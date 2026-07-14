@@ -17,8 +17,9 @@ defmodule RetrievalNode.Search do
   Hybrid (dense + BM25/RRF) search over the query text.
 
   Options:
-    * `:source_id` / `:repo` / `:lang` — optional filters applied inside both
-      ranking CTEs (see `HybridQuery`)
+    * `:source_id` / `:source_type` / `:repo` / `:lang` — optional filters applied
+      inside both ranking CTEs (see `HybridQuery`). `:source_type` is the DB enum
+      string (`"git_repo"`/`"jira_project"`/`"drive_folder"`)
     * `:top_k` — result count (default 20)
     * `:embedding` — a precomputed 384-float query vector; when given, skips the
       embedding step (used by tests and callers that already hold an embedding)
@@ -33,7 +34,7 @@ defmodule RetrievalNode.Search do
 
     query_opts =
       opts
-      |> Keyword.take([:source_id, :repo, :lang, :top_k])
+      |> Keyword.take([:source_id, :source_type, :repo, :lang, :top_k])
       |> Keyword.merge(embedding: embedding, text_query: query_text)
 
     query_opts

@@ -12,8 +12,10 @@ defmodule RetrievalNode.Application do
       RetrievalNode.Repo,
       {DNSCluster, query: Application.get_env(:retrieval_node, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: RetrievalNode.PubSub},
-      # Start a worker by calling: RetrievalNode.Worker.start_link(arg)
-      # {RetrievalNode.Worker, arg},
+      # MCP server (streamable_http) — mounted on the Endpoint at /mcp. `start: true`
+      # starts the session infra unconditionally; the default gates on the Phoenix
+      # listener being up, which leaves it down under ConnTest (server: false).
+      {RetrievalNode.MCP.Server, transport: {:streamable_http, start: true}},
       # Start to serve requests, typically the last entry
       RetrievalNodeWeb.Endpoint
     ]

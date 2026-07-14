@@ -40,6 +40,9 @@ defmodule RetrievalNodeWeb.Endpoint do
   plug Plug.RequestId
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
 
+  # MCP transport at /mcp — must precede Plug.Parsers (it reads the raw body itself).
+  plug RetrievalNodeWeb.MCPPlug, server: RetrievalNode.MCP.Server
+
   plug Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],

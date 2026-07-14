@@ -235,33 +235,40 @@ in naming, THIS section wins:
 > `System.cmd` shell-outs are confined to `Ingest.GitMirror`, never in the
 > Anubis tool modules.
 
-- [ ] `RetrievalNode.MCP.Server` — `use Anubis.Server, name:, version:,
-      capabilities: [:tools]` listing four `component` entries; add to the
-      supervision tree as `{RetrievalNode.MCP.Server, transport: :streamable_http}`
-- [ ] Mount on Endpoint: `plug Anubis.Server.Transport.StreamableHTTP.Plug,
-      server: RetrievalNode.MCP.Server, path: "/mcp"`. **No bearer auth in the
-      slice — trust the LAN** (see Risks; auth is mandatory before internet exposure)
-- [ ] Each tool = its own module (`use Anubis.Server.Component, type: :tool`) with
-      a `schema do field ... end` block and `execute/2` → `{:reply, Response.*, frame}`:
-  - [ ] `semantic_search(query!, source?, repo?, lang?)` → `Search.hybrid_search/2`;
-        returns `{source_type, back-links, breadcrumb snippet, score}` — **NOT full content**
-  - [ ] `grep(pattern!, repo?)` → `GitMirror.grep/2` (`rg`); returns `{repo, path, line, text}`
-  - [ ] `get_file(repo!, path!, ref?)` → `GitMirror.show/3` (`git show`); the **sole
-        full-content tool** → `{repo, path, ref, content}` (so search hits & fetches agree)
-  - [ ] `list_repos()` (no fields) → `Ingest.list_repos/0` → `{repo, source_type, default_ref?}`
-- [ ] `Ingest.GitMirror` shell-out facade — **argument-list form only (no shell
-      string interpolation)**, `System.find_executable("rg")` checked first,
-      `Path.safe_relative/1` guard on `path` before every `git show`, repo slugs
-      resolved via registered-repos lookup (not raw dir scan). Exceptions →
-      `{:error, reason}` at this boundary so `execute/2` needs no bare rescue
-- [ ] Error contract: `Response.error(Response.tool(), msg)` per-tool `format_error`
-      (repo/file/ref not found, rg missing, invalid pattern, path traversal) + catch-all.
-      **⚠ Spot-check** the exact Anubis tool-failure return tuple against
-      `deps/anubis_mcp` source once vendored (docs confirmed success path +
-      `Response.error/2` only) — see `design-mcp.md` flagged risk
-- [ ] **Verify**: drive `/mcp` over LAN (MCP inspector or `Req`); all four tools
-      return; `semantic_search` returns back-links, `get_file` returns exact bytes
-      matching a search hit; a path-traversal `get_file` is rejected
+- [x] `RetrievalNode.MCP.Server` — `use Anubis.Server, name: "retrieval-node",
+      version:, capabilities: [:tools]` with four `component` entries; added to the
+      supervision tree as `{RetrievalNode.MCP.Server, transport: {:streamable_http,
+      start: true}}` — `start: true` because the default gates on the Phoenix
+      listener, which is off under ConnTest (server: false)
+- [x] Mounted via `RetrievalNodeWeb.MCPPlug` (thin path-guarded wrapper around
+      `Anubis.Server.Transport.StreamableHTTP.Plug`) placed on the Endpoint
+      **before `Plug.Parsers`** — the transport reads the raw body itself and the
+      Anubis plug does NOT support a `path:` option (spot-check corrected the plan).
+      No bearer auth in the slice — LAN trust
+- [x] Each tool = its own module (`use Anubis.Server.Component, type: :tool`) with a
+      `schema do field ... end` block; `execute/2` gets ATOM-keyed validated params
+      and returns `{:reply, Response.json/error(Response.tool(), ...), frame}`:
+  - [x] `semantic_search(query!, source?, repo?, lang?)` → `Search.hybrid_search/2`;
+        `source` maps git/jira/drive → a `source_type` filter (added to HybridQuery
+        as `$8`, applied inside the shared candidates CTE); returns back-links
+        (`chunk_id, source_type, repo, lang, breadcrumb, metadata, score`) — no content
+  - [x] `grep(pattern!, repo?)` → `GitMirror.grep/3` (git grep); repo-less greps all
+        indexed git repos; returns `{repo, path, line, text}`; invalid pattern surfaces
+  - [x] `get_file(repo!, path!, ref?)` → `GitMirror.show/3`; sole full-content tool →
+        `{repo, path, ref, content}`
+  - [x] `list_repos()` (empty `schema do %{} end`) → `Ingest.list_repos/0` →
+        `{repo, source_type, default_ref}`
+- [x] Repo resolution via `Ingest.resolve_git_repo/1` / `git_repo_slugs/0` (registered
+      sources, never a dir scan); `GitMirror` already argument-list-only with
+      `Path.safe_relative` in `show` — traversal → `{:error, :invalid_path}`
+- [x] Error contract: per-tool `format_error/1` → `Response.error(Response.tool(), msg)`
+      (repo/file/ref not found, invalid pattern, path traversal) + catch-all. Spot-checked
+      against `deps/anubis_mcp` source (success = `Response.json`, failure = `Response.error`)
+- [x] **Verify**: 113 tests. Tool `execute/2` tested directly against real DB + real
+      git mirror (list_repos, grep matches, get_file exact bytes, path-traversal
+      rejected, semantic_search back-links + source_type filter + no content). Endpoint
+      test drives `/mcp` through the full pipeline (transport owns `/mcp`, other paths
+      pass through). Manual LAN drive with an MCP client/`Req` remains for on-device
 
 ## Phase 8 — Supervision, build & deploy `[otp]` `[deploy]` (from `design-otp.md` §1, `design-build.md`)
 

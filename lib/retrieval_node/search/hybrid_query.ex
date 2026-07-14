@@ -43,6 +43,7 @@ defmodule RetrievalNode.Search.HybridQuery do
           embedding: [float()],
           text_query: String.t(),
           source_id: Ecto.UUID.t() | nil,
+          source_type: String.t() | nil,
           repo: String.t() | nil,
           lang: String.t() | nil,
           top_k: pos_integer()
@@ -54,6 +55,7 @@ defmodule RetrievalNode.Search.HybridQuery do
     WHERE ($5::uuid IS NULL OR source_id = $5)
       AND ($6::text IS NULL OR repo = $6)
       AND ($7::text IS NULL OR lang = $7)
+      AND ($8::text IS NULL OR source_type = $8)
   ),
   vector_search AS (
     SELECT c.id, row_number() OVER (ORDER BY c.embedding <=> $1::vector) AS rank
@@ -92,7 +94,9 @@ defmodule RetrievalNode.Search.HybridQuery do
   @doc """
   Run the RRF hybrid query. Requires `:embedding` (a 384-float query vector) and
   `:text_query` (free-form, parsed with `websearch_to_tsquery`). Optional
-  `:source_id`/`:repo`/`:lang` filters and `:top_k` (default #{@default_top_k}).
+  `:source_id`/`:source_type`/`:repo`/`:lang` filters and `:top_k`
+  (default #{@default_top_k}). `:source_type` is the DB enum string
+  (`"git_repo"`/`"jira_project"`/`"drive_folder"`).
   """
   @spec search(opts) :: [result]
   def search(opts) do
@@ -107,7 +111,8 @@ defmodule RetrievalNode.Search.HybridQuery do
       top_k,
       opts[:source_id],
       opts[:repo],
-      opts[:lang]
+      opts[:lang],
+      opts[:source_type]
     ]
 
     %Postgrex.Result{rows: rows} = Repo.query!(@sql, params)
