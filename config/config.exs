@@ -25,6 +25,16 @@ config :retrieval_node,
   chunking_impl: RetrievalNode.Chunking.TreeSitterImpl,
   embedding_impl: RetrievalNode.Embedding.NxServingImpl
 
+# Embedding serving (Bumblebee/Nx.Serving over nomic-embed-text-v1.5). `compile`
+# forces a JIT pass at init (batch_size 16, sequence_length 512); batch_timeout
+# groups concurrent query/indexing calls. The model emits 768-dim vectors; the
+# impl Matryoshka-truncates to 384.
+config :retrieval_node, RetrievalNode.Embedding.Serving,
+  model: "nomic-ai/nomic-embed-text-v1.5",
+  batch_size: 16,
+  sequence_length: 512,
+  batch_timeout_ms: 50
+
 # Configures the endpoint
 config :retrieval_node, RetrievalNodeWeb.Endpoint,
   url: [host: "localhost"],

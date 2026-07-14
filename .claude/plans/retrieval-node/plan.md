@@ -111,24 +111,26 @@ in naming, THIS section wins:
 
 ## Phase 3 — Embedding subsystem `[otp]` (from `design-otp.md` §1a, §3)
 
-- [ ] `RetrievalNode.Embedding` behaviour (`embed/1`, `embed_batch/1`, `dimensions/0`)
-- [ ] `Embedding.NxServingImpl` — `Nx.Serving.batched_run/2`; **Matryoshka
-      truncation to 384 + L2 renormalize** applied here; `dimensions/0` → 384
-- [ ] `Embedding.Serving` child_spec — `Bumblebee.Text.TextEmbedding.text_embedding`
-      with `compile: [batch_size: 16, sequence_length: 512], defn_options: [compiler: EXLA]`
-      (compile-at-init forces JIT during supervised startup); `batch_timeout: 50`
-- [ ] `Embedding.LlamaCppSidecarImpl` — **stub only** (Req HTTP to llama.cpp
-      `--embedding`); documents the escape hatch, config-swappable via `:embedding_impl`
-- [ ] `warmup/0` fired via unsupervised `Task.start/1` after `Supervisor.start_link`
-      (fire-and-forget; must never crash boot); flips a `:persistent_term` readiness
-      flag consumed by `/healthz`
-- [ ] **Shared-serving note** (Oban agent flag): one Nx.Serving handles both
-      query-time (batch 1) and bulk indexing (batch N). `:embed` concurrency-1 bounds
-      Oban-level contention, but a large bulk batch can still delay an interactive
-      query embed. Documented escape hatch: a **second named serving (bulk vs query)**
-      sharing the same loaded model — add only if measurement shows contention
-- [ ] **Verify**: `mix test` for the truncation math (768→384, norm ≈ 1.0); a
-      tagged `:integration` test that actually loads the model + embeds (skipped in CI)
+- [x] `RetrievalNode.Embedding` behaviour (`embed/1`, `embed_batch/1`, `dimensions/0`)
+      — @callbacks + @types added to the existing dispatcher; bare `[float()]` returns
+      (per plan, not design's `embed_query`/`{:ok, _}`) to match merged Phase 2 Search
+- [x] `Embedding.NxServingImpl` — `Nx.Serving.batched_run/2`; **Matryoshka
+      truncation to 384 + L2 renormalize** in a pure, unit-tested `matryoshka/1`;
+      `dimensions/0` → 384; `embed/1` = `embed_batch([text]) |> hd`
+- [x] `Embedding.Serving` child_spec — `Bumblebee.Text.TextEmbedding.text_embedding`
+      with compile/defn/output_attribute/embedding_processor opts; batch_timeout 50;
+      model/params from config (`RetrievalNode.Embedding.Serving` key)
+- [x] `Embedding.LlamaCppSidecarImpl` — stub only; documents the escape hatch,
+      callbacks raise; config-swappable via `:embedding_impl`
+- [x] `warmup/0` + `ready?/0` (persistent_term flag) implemented in `Embedding.Serving`.
+      NOTE: the `Task.start/1` wiring in `Application.start` + the `/healthz` consumer
+      land in **Phase 8** (supervision tree) — Serving is NOT in the tree yet, so tests
+      never load the model.
+- [x] **Shared-serving note** — documented in `Embedding.Serving` moduledoc (one serving
+      for query+batch; second-named-serving escape hatch if p99 creeps under ingest)
+- [x] **Verify**: 5 unit tests for the truncation math (768→384 len, unit L2 norm,
+      leading-half selection, %{embedding:} shape) pass; 2 tagged `:integration` tests
+      (load model + embed) excluded by default via `ExUnit.start(exclude: [:integration])`
 
 ## Phase 4 — Chunking subsystem `[otp]` `[security-adjacent]` (from `design-otp.md` §2-3)
 
@@ -250,6 +252,11 @@ in naming, THIS section wins:
 - [ ] `/healthz` readiness gates: (1) grammar-cache present for allowlist,
       (2) `Nx.default_backend()` is EXLA (not silent BinaryBackend), (3) Nx.Serving
       warmed, (4) DB reachable — ready only when all pass
+  - [ ] **`Embedding.Serving.ready?/0` must not go stale across a serving crash/restart**
+        (Copilot review, PR #2): the `:persistent_term` flag stays `true` after the
+        supervised serving restarts without re-warming. Reset it to `false` when the
+        serving (re)starts and re-run `warmup/0`, OR have the gate also confirm the
+        serving pid is the one that warmed — decide when wiring warmup into the tree here.
 - [ ] Postgres via apt (PGDG arm64) + pgvector; `/var/lib/retrieval_node/git-mirrors/`,
       nightly `pg_dump` snapshot to NVMe
 - [ ] Dev (x86-64) deltas: skip ELF gate, `mix phx.server` not release/systemd,
