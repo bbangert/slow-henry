@@ -181,10 +181,20 @@ in naming, THIS section wins:
 
 ## Phase 6 — Ingest pipeline `[oban]` (from `design-oban.md`) — the all-three-thin slice
 
-- [ ] Oban config: queues `sync: 3, chunk: 2, embed: 1, upsert: 5`; Pruner (14d),
-      Lifeline (20m), Cron; `Repo` `pool_size: 20`
-- [ ] Source clients (thin): `Ingest.Git` (bare `--mirror` clone + `git fetch` +
-      diff changed files vs `last_sha`), `Ingest.Jira` (Req REST, JQL
+> **Split into two PRs.** 6a = plumbing (Oban config, `pending_chunks` schema/context,
+> `GitMirror`). 6b = Jira/Drive clients + the 4 Oban workers + cron + deletions.
+
+- [x] **(6a)** Oban config: queues `sync: 3, chunk: 2, embed: 1, upsert: 5`; Pruner (14d),
+      Lifeline (20m); `Repo` `pool_size: 20`; `:test` → `testing: :manual`. **Cron deferred
+      to 6b** (added with the worker modules it references). Oban not in the tree yet (Phase 8).
+- [x] **(6a)** `Retrieval.PendingChunk` schema (bigserial staging) + `Ingest.PendingChunks`
+      context (insert_raw/insert_raw_all, fetch!/fetch_many!, write_chunks, set_embeddings,
+      by_ids/delete_by_ids) — the staging-table access the workers use.
+- [x] **(6a)** `Ingest.GitMirror` — bare `--mirror` clone/`fetch --prune`, `head_sha`,
+      `changed_files` (ls-tree/diff), `show` (full content), `grep`. Arg-list `System.cmd`
+      (no shell), `find_executable` guard, `Path.safe_relative` on repo slug + file path.
+      Tested against a real local repo (git is always present). Reused by Phase 7 MCP tools.
+- [ ] **(6b)** Source clients (thin): `Ingest.Jira` (Req REST, JQL
       `resolutiondate` watermark, resolved/closed only), `Ingest.Drive` (Req +
       Changes API cursor, export Docs as `text/markdown`, handle deletions/unshares)
 - [ ] Workers `[oban]`:

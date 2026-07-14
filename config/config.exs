@@ -25,6 +25,20 @@ config :retrieval_node,
   chunking_impl: RetrievalNode.Chunking.TreeSitterImpl,
   embedding_impl: RetrievalNode.Embedding.NxServingImpl
 
+# Oban ingest pipeline. Queue concurrencies (design-oban §2): sync I/O-bound;
+# chunk CPU+NIF (bounded so it doesn't monopolize dirty schedulers); embed=1
+# (single Nx.Serving, must not starve the MCP endpoint); upsert cheap Postgres.
+# Pruner keeps 14d of job history; Lifeline rescues jobs orphaned >20m. The Cron
+# plugin (per-source watermark sync entrypoints) is added with the workers in the
+# next step. Repo pool_size is raised (dev/runtime) to num_queues + sum(limits) + buffer.
+config :retrieval_node, Oban,
+  repo: RetrievalNode.Repo,
+  queues: [sync: 3, chunk: 2, embed: 1, upsert: 5],
+  plugins: [
+    {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 14},
+    {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(20)}
+  ]
+
 # Embedding serving (Bumblebee/Nx.Serving over nomic-embed-text-v1.5). `compile`
 # forces a JIT pass at init (batch_size 16, sequence_length 512); batch_timeout
 # groups concurrent query/indexing calls. The model emits 768-dim vectors; the
