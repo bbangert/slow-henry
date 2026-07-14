@@ -161,8 +161,7 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
     end
   end
 
-  # Mirror dir slug: explicit config, else the human name.
-  defp repo_slug(source), do: Map.get(source.config || %{}, "mirror_slug") || source.name
+  defp repo_slug(source), do: Source.mirror_slug(source)
 
   defp lang_for(path) do
     ext = path |> Path.extname() |> String.trim_leading(".")

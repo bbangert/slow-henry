@@ -21,20 +21,28 @@ defmodule RetrievalNode.MCP.Tools.SemanticSearch do
 
   @impl true
   def execute(%{query: query} = params, frame) do
-    opts =
-      [
-        source_type: params |> Map.get(:source) |> normalize_source(),
-        repo: Map.get(params, :repo),
-        lang: Map.get(params, :lang)
-      ]
-      |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+    case normalize_source(Map.get(params, :source)) do
+      {:ok, source_type} ->
+        opts =
+          [source_type: source_type, repo: Map.get(params, :repo), lang: Map.get(params, :lang)]
+          |> Enum.reject(fn {_k, v} -> is_nil(v) end)
 
-    results = query |> Search.hybrid_search(opts) |> Enum.map(&result/1)
-    {:reply, Response.json(Response.tool(), %{results: results}), frame}
+        results = query |> Search.hybrid_search(opts) |> Enum.map(&result/1)
+        {:reply, Response.json(Response.tool(), %{results: results}), frame}
+
+      {:error, msg} ->
+        {:reply, Response.error(Response.tool(), msg), frame}
+    end
   end
 
-  defp normalize_source(nil), do: nil
-  defp normalize_source(source), do: Map.get(@source_map, source, source)
+  # Reject an unknown `source` rather than silently returning zero results.
+  defp normalize_source(nil), do: {:ok, nil}
+
+  defp normalize_source(source) when is_map_key(@source_map, source),
+    do: {:ok, @source_map[source]}
+
+  defp normalize_source(other),
+    do: {:error, "unknown source #{inspect(other)} — use git | jira | drive"}
 
   defp result(%{chunk: chunk, score: score}) do
     %{

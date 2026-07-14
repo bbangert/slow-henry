@@ -71,6 +71,13 @@ defmodule RetrievalNode.MCP.ToolsTest do
     test "unknown repo is an error" do
       assert err(GetFile, %{repo: "nope", path: "a.ex"}) =~ "repo not found"
     end
+
+    test "a missing path or ref is a not-found error", %{root: root} do
+      seed_repo(root, "acme/app", [{"a.ex", "x\n"}])
+
+      assert err(GetFile, %{repo: "acme/app", path: "does/not/exist.ex"}) =~ "not found"
+      assert err(GetFile, %{repo: "acme/app", path: "a.ex", ref: "nonexistent"}) =~ "not found"
+    end
   end
 
   describe "grep" do
@@ -88,6 +95,26 @@ defmodule RetrievalNode.MCP.ToolsTest do
 
     test "unknown repo is an error" do
       assert err(Grep, %{pattern: "x", repo: "nope"}) =~ "repo not found"
+    end
+
+    test "a match-everything pattern is rejected (DoS guard)" do
+      for p <- ["", ".", ".*"] do
+        assert err(Grep, %{pattern: p}) =~ "too broad"
+      end
+    end
+
+    test "an invalid regex surfaces as an error, not empty results", %{root: root} do
+      seed_repo(root, "acme/app", [{"a.py", "x = 1\n"}])
+      assert err(Grep, %{pattern: "[", repo: "acme/app"}) =~ "pattern"
+    end
+
+    test "repo-less grep aggregates across all indexed repos", %{root: root} do
+      seed_repo(root, "acme/one", [{"a.py", "needle here\n"}])
+      seed_repo(root, "acme/two", [{"b.py", "needle there\n"}])
+
+      %{"matches" => matches} = ok(Grep, %{pattern: "needle"})
+      repos = matches |> Enum.map(& &1["repo"]) |> Enum.uniq() |> Enum.sort()
+      assert repos == ["acme/one", "acme/two"]
     end
   end
 
@@ -119,6 +146,26 @@ defmodule RetrievalNode.MCP.ToolsTest do
       %{"results" => results} = ok(SemanticSearch, %{query: "widgetalpha", source: "jira"})
       assert results != []
       assert Enum.all?(results, &(&1["source_type"] == "jira_project"))
+    end
+
+    test "an unknown source is rejected" do
+      assert err(SemanticSearch, %{query: "x", source: "bogus"}) =~ "unknown source"
+    end
+
+    test "repo filter narrows results and an unmatched query returns none" do
+      a = Repo.insert!(%Source{source_type: :git_repo, name: "a", identifier: "file:///a"})
+      b = Repo.insert!(%Source{source_type: :git_repo, name: "b", identifier: "file:///b"})
+      insert_chunk(a, :git_repo, "flurbo accounting", repo: "a")
+      insert_chunk(b, :git_repo, "flurbo billing", repo: "b")
+
+      %{"results" => results} = ok(SemanticSearch, %{query: "flurbo", repo: "a"})
+      assert results != []
+      assert Enum.all?(results, &(&1["repo"] == "a"))
+
+      # A filter that matches no candidate returns nothing (the dense side can't
+      # backfill nearest-neighbours from outside the filtered candidate set).
+      %{"results" => none} = ok(SemanticSearch, %{query: "flurbo", repo: "no-such-repo"})
+      assert none == []
     end
   end
 

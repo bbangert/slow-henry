@@ -32,6 +32,7 @@ defmodule RetrievalNode.MCP.Tools.GetFile do
   defp format_error(:repo_not_found), do: "repo not found (see list_repos)"
   defp format_error(:invalid_path), do: "invalid path — path traversal is rejected"
   defp format_error(:invalid_ref), do: "invalid ref"
+  defp format_error(:git_timeout), do: "get_file timed out"
   defp format_error(:file_too_large), do: "file too large to return"
   defp format_error({:git, _code, _out}), do: "file or ref not found"
   defp format_error(reason), do: "get_file failed: #{inspect(reason)}"

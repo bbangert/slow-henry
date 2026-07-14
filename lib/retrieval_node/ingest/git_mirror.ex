@@ -27,6 +27,7 @@ defmodule RetrievalNode.Ingest.GitMirror do
           | :invalid_ref
           | :invalid_url
           | :file_too_large
+          | :git_timeout
           | {:git, integer(), String.t()}
 
   # A ref/sha that cannot be mistaken for a git option: alphanumeric start, then
@@ -166,6 +167,10 @@ defmodule RetrievalNode.Ingest.GitMirror do
   Grep a repo at `ref` (default HEAD). Returns `[%{repo, path, line, text}]`.
   Exit 1 (no matches) is a normal empty result. `-I` skips binary files.
   """
+  # Per-file match cap (`-m`) so one huge file can't dump unbounded output; the tool
+  # layer caps the aggregate across repos too.
+  @grep_max_per_file 100
+
   @spec grep(repo, String.t(), String.t()) :: {:ok, [map()]} | {:error, reason}
   def grep(slug, pattern, ref \\ "HEAD") do
     # git grep doesn't accept --end-of-options; the validated ref (no leading dash)
@@ -174,21 +179,41 @@ defmodule RetrievalNode.Ingest.GitMirror do
     with {:ok, ref} <- safe_ref(ref),
          {:ok, gitdir} <- mirror_path(slug),
          {:ok, out} <-
-           git(["--git-dir", gitdir, "grep", "-n", "-I", "-z", "-e", pattern, ref], [0, 1]) do
+           git(
+             ["--git-dir", gitdir, "grep", "-n", "-I", "-z", "-m", "#{@grep_max_per_file}"] ++
+               ["-e", pattern, ref],
+             [0, 1]
+           ) do
       {:ok, parse_grep(slug, ref, out)}
     end
   end
 
   # --- internals ---
 
+  # Hard ceiling on any single git invocation. A pathological pattern/tree can make
+  # git run unbounded; without this the caller (and the MCP session process) would
+  # hang. On timeout the task is killed, which closes the port and terminates git.
+  @git_timeout :timer.seconds(20)
+
   defp git(args, ok_codes \\ [0]) do
     case System.find_executable("git") do
-      nil ->
-        {:error, :git_not_found}
+      nil -> {:error, :git_not_found}
+      git -> run_git(git, args, ok_codes)
+    end
+  end
 
-      git ->
-        {out, code} = System.cmd(git, args, stderr_to_stdout: true)
+  defp run_git(git, args, ok_codes) do
+    task = Task.async(fn -> System.cmd(git, args, stderr_to_stdout: true) end)
+
+    case Task.yield(task, @git_timeout) do
+      {:ok, {out, code}} ->
         if code in ok_codes, do: {:ok, out}, else: {:error, {:git, code, String.trim(out)}}
+
+      # nil = still running (timed out); {:exit, _} = the task crashed. Either way
+      # kill it (closing the port → terminating git) and report a timeout.
+      _ ->
+        Task.shutdown(task, :brutal_kill)
+        {:error, :git_timeout}
     end
   end
 

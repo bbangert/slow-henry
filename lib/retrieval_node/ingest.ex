@@ -39,29 +39,27 @@ defmodule RetrievalNode.Ingest do
   """
   @spec resolve_git_repo(String.t()) :: {:ok, String.t()} | {:error, :repo_not_found}
   def resolve_git_repo(repo) when is_binary(repo) do
-    Source
-    |> where([s], s.source_type == :git_repo and s.active == true and s.policy == :allow)
-    |> Repo.all()
+    git_sources()
     |> Enum.find_value({:error, :repo_not_found}, fn source ->
-      if git_slug(source) == repo, do: {:ok, git_slug(source)}
+      slug = Source.mirror_slug(source)
+      if slug == repo, do: {:ok, slug}
     end)
   end
 
   @doc "The git slugs of every active, allow-policy git source (for repo-less grep)."
   @spec git_repo_slugs() :: [String.t()]
-  def git_repo_slugs do
+  def git_repo_slugs, do: git_sources() |> Enum.map(&Source.mirror_slug/1)
+
+  # Active, allow-policy git sources — the one query resolve_git_repo/git_repo_slugs share.
+  defp git_sources do
     Source
     |> where([s], s.source_type == :git_repo and s.active == true and s.policy == :allow)
     |> Repo.all()
-    |> Enum.map(&git_slug/1)
   end
 
   defp entry(%Source{source_type: :git_repo} = s),
-    do: %{repo: git_slug(s), source_type: "git_repo", default_ref: "HEAD"}
+    do: %{repo: Source.mirror_slug(s), source_type: "git_repo", default_ref: "HEAD"}
 
   defp entry(%Source{} = s),
     do: %{repo: s.name, source_type: to_string(s.source_type), default_ref: nil}
-
-  # Mirror dir slug: explicit config, else the human name (matches Workers.RepoSync).
-  defp git_slug(source), do: Map.get(source.config || %{}, "mirror_slug") || source.name
 end

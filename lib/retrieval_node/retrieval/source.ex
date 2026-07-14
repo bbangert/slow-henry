@@ -10,6 +10,8 @@ defmodule RetrievalNode.Retrieval.Source do
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
 
+  @type t :: %__MODULE__{}
+
   schema "sources" do
     field :source_type, Ecto.Enum, values: [:git_repo, :jira_project, :drive_folder]
     field :name, :string
@@ -38,4 +40,13 @@ defmodule RetrievalNode.Retrieval.Source do
     source
     |> cast(attrs, [:name, :policy, :active, :config])
   end
+
+  @doc """
+  The bare-mirror directory slug for a git source: an explicit `config["mirror_slug"]`
+  override, else the human `name`. Single source of truth for the slug rule shared by
+  `Ingest.Workers.RepoSync` (writes) and `Ingest`/the MCP tools (reads).
+  """
+  @spec mirror_slug(t()) :: String.t()
+  def mirror_slug(%__MODULE__{} = source),
+    do: Map.get(source.config || %{}, "mirror_slug") || source.name
 end
