@@ -349,5 +349,5 @@ defmodule RetrievalNode.Ingest.Scrubber do
     })
   end
 
-  defp gitleaks_cmd, do: Application.get_env(:retrieval_node, :gitleaks_cmd, "gitleaks")
+  defp gitleaks_cmd, do: Application.get_env(:retrieval_node, :gitleaks_cmd) || "gitleaks"
 end

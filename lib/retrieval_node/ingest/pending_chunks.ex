@@ -18,9 +18,10 @@ defmodule RetrievalNode.Ingest.PendingChunks do
   Bulk-insert freshly-discovered raw rows in a single `insert_all` (one round-trip,
   atomic). Rows come from the internal `*Sync` clients; NOT NULL constraints at the
   DB enforce required fields (a malformed row raises → the Oban job retries).
-  Returns `{:ok, count}`.
+  Returns `{:ok, ids}` (the inserted ids, so callers can enqueue a `ChunkFiles`
+  job per row).
   """
-  @spec insert_raw_all([map()]) :: {:ok, non_neg_integer()}
+  @spec insert_raw_all([map()]) :: {:ok, [integer()]}
   def insert_raw_all(rows) do
     now = DateTime.utc_now()
 
@@ -30,17 +31,22 @@ defmodule RetrievalNode.Ingest.PendingChunks do
         # NOT NULL failure, rather than a KeyError before we ever reach the DB.
         %{
           source: Map.get(attrs, :source),
+          source_id: Map.get(attrs, :source_id),
+          source_type: Map.get(attrs, :source_type),
+          repo: Map.get(attrs, :repo),
+          lang: Map.get(attrs, :lang),
           natural_key: Map.get(attrs, :natural_key),
           content_hash: Map.get(attrs, :content_hash),
           raw_content: Map.get(attrs, :raw_content),
+          metadata: Map.get(attrs, :metadata, %{}),
           status: "raw",
           inserted_at: now,
           updated_at: now
         }
       end)
 
-    {count, _} = Repo.insert_all(PendingChunk, entries)
-    {:ok, count}
+    {_count, rows} = Repo.insert_all(PendingChunk, entries, returning: [:id])
+    {:ok, Enum.map(rows, & &1.id)}
   end
 
   @doc "Insert a single raw row, returning the persisted record."
@@ -52,6 +58,10 @@ defmodule RetrievalNode.Ingest.PendingChunks do
   @doc "Fetch one staging row by id (raises if missing)."
   @spec fetch!(integer()) :: PendingChunk.t()
   def fetch!(id), do: Repo.get!(PendingChunk, id)
+
+  @doc "Fetch one staging row by id, or nil if already consumed (idempotent retries)."
+  @spec get(integer()) :: PendingChunk.t() | nil
+  def get(id), do: Repo.get(PendingChunk, id)
 
   @doc "Fetch many staging rows by id (order not guaranteed)."
   @spec fetch_many!([integer()]) :: [PendingChunk.t()]
@@ -66,12 +76,20 @@ defmodule RetrievalNode.Ingest.PendingChunks do
           {:ok, [PendingChunk.t()]} | {:error, Ecto.Changeset.t()}
   def write_chunks(%PendingChunk{} = raw, chunks, opts \\ []) do
     base = %{
+      # provenance copied from the raw row
       source: raw.source,
+      source_id: raw.source_id,
+      source_type: raw.source_type,
+      repo: raw.repo,
+      lang: raw.lang,
       natural_key: raw.natural_key,
       content_hash: raw.content_hash,
+      metadata: raw.metadata,
+      # staging bookkeeping
       status: "chunked",
       chunk_quality: opts[:chunk_quality],
-      scrub_mode: opts[:scrub_mode]
+      scrub_mode: opts[:scrub_mode],
+      secrets_status: opts[:secrets_status] || "clean"
     }
 
     Repo.transaction(fn -> Enum.map(chunks, &insert_chunk_row(base, &1)) end)

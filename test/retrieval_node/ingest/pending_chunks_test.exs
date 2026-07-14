@@ -23,8 +23,9 @@ defmodule RetrievalNode.Ingest.PendingChunksTest do
     assert PendingChunks.fetch!(row.id).natural_key == "repo:acme/app:lib/foo.ex"
   end
 
-  test "insert_raw_all bulk-inserts in a single round-trip" do
-    assert {:ok, 2} = PendingChunks.insert_raw_all([raw_attrs(), raw_attrs()])
+  test "insert_raw_all bulk-inserts in a single round-trip and returns the ids" do
+    assert {:ok, ids} = PendingChunks.insert_raw_all([raw_attrs(), raw_attrs()])
+    assert length(ids) == 2
     assert Repo.aggregate(PendingChunk, :count, :id) == 2
   end
 

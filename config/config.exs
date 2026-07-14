@@ -36,7 +36,16 @@ config :retrieval_node, Oban,
   queues: [sync: 3, chunk: 2, embed: 1, upsert: 5],
   plugins: [
     {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 14},
-    {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(20)}
+    {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(20)},
+    # Cron fans out per source kind (RepoSync */15, JiraSync hourly, DriveSync */30)
+    # via SyncScheduler, since source ids are dynamic. Only active when Oban is in
+    # the supervision tree (Phase 8); disabled in :test.
+    {Oban.Plugins.Cron,
+     crontab: [
+       {"*/15 * * * *", RetrievalNode.Ingest.Workers.SyncScheduler, args: %{"kind" => "git"}},
+       {"0 * * * *", RetrievalNode.Ingest.Workers.SyncScheduler, args: %{"kind" => "jira"}},
+       {"*/30 * * * *", RetrievalNode.Ingest.Workers.SyncScheduler, args: %{"kind" => "drive"}}
+     ]}
   ]
 
 # Embedding serving (Bumblebee/Nx.Serving over nomic-embed-text-v1.5). `compile`
