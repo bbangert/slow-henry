@@ -54,22 +54,26 @@ defmodule RetrievalNode.MCP.Tools.Grep do
   # boundary it may over-report, never under-report).
   defp grep_all(slugs, pattern) do
     slugs
-    |> Enum.reduce_while({[], 0}, fn slug, {chunks, count} ->
-      case GitMirror.grep(slug, pattern) do
-        {:ok, matches} ->
-          count = count + length(matches)
-          chunks = [matches | chunks]
-          if count >= @max_matches, do: {:halt, {:capped, chunks}}, else: {:cont, {chunks, count}}
-
-        {:error, reason} ->
-          {:halt, {:error, reason}}
-      end
-    end)
+    |> Enum.reduce_while({[], 0}, &grep_reduce(&1, pattern, &2))
     |> case do
       {:error, reason} -> {:error, reason}
       {:capped, chunks} -> {:ok, flatten_take(chunks), true}
       {chunks, _count} -> {:ok, flatten_take(chunks), false}
     end
+  end
+
+  defp grep_reduce(slug, pattern, {chunks, count}) do
+    case GitMirror.grep(slug, pattern) do
+      {:ok, matches} -> accumulate(matches, chunks, count)
+      {:error, reason} -> {:halt, {:error, reason}}
+    end
+  end
+
+  # Prepend this repo's matches (O(1)) and halt once the aggregate cap is reached.
+  defp accumulate(matches, chunks, count) do
+    count = count + length(matches)
+    chunks = [matches | chunks]
+    if count >= @max_matches, do: {:halt, {:capped, chunks}}, else: {:cont, {chunks, count}}
   end
 
   defp flatten_take(chunks),
