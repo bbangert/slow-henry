@@ -38,6 +38,10 @@ config :retrieval_node, :chunking, call_timeout_ms: 100
 # via Oban.Testing (perform_job / assert_enqueued).
 config :retrieval_node, Oban, testing: :manual
 
+# Model-free embedding so the ingest pipeline (EmbedBatch) is testable without
+# downloading nomic-embed-text or compiling EXLA.
+config :retrieval_node, embedding_impl: RetrievalNode.Embedding.StubImpl
+
 # Print only warnings and errors during test
 config :logger, level: :warning
 

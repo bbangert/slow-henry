@@ -15,8 +15,9 @@ defmodule RetrievalNode.Ingest.Scrubber do
       never silently skip scanning.
     * **jira/drive** text → the regex scanner directly.
 
-  A high-confidence secret that survives redaction is discarded (`{:cancel, ...}`)
-  rather than indexed — the "never index a plaintext secret" guarantee, enforced
+  A high-confidence secret that survives redaction — or content that no scanner
+  could run over at all — is discarded (`{:cancel, ...}`) rather than indexed —
+  the "never index a plaintext secret" guarantee, enforced
   detector-agnostically via `redaction_left_secret?/2`. Audit rows store only a
   `sha256` of the match, never the raw secret. Secrets are also kept out of logs
   and telemetry: only exit codes / exception types are logged, never content or a
@@ -73,11 +74,12 @@ defmodule RetrievalNode.Ingest.Scrubber do
 
   @doc """
   Scrub `content` for the given `source_type`. Returns `{:ok, result}` (possibly
-  with `secrets_status: :redacted`), `{:cancel, reason}` if a high-confidence
-  secret survives redaction or the content is too large, or `{:error, reason}` if
-  no scan could run at all.
+  with `secrets_status: :redacted`), or `{:cancel, reason}` — fail-closed — if a
+  high-confidence secret survives redaction, the content is too large, or no scan
+  could run at all (a `:scrub_unavailable` regex crash is deterministic, so it is
+  discarded rather than retried).
   """
-  @spec scrub(String.t(), atom()) :: {:ok, result} | {:cancel, atom()} | {:error, atom()}
+  @spec scrub(String.t(), atom()) :: {:ok, result} | {:cancel, atom()}
   def scrub(content, _source_type)
       when is_binary(content) and byte_size(content) > @max_scan_bytes do
     {:cancel, :content_too_large}
@@ -107,13 +109,15 @@ defmodule RetrievalNode.Ingest.Scrubber do
     # The regex scanner is pure Elixir and should never raise; if it does, NOTHING
     # scanned this content — the true fail-closed terminal state. Log the exception
     # TYPE + stacktrace only (never the message, which could embed the content).
+    # This is deterministic (same input re-raises), so we {:cancel} — discard the
+    # content — rather than {:error}, which would burn Oban retries to no effect.
     e ->
       Logger.error(
         "regex scrub raised #{inspect(e.__struct__)}:\n" <>
           Exception.format_stacktrace(__STACKTRACE__)
       )
 
-      {:error, :scrub_unavailable}
+      {:cancel, :scrub_unavailable}
   end
 
   # Common tail: redact, then fail-closed verify that no high-confidence secret
@@ -349,5 +353,5 @@ defmodule RetrievalNode.Ingest.Scrubber do
     })
   end
 
-  defp gitleaks_cmd, do: Application.get_env(:retrieval_node, :gitleaks_cmd, "gitleaks")
+  defp gitleaks_cmd, do: Application.get_env(:retrieval_node, :gitleaks_cmd) || "gitleaks"
 end

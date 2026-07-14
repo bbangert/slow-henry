@@ -194,15 +194,15 @@ in naming, THIS section wins:
       `changed_files` (ls-tree/diff), `show` (full content), `grep`. Arg-list `System.cmd`
       (no shell), `find_executable` guard, `Path.safe_relative` on repo slug + file path.
       Tested against a real local repo (git is always present). Reused by Phase 7 MCP tools.
-- [ ] **(6b)** Source clients (thin): `Ingest.Jira` (Req REST, JQL
+- [x] **(6b)** Source clients (thin): `Ingest.Jira` (Req REST, JQL
       `resolutiondate` watermark, resolved/closed only), `Ingest.Drive` (Req +
       Changes API cursor, export Docs as `text/markdown`, handle deletions/unshares)
-- [ ] Workers `[oban]`:
-  - [ ] `RepoSync` / `JiraSync` / `DriveSync` (`:sync`) — diff vs watermark →
+- [x] Workers `[oban]`:
+  - [x] `RepoSync` / `JiraSync` / `DriveSync` (`:sync`) — diff vs watermark →
         `Ecto.Multi` bulk-insert `pending_chunks` (status `raw`) + one `ChunkFiles`
         job per file/issue/doc; advance watermark. `unique` on the source id;
         `{:snooze, n}` on 429 (parse `Retry-After`)
-  - [ ] `ChunkFiles` (`:chunk`) — **scrub → tree-sitter (guarded) → heuristic
+  - [x] `ChunkFiles` (`:chunk`) — **scrub → tree-sitter (guarded) → heuristic
         fallback on final attempt** (the `attempt >= max` pattern from `design-oban.md`
         §5); writes chunk rows to `pending_chunks`; enqueues one `EmbedBatch`.
         `timeout/1` 45s, `max_attempts: 5`, short custom backoff, unique on
@@ -210,17 +210,23 @@ in naming, THIS section wins:
         `:chunk_crashed` / `:unsupported_language`) — NOT on `:too_large` /
         `:binary_content` (hard rejections → skip the file; the heuristic must not
         re-chunk oversized/binary input). Phase 4 review finding.
-  - [ ] `EmbedBatch` (`:embed`) — `Embedding.embed_batch/1` over the batch → write
+  - [x] `EmbedBatch` (`:embed`) — `Embedding.embed_batch/1` over the batch → write
         384-dim `embedding` back → enqueue `UpsertChunks`. `max_attempts: 3`
-  - [ ] `UpsertChunks` (`:upsert`) — `Ecto.Multi.insert_all` into `Retrieval.Chunk`
+  - [x] `UpsertChunks` (`:upsert`) — `Ecto.Multi.insert_all` into `Retrieval.Chunk`
         with `on_conflict: {:replace, [...]}, conflict_target: [:source_id, :chunk_key]`,
         then delete consumed `pending_chunks`. Idempotent; `max_attempts: 5`
-- [ ] Cron: `RepoSync */15`, `JiraSync 0 * * * *`, `DriveSync */30` (per-source args)
-- [ ] Deletions: Drive unshare/removal + repo file deletion → delete matching
+- [x] Cron (`SyncScheduler` fan-out, source ids are dynamic): git */15, jira hourly, drive */30. Cron: `RepoSync */15`, `JiraSync 0 * * * *`, `DriveSync */30` (per-source args)
+- [x] Deletions: Drive unshare/removal + repo file deletion → delete matching
       `Retrieval.Chunk` rows
-- [ ] **Verify**: `mix test` with Oban `:manual`/`:inline` testing mode — one round
-      per source produces chunks end-to-end; re-running is a no-op (content_hash);
-      a parse-failing file still lands via heuristic fallback
+- [x] **Verify**: Oban `:manual` testing mode. **Full git pipeline e2e** (RepoSync real-git
+      diff → ChunkFiles → EmbedBatch → UpsertChunks) lands permanent chunks; secret redacted +
+      audited; re-ingest upserts not duplicates (chunk_key); deletions prune chunks; RepoSync
+      watermark advances / no-op when unchanged; JiraSync via Req.Test (429 → `{:snooze}`);
+      Drive/Jira parsing; SyncScheduler fan-out. 89 tests, credo/dialyzer/format clean.
+- [x] **Enabling changes**: migration extending `pending_chunks` with the Chunk-building fields
+      (source_id/source_type/repo/lang/chunk_key/breadcrumb/metadata/parse_status/secrets_status —
+      the Phase 1 staging schema was under-specified); `Oban.Migrations` (oban_jobs table);
+      test-env `Embedding.StubImpl` (deferred from Phase 3); `SyncScheduler` cron fan-out worker.
 
 ## Phase 7 — MCP tools `[mcp]` (Anubis; LAN-only, NO auth for the slice)
 
