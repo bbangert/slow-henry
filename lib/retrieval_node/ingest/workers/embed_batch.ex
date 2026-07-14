@@ -26,6 +26,13 @@ defmodule RetrievalNode.Ingest.Workers.EmbedBatch do
     rows = PendingChunks.fetch_many!(ids)
     vectors = rows |> Enum.map(&embed_text/1) |> Embedding.embed_batch()
 
+    # Fail loud (→ Oban retry) rather than let Enum.zip silently drop the tail if
+    # the serving ever returns fewer vectors than rows — a truncated zip would
+    # strand those chunk rows unembedded with no error surfaced.
+    if length(vectors) != length(rows) do
+      raise "embed_batch returned #{length(vectors)} vectors for #{length(rows)} rows"
+    end
+
     pairs =
       rows
       |> Enum.zip(vectors)

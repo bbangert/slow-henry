@@ -32,7 +32,7 @@ defmodule RetrievalNode.Ingest.Jira do
     case Req.get(req(), url: "/rest/api/3/search", params: params) do
       {:ok, %{status: 200, body: body}} -> {:ok, parse_issues(body)}
       {:ok, %{status: 429} = resp} -> {:snooze, retry_after(resp)}
-      {:ok, %{status: status, body: body}} -> {:error, {:jira_http, status, body}}
+      {:ok, %{status: status, body: body}} -> {:error, {:jira_http, status, truncate(body)}}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -89,6 +89,11 @@ defmodule RetrievalNode.Ingest.Jira do
       _ -> 60
     end
   end
+
+  # Oban persists a failed job's error term to the jobs table (and logs it), so we
+  # only keep a short, inspected prefix of the response body — enough to debug an
+  # API error without spilling a full (potentially sensitive) payload into storage.
+  defp truncate(body), do: body |> inspect(limit: 5, printable_limit: 200) |> String.slice(0, 200)
 
   defp req do
     cfg = Application.get_env(:retrieval_node, :jira, [])

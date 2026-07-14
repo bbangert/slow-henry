@@ -28,7 +28,7 @@ defmodule RetrievalNode.Ingest.Drive do
     case Req.get(req(), url: "/drive/v3/changes", params: params) do
       {:ok, %{status: 200, body: body}} -> {:ok, parse_changes(body)}
       {:ok, %{status: 429} = resp} -> {:snooze, retry_after(resp)}
-      {:ok, %{status: status, body: body}} -> {:error, {:drive_http, status, body}}
+      {:ok, %{status: status, body: body}} -> {:error, {:drive_http, status, truncate(body)}}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -52,11 +52,13 @@ defmodule RetrievalNode.Ingest.Drive do
   @spec export_doc(String.t()) :: {:ok, String.t()} | {:error, term()}
   def export_doc(file_id) do
     case Req.get(req(),
-           url: "/drive/v3/files/#{file_id}/export",
+           # Encode the id as a single path segment — it comes from a Drive API
+           # response, so don't let it inject extra path/query structure.
+           url: "/drive/v3/files/#{URI.encode(file_id, &URI.char_unreserved?/1)}/export",
            params: [mimeType: "text/markdown"]
          ) do
       {:ok, %{status: 200, body: body}} -> {:ok, to_string(body)}
-      {:ok, %{status: status, body: body}} -> {:error, {:drive_http, status, body}}
+      {:ok, %{status: status, body: body}} -> {:error, {:drive_http, status, truncate(body)}}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -75,6 +77,11 @@ defmodule RetrievalNode.Ingest.Drive do
       _ -> 60
     end
   end
+
+  # Oban persists a failed job's error term to the jobs table (and logs it), so we
+  # only keep a short, inspected prefix of the response body — enough to debug an
+  # API error without spilling a full (potentially sensitive) payload into storage.
+  defp truncate(body), do: body |> inspect(limit: 5, printable_limit: 200) |> String.slice(0, 200)
 
   defp req do
     cfg = Application.get_env(:retrieval_node, :drive, [])

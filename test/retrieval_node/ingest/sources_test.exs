@@ -3,9 +3,9 @@ defmodule RetrievalNode.Ingest.SourcesTest do
   use Oban.Testing, repo: RetrievalNode.Repo
 
   alias RetrievalNode.Ingest.{Drive, Jira}
-  alias RetrievalNode.Ingest.Workers.{JiraSync, RepoSync, SyncScheduler}
+  alias RetrievalNode.Ingest.Workers.{ChunkFiles, DriveSync, JiraSync, RepoSync, SyncScheduler}
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.{PendingChunk, Source, SyncState}
+  alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source, SyncState}
 
   describe "Jira client (pure)" do
     test "build_jql adds a resolutiondate watermark clause when present" do
@@ -135,6 +135,98 @@ defmodule RetrievalNode.Ingest.SourcesTest do
       end)
 
       assert {:snooze, 30} = perform_job(JiraSync, %{"source_id" => source.id})
+    end
+  end
+
+  describe "DriveSync (Req.Test)" do
+    setup do
+      start_supervised!({Oban, Application.fetch_env!(:retrieval_node, Oban)})
+      prev = Application.get_env(:retrieval_node, :drive_req_options)
+      Application.put_env(:retrieval_node, :drive_req_options, plug: {Req.Test, __MODULE__})
+      on_exit(fn -> Application.put_env(:retrieval_node, :drive_req_options, prev) end)
+      :ok
+    end
+
+    test "exports a changed Doc, stages it, prunes a removed Doc, advances the cursor" do
+      source =
+        Repo.insert!(%Source{source_type: :drive_folder, name: "folder", identifier: "root"})
+
+      # a pre-existing chunk for the doc that this sync reports as removed
+      Repo.insert!(
+        Chunk.upsert_changeset(%Chunk{}, %{
+          source_id: source.id,
+          source_type: :drive_folder,
+          chunk_key: "old-key",
+          content_hash: "h",
+          content: "old",
+          context_breadcrumb: "Design Doc",
+          metadata: %{"doc_id" => "d2"}
+        })
+      )
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        if String.ends_with?(conn.request_path, "/export") do
+          Plug.Conn.send_resp(conn, 200, "# Design Doc\n\nbody text")
+        else
+          Req.Test.json(conn, %{
+            "newStartPageToken" => "tok-9",
+            "changes" => [
+              %{
+                "fileId" => "d1",
+                "file" => %{
+                  "id" => "d1",
+                  "name" => "Design Doc",
+                  "mimeType" => "application/vnd.google-apps.document"
+                }
+              },
+              %{"fileId" => "d2", "removed" => true}
+            ]
+          })
+        end
+      end)
+
+      assert :ok = perform_job(DriveSync, %{"source_id" => source.id})
+
+      [raw] = Repo.all(PendingChunk)
+      assert raw.natural_key == "drive:d1"
+      assert raw.source_type == "drive_folder"
+      assert raw.raw_content =~ "Design Doc"
+      assert_enqueued(worker: ChunkFiles)
+
+      # removed doc's chunk pruned
+      assert Repo.aggregate(Chunk, :count, :id) == 0
+
+      state = Repo.get_by!(SyncState, source_id: source.id)
+      assert state.cursor["start_page_token"] == "tok-9"
+    end
+
+    test "a 429 returns {:snooze, _} and writes nothing" do
+      source = Repo.insert!(%Source{source_type: :drive_folder, name: "f", identifier: "root"})
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("retry-after", "45")
+        |> Plug.Conn.send_resp(429, "rate limited")
+      end)
+
+      assert {:snooze, 45} = perform_job(DriveSync, %{"source_id" => source.id})
+      assert Repo.all(PendingChunk) == []
+      refute_enqueued(worker: ChunkFiles)
+    end
+  end
+
+  describe "worker uniqueness" do
+    setup do
+      start_supervised!({Oban, Application.fetch_env!(:retrieval_node, Oban)})
+      :ok
+    end
+
+    test "ChunkFiles dedups a second enqueue for the same pending_chunk_id" do
+      assert {:ok, _} = Oban.insert(ChunkFiles.new(%{"pending_chunk_id" => 123}))
+      assert {:ok, job} = Oban.insert(ChunkFiles.new(%{"pending_chunk_id" => 123}))
+      # the unique constraint collapses the duplicate onto the first job
+      assert job.conflict?
+      assert Repo.aggregate(Oban.Job, :count, :id) == 1
     end
   end
 end

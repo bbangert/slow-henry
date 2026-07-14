@@ -95,4 +95,90 @@ defmodule RetrievalNode.Ingest.PipelineTest do
 
     assert Repo.aggregate(Chunk, :count, :id) == count_after_first
   end
+
+  # The scrub `{:cancel, _}` path (unredactable secret / too-large content) must
+  # reap the raw row — it still holds the un-redacted secret (review B1).
+  test "ChunkFiles reaps the raw row when scrub cancels (fail-closed)", %{source: source} do
+    # >5MB trips Scrubber's deterministic {:cancel, :content_too_large}.
+    raw = seed_raw(source, String.duplicate("a", 5_000_001))
+
+    assert {:cancel, _} = perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id})
+
+    refute Repo.get(PendingChunk, raw.id)
+    assert Repo.all(from p in PendingChunk, where: p.status == "chunked") == []
+    refute_enqueued(worker: EmbedBatch)
+  end
+
+  describe "ChunkFiles chunker-error branches (fake chunking impl)" do
+    setup do
+      prev = Application.get_env(:retrieval_node, :chunking_impl)
+      Application.put_env(:retrieval_node, :chunking_impl, RetrievalNode.Chunking.FakeImpl)
+
+      on_exit(fn ->
+        Application.put_env(:retrieval_node, :chunking_impl, prev)
+        Application.delete_env(:retrieval_node, :fake_chunk_result)
+      end)
+    end
+
+    defp force_chunk(result), do: Application.put_env(:retrieval_node, :fake_chunk_result, result)
+
+    test "unsupported_language falls back to the heuristic chunker", %{source: source} do
+      force_chunk({:error, :unsupported_language})
+      raw = seed_raw(source, "def a():\n    return 1\n\ndef b():\n    return 2\n")
+
+      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id})
+
+      refute Repo.get(PendingChunk, raw.id)
+      chunks = Repo.all(from p in PendingChunk, where: p.status == "chunked")
+      assert chunks != []
+      assert Enum.all?(chunks, &(&1.parse_status == "heuristic_fallback"))
+      assert_enqueued(worker: EmbedBatch)
+    end
+
+    for err <- [:too_large, :binary_content] do
+      test "#{err} is skipped (cancel) and the raw row reaped", %{source: source} do
+        force_chunk({:error, unquote(err)})
+        raw = seed_raw(source, "def a():\n    return 1\n")
+
+        assert {:cancel, _} = perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id})
+
+        refute Repo.get(PendingChunk, raw.id)
+        assert Repo.all(from p in PendingChunk, where: p.status == "chunked") == []
+        refute_enqueued(worker: EmbedBatch)
+      end
+    end
+
+    test "a parse crash on the FINAL attempt falls back to heuristic", %{source: source} do
+      force_chunk({:error, :chunk_crashed})
+      raw = seed_raw(source, "def a():\n    return 1\n")
+
+      assert :ok =
+               perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id},
+                 attempt: 5,
+                 max_attempts: 5
+               )
+
+      refute Repo.get(PendingChunk, raw.id)
+      chunks = Repo.all(from p in PendingChunk, where: p.status == "chunked")
+      assert chunks != []
+      assert Enum.all?(chunks, &(&1.parse_status == "crashed_fallback"))
+    end
+
+    test "a parse crash before the final attempt errors (retryable), keeping the raw row", %{
+      source: source
+    } do
+      force_chunk({:error, :chunk_crashed})
+      raw = seed_raw(source, "def a():\n    return 1\n")
+
+      assert {:error, :chunk_crashed} =
+               perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id},
+                 attempt: 1,
+                 max_attempts: 5
+               )
+
+      # not reaped — a later retry can still succeed
+      assert Repo.get(PendingChunk, raw.id)
+      assert Repo.all(from p in PendingChunk, where: p.status == "chunked") == []
+    end
+  end
 end
