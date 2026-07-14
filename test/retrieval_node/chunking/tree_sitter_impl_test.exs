@@ -43,8 +43,9 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
 
     test "a raising parse becomes {:error, {:chunk_crashed, _}} — never kills the caller" do
       assert {:error, {:chunk_crashed, _reason}} = TSI.guarded(fn -> raise "boom" end)
-      # The caller (this test process) is still alive.
-      assert Process.alive?(self())
+      # The caller survives and can still do work — a regression to a linked
+      # `async` would have killed this process before reaching here.
+      assert {:ok, [:still_working]} = TSI.guarded(fn -> {:ok, [:still_working]} end)
     end
 
     test "an exiting parse becomes {:error, {:chunk_crashed, _}}" do

@@ -24,6 +24,11 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
 
   @max_bytes Application.compile_env(:retrieval_node, [:chunking, :max_bytes], 2_000_000)
   @call_timeout_ms Application.compile_env(:retrieval_node, [:chunking, :call_timeout_ms], 5_000)
+
+  # DEPENDENCY: this named Task.Supervisor must be in the supervision tree before
+  # any runtime caller invokes chunk/2 — otherwise `async_nolink` raises :noproc
+  # in the caller (which guarded/1 cannot catch, since no task exists yet). Added
+  # to the tree in Phase 8; until then only tests use it (via start_supervised!).
   @supervisor RetrievalNode.ChunkTaskSupervisor
 
   @allowed_languages ~w(python javascript typescript go rust ruby java)
@@ -50,9 +55,11 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
 
   @impl true
   def chunk(source, language) when is_binary(source) do
-    with :ok <- check_size(source),
-         :ok <- check_binary_content(source),
-         :ok <- check_language_allowlist(language) do
+    # Cheapest check first: an O(1) allowlist lookup short-circuits before the
+    # O(n) binary-content scan of an up-to-2MB blob.
+    with :ok <- check_language_allowlist(language),
+         :ok <- check_size(source),
+         :ok <- check_binary_content(source) do
       guarded(fn -> parse_to_chunks(source, language) end)
     end
   end
@@ -72,6 +79,10 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   def guarded(fun) when is_function(fun, 0) do
     task = Task.Supervisor.async_nolink(@supervisor, fun)
 
+    # NOTE: the `yield || shutdown` race is handled by Task itself — if the task
+    # replies just as the timeout fires, Task.shutdown's flush picks up the reply
+    # and returns {:ok, result}; only a genuine kill returns nil. Do not "fix"
+    # this into something more elaborate; all five shapes below are reachable.
     case Task.yield(task, @call_timeout_ms) || Task.shutdown(task, :brutal_kill) do
       {:ok, {:ok, chunks}} -> {:ok, chunks}
       {:ok, {:error, reason}} -> {:error, reason}
@@ -137,10 +148,27 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
     end
   end
 
+  # Collect direct named children in one O(n) cursor pass. The indexed
+  # `node_named_child/2` accessor rescans from the first child each call (O(n²)
+  # over siblings); the TreeCursor walks siblings in O(1) amortized.
   defp named_children(node) do
-    case TS.node_named_child_count(node) do
-      0 -> []
-      n -> Enum.map(0..(n - 1), &TS.node_named_child(node, &1))
+    cursor = TS.node_walk(node)
+
+    if TS.treecursor_goto_first_child(cursor) do
+      collect_siblings(cursor, [])
+    else
+      []
+    end
+  end
+
+  defp collect_siblings(cursor, acc) do
+    node = TS.treecursor_node(cursor)
+    acc = if TS.node_is_named(node), do: [node | acc], else: acc
+
+    if TS.treecursor_goto_next_sibling(cursor) do
+      collect_siblings(cursor, acc)
+    else
+      Enum.reverse(acc)
     end
   end
 
@@ -167,6 +195,9 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
 
   defp slice(source, node) do
     start_byte = TS.node_start_byte(node)
-    binary_part(source, start_byte, TS.node_end_byte(node) - start_byte)
+    end_byte = TS.node_end_byte(node)
+    # tree-sitter always gives end >= start; guard anyway so a malformed offset
+    # yields "" rather than a silent backwards read.
+    if end_byte > start_byte, do: binary_part(source, start_byte, end_byte - start_byte), else: ""
   end
 end

@@ -18,7 +18,12 @@ defmodule RetrievalNode.Chunking.Breadcrumb do
   """
   @spec build(String.t(), String.t() | nil) :: String.t()
   def build(prefix, symbol_trail) when symbol_trail in [nil, ""], do: prefix
-  def build(prefix, symbol_trail), do: prefix <> @separator <> symbol_trail
+  def build(prefix, symbol_trail), do: prefix <> @separator <> sanitize(symbol_trail)
+
+  # The symbol trail comes from parsed (untrusted) identifiers. Collapse any
+  # newlines/control whitespace to spaces so a malformed name can't inject line
+  # breaks into the breadcrumb (which is embedded and stored).
+  defp sanitize(trail), do: String.replace(trail, ~r/\s+/, " ")
 
   @doc "Prepend a breadcrumb to chunk text (the string that actually gets embedded)."
   @spec prepend(String.t(), String.t()) :: String.t()

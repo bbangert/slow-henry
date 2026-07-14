@@ -151,10 +151,12 @@ in naming, THIS section wins:
       scheduler → raises peer-node priority. Recorded in scratchpad.
 - [x] Breadcrumb builder — `RetrievalNode.Chunking.Breadcrumb.build/2` (path/title +
       symbol trail) + `prepend/2` (attach to text before embedding)
-- [x] **Verify**: 31 tests pass NIF-free (guards reject oversized/binary/unsupported;
-      `guarded/1` crash→`{:chunk_crashed}` & timeout→`:chunk_timeout` without killing
-      caller; heuristic produces chunks, respects blank/brace boundaries) + 2 tagged
-      `:integration` real-parse tests (python/js AST chunking). credo/dialyzer/format clean
+- [x] **Verify**: ~23 Phase-4 NIF-free unit tests (guards reject oversized/binary/unsupported;
+      `guarded/1` crash→`{:chunk_crashed}` & timeout→`:chunk_timeout` without killing caller;
+      heuristic blank/brace boundaries + hard-cap safety valve + CRLF; breadcrumb sanitize) + 2
+      tagged `:integration` real-parse tests (python/js AST chunking). credo/dialyzer/format clean.
+      Post-review hardening: heuristic hard byte-cap (unbounded-chunk fix), cursor-based O(n)
+      named-children, guard reorder, breadcrumb newline sanitize (see reviews/phase-4-review.md).
 
 ## Phase 5 — Secrets scrubbing `[security]` (from `design-oban.md` §1, `secrets-scrubbing.md`)
 
@@ -188,7 +190,10 @@ in naming, THIS section wins:
         fallback on final attempt** (the `attempt >= max` pattern from `design-oban.md`
         §5); writes chunk rows to `pending_chunks`; enqueues one `EmbedBatch`.
         `timeout/1` 45s, `max_attempts: 5`, short custom backoff, unique on
-        `pending_chunk_id`
+        `pending_chunk_id`. **Fallback only on parse failures** (`:chunk_timeout` /
+        `:chunk_crashed` / `:unsupported_language`) — NOT on `:too_large` /
+        `:binary_content` (hard rejections → skip the file; the heuristic must not
+        re-chunk oversized/binary input). Phase 4 review finding.
   - [ ] `EmbedBatch` (`:embed`) — `Embedding.embed_batch/1` over the batch → write
         384-dim `embedding` back → enqueue `UpsertChunks`. `max_attempts: 3`
   - [ ] `UpsertChunks` (`:upsert`) — `Ecto.Multi.insert_all` into `Retrieval.Chunk`

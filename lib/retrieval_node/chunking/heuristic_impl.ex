@@ -19,6 +19,13 @@ defmodule RetrievalNode.Chunking.HeuristicImpl do
   # boundary rather than split mid-block.
   @max_chunk_bytes 1_500
 
+  # Hard ceiling: force a boundary regardless of brace balance. Without it, an
+  # unmatched brace inside a string/comment literal keeps `balance` positive
+  # forever so the soft cap never fires, and the rest of the file accumulates
+  # into one unbounded chunk. (A single physical line longer than this still
+  # yields one chunk — bounded by the upstream 2MB file cap in TreeSitterImpl.)
+  @hard_max_bytes 6_000
+
   @impl true
   def allowed_languages, do: TreeSitterImpl.allowed_languages()
 
@@ -26,6 +33,7 @@ defmodule RetrievalNode.Chunking.HeuristicImpl do
   def chunk(source, _language) when is_binary(source) do
     chunks =
       source
+      |> normalize_newlines()
       |> String.split("\n")
       |> Enum.with_index(1)
       |> Enum.reduce(new_acc(), &step/2)
@@ -34,6 +42,10 @@ defmodule RetrievalNode.Chunking.HeuristicImpl do
 
     {:ok, chunks}
   end
+
+  # Normalize CRLF/CR to LF so `\r` doesn't leak into chunk text (or the embedded
+  # vector) on Windows-authored files.
+  defp normalize_newlines(source), do: String.replace(source, ~r/\r\n?/, "\n")
 
   defp new_acc, do: %{chunks: [], lines: [], start: nil, balance: 0, bytes: 0}
 
@@ -50,9 +62,14 @@ defmodule RetrievalNode.Chunking.HeuristicImpl do
     lines = [{line, idx} | acc.lines]
     bytes = acc.bytes + byte_size(line) + 1
     start = acc.start || idx
-    boundary? = balance <= 0 and (blank?(line) or bytes >= @max_chunk_bytes) and acc.lines != []
 
-    if boundary? do
+    soft_boundary? =
+      balance <= 0 and (blank?(line) or bytes >= @max_chunk_bytes) and acc.lines != []
+
+    # Hard cap fires regardless of brace balance — the safety valve.
+    hard_boundary? = bytes >= @hard_max_bytes
+
+    if soft_boundary? or hard_boundary? do
       reset(%{acc | chunks: [build(lines, start) | acc.chunks]})
     else
       %{acc | lines: lines, start: start, balance: max(balance, 0), bytes: bytes}

@@ -20,4 +20,8 @@ defmodule RetrievalNode.Chunking.BreadcrumbTest do
     assert Breadcrumb.prepend("lib/foo.ex > Foo", "def bar, do: :ok") ==
              "lib/foo.ex > Foo\n\ndef bar, do: :ok"
   end
+
+  test "collapses newlines/whitespace in an untrusted symbol trail" do
+    assert Breadcrumb.build("lib/foo.ex", "Foo\n> injected") == "lib/foo.ex > Foo > injected"
+  end
 end

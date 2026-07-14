@@ -45,4 +45,29 @@ defmodule RetrievalNode.Chunking.HeuristicImplTest do
   test "returns no chunks for whitespace-only input" do
     assert {:ok, []} = HeuristicImpl.chunk("\n\n   \n", "text")
   end
+
+  test "hard byte-cap prevents an unbounded chunk when brace balance never returns to zero" do
+    # Every line opens a brace inside a string literal, so `balance` climbs forever
+    # and the soft (balance<=0) boundary can never fire. The hard cap must still
+    # split this into bounded pieces rather than one giant chunk.
+    source = String.duplicate(~s(x = "{"\n), 1_000)
+    {:ok, chunks} = HeuristicImpl.chunk(source, "js")
+
+    assert length(chunks) >= 2
+    assert Enum.all?(chunks, &(byte_size(&1.text) <= 7_000))
+  end
+
+  test "soft cap splits a large brace-balanced block with no blank lines" do
+    source = String.duplicate("statement_line_here()\n", 200)
+    {:ok, chunks} = HeuristicImpl.chunk(source, "text")
+
+    assert length(chunks) >= 2
+  end
+
+  test "normalizes CRLF so no carriage return leaks into chunk text" do
+    {:ok, chunks} = HeuristicImpl.chunk("a\r\nb\r\n\r\nc\r\n", "text")
+
+    assert Enum.map(chunks, & &1.text) == ["a\nb", "c"]
+    refute Enum.any?(chunks, &String.contains?(&1.text, "\r"))
+  end
 end
