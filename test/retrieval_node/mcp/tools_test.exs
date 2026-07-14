@@ -108,6 +108,25 @@ defmodule RetrievalNode.MCP.ToolsTest do
       assert err(Grep, %{pattern: "[", repo: "acme/app"}) =~ "pattern"
     end
 
+    test "caps a huge result set and flags it truncated", %{root: root} do
+      # 6 files × 150 matching lines; git grep's -m caps each file at 100 → 600
+      # matches, over the 500 aggregate cap.
+      files = for i <- 1..6, do: {"f#{i}.txt", String.duplicate("match\n", 150)}
+      seed_repo(root, "acme/big", files)
+
+      %{"matches" => matches, "truncated" => truncated} =
+        ok(Grep, %{pattern: "match", repo: "acme/big"})
+
+      assert truncated == true
+      assert length(matches) == 500
+    end
+
+    test "a within-cap result is not flagged truncated", %{root: root} do
+      seed_repo(root, "acme/small", [{"a.py", "needle\n"}])
+      %{"truncated" => truncated} = ok(Grep, %{pattern: "needle", repo: "acme/small"})
+      assert truncated == false
+    end
+
     test "repo-less grep aggregates across all indexed repos", %{root: root} do
       seed_repo(root, "acme/one", [{"a.py", "needle here\n"}])
       seed_repo(root, "acme/two", [{"b.py", "needle there\n"}])

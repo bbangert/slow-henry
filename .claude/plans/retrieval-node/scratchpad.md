@@ -53,6 +53,13 @@ Companion to `plan.md`. Records why things are the way they are, and paths NOT t
       parser/cursor/node API — TreeSitterImpl builds the tree-walk chunk extraction itself.
 - [ ] **Spot-check Anubis tool-failure return tuple** against `deps/anubis_mcp` source
       (docs only confirmed the success path + `Response.error/2`).
+- [ ] **Phase 8 hardening — stream/bound `git grep` output (PR #7 Copilot #3).** `GitMirror`
+      shells out via `System.cmd`, which buffers ALL stdout before the tool's aggregate
+      cap. `-m 100` (per-file) + the 20s timeout bound the worst case, but a common
+      unblocked pattern (`def`) across many files can still spike memory pre-cap. Fix:
+      switch grep to a `Port`/`System.cmd(into:)` stream that stops after N bytes/matches
+      and closes early (needs NUL-chunk-boundary-safe parsing). Deferred from the Phase 7
+      review as a LAN-trust-acceptable robustness item.
 - [ ] Confirm arm64 grammar prefetch works for the full language allowlist at build time.
 - [ ] Benchmark chunk-size cap + Matryoshka 384-vs-768 delta during the first slice.
 - [x] **Verify Postgres `vector` extension ≥ 0.5.0** (HNSW) — DONE. Installed 0.8.5,

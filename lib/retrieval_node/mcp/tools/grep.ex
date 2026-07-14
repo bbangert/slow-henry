@@ -32,9 +32,8 @@ defmodule RetrievalNode.MCP.Tools.Grep do
 
   defp run(pattern, repo, frame) do
     with {:ok, slugs} <- slugs(repo),
-         {:ok, matches} <- grep_all(slugs, pattern) do
-      capped = Enum.take(matches, @max_matches)
-      payload = %{matches: capped, truncated: length(matches) > @max_matches}
+         {:ok, matches, truncated?} <- grep_all(slugs, pattern) do
+      payload = %{matches: matches, truncated: truncated?}
       {:reply, Response.json(Response.tool(), payload), frame}
     else
       {:error, reason} -> reply_error(format_error(reason), frame)
@@ -47,23 +46,34 @@ defmodule RetrievalNode.MCP.Tools.Grep do
     with {:ok, slug} <- Ingest.resolve_git_repo(repo), do: {:ok, [slug]}
   end
 
-  # Halt on the first grep error (e.g. an invalid pattern → git grep exit 2) so it
-  # surfaces to the caller; stop early once the aggregate cap is reached so a
-  # repo-less grep can't keep buffering across every repo.
+  # Collect matches across repos, halting on the first grep error (so an invalid
+  # pattern surfaces) and once the aggregate cap is reached (so a repo-less grep
+  # can't keep buffering). Per-repo lists are prepended (O(1)) with a running count
+  # — no `length/1` per repo, no `acc ++ matches` — and flattened once at the end.
+  # `truncated?` is true iff we halted at the cap (conservative: on the exactly-cap
+  # boundary it may over-report, never under-report).
   defp grep_all(slugs, pattern) do
-    Enum.reduce_while(slugs, {:ok, []}, fn slug, {:ok, acc} ->
-      if length(acc) >= @max_matches,
-        do: {:halt, {:ok, acc}},
-        else: grep_step(slug, pattern, acc)
-    end)
-  end
+    slugs
+    |> Enum.reduce_while({[], 0}, fn slug, {chunks, count} ->
+      case GitMirror.grep(slug, pattern) do
+        {:ok, matches} ->
+          count = count + length(matches)
+          chunks = [matches | chunks]
+          if count >= @max_matches, do: {:halt, {:capped, chunks}}, else: {:cont, {chunks, count}}
 
-  defp grep_step(slug, pattern, acc) do
-    case GitMirror.grep(slug, pattern) do
-      {:ok, matches} -> {:cont, {:ok, acc ++ matches}}
-      {:error, reason} -> {:halt, {:error, reason}}
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:error, reason} -> {:error, reason}
+      {:capped, chunks} -> {:ok, flatten_take(chunks), true}
+      {chunks, _count} -> {:ok, flatten_take(chunks), false}
     end
   end
+
+  defp flatten_take(chunks),
+    do: chunks |> Enum.reverse() |> Enum.concat() |> Enum.take(@max_matches)
 
   defp reply_error(msg, frame), do: {:reply, Response.error(Response.tool(), msg), frame}
 

@@ -290,6 +290,10 @@ in naming, THIS section wins:
 - [ ] `/healthz` readiness gates: (1) grammar-cache present for allowlist,
       (2) `Nx.default_backend()` is EXLA (not silent BinaryBackend), (3) Nx.Serving
       warmed, (4) DB reachable — ready only when all pass
+- [ ] **Harden `git grep` memory (deferred from Phase 7 review, Copilot #3)**: `GitMirror`
+      buffers all `System.cmd` stdout before the tool caps it. `-m 100`/file + 20s timeout
+      bound it, but stream via `Port`/`System.cmd(into:)` with an N-byte/N-match budget +
+      early close so the cap is enforced during collection (NUL-boundary-safe parsing)
   - [ ] **`Embedding.Serving.ready?/0` must not go stale across a serving crash/restart**
         (Copilot review, PR #2): the `:persistent_term` flag stays `true` after the
         supervised serving restarts without re-warming. Reset it to `false` when the
