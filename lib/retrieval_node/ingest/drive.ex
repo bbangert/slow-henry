@@ -71,9 +71,15 @@ defmodule RetrievalNode.Ingest.Drive do
     %{doc_id: file["id"], name: file["name"], text: ""}
   end
 
+  # Retry-After may be absent, an HTTP-date (RFC-allowed), or garbage — none of
+  # which are a delta-seconds integer. Parse defensively and fall back to 60s so a
+  # rate limit always yields {:snooze, _} rather than a raised (crashed) job.
   defp retry_after(resp) do
-    case Req.Response.get_header(resp, "retry-after") do
-      [value | _] -> String.to_integer(value)
+    with [value | _] <- Req.Response.get_header(resp, "retry-after"),
+         {seconds, _} <- Integer.parse(value),
+         true <- seconds > 0 do
+      seconds
+    else
       _ -> 60
     end
   end

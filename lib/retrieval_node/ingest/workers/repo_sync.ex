@@ -1,11 +1,14 @@
 defmodule RetrievalNode.Ingest.Workers.RepoSync do
   @moduledoc """
   Watermark-driven "discover work" job for a git source. Ensures the bare mirror is
-  current, diffs `changed_files` between the stored `last_sha` and `HEAD`, then for
-  each changed file that still exists inserts a raw `pending_chunks` row and enqueues
-  a `ChunkFiles` job; files that vanished are deletions — their permanent `chunks`
-  are removed. The watermark is advanced last, so a crash re-discovers the same work
-  (the `ChunkFiles`/`UpsertChunks` idempotency makes re-processing harmless).
+  current, takes the `diff --name-status` (`changed_entries`) between the stored
+  `last_sha` and `HEAD`, then for each added/modified file inserts a raw
+  `pending_chunks` row and enqueues a `ChunkFiles` job; files the diff marks
+  **deleted** have their permanent `chunks` removed. Deletion is decided by the diff
+  status, not by whether `show` can read the blob, so an unreadable-but-present file
+  is skipped rather than wrongly pruned. The watermark is advanced last (only after
+  enqueues succeed), so a crash re-discovers the same work (the `ChunkFiles`/
+  `UpsertChunks` idempotency makes re-processing harmless).
 
   `unique` on `source_id` collapses overlapping cron/webhook triggers for one repo.
   """
@@ -55,21 +58,19 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   end
 
   defp sync_changes(source, slug, last_sha, new_sha, sync_state) do
-    with {:ok, files} <- GitMirror.changed_files(slug, last_sha, new_sha) do
-      {existing, deleted} = partition_files(slug, files, new_sha)
+    with {:ok, entries} <- GitMirror.changed_entries(slug, last_sha, new_sha) do
+      # Deletions come from the diff status, NOT from probing `show` — a file that
+      # still exists but is unreadable ({:error, :file_too_large}) must be skipped,
+      # never mistaken for a deletion and pruned.
+      {deleted, present} = Enum.split_with(entries, fn {status, _} -> status == :deleted end)
 
-      delete_removed(source, deleted)
-      enqueue_changed(source, slug, existing, new_sha)
-      advance_watermark(sync_state, new_sha)
-      :ok
+      delete_removed(source, Enum.map(deleted, &elem(&1, 1)))
+
+      with :ok <- enqueue_changed(source, slug, Enum.map(present, &elem(&1, 1)), new_sha) do
+        advance_watermark(sync_state, new_sha)
+        :ok
+      end
     end
-  end
-
-  # A changed file that `show` can no longer read at new_sha was deleted.
-  defp partition_files(slug, files, new_sha) do
-    Enum.split_with(files, fn path ->
-      match?({:ok, _}, GitMirror.show(slug, path, new_sha))
-    end)
   end
 
   defp delete_removed(_source, []), do: :ok
@@ -88,7 +89,16 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   defp enqueue_changed(source, slug, paths, new_sha) do
     rows = Enum.flat_map(paths, &raw_row(source, slug, &1, new_sha))
     {:ok, ids} = PendingChunks.insert_raw_all(rows)
-    Enum.each(ids, &Oban.insert(ChunkFiles.new(%{"pending_chunk_id" => &1})))
+
+    # Surface a failed enqueue ({:error, _}) so perform errors and the watermark
+    # isn't advanced past staged rows that never got a ChunkFiles job. A unique
+    # overlap comes back {:ok, conflict?} and is fine.
+    Enum.reduce_while(ids, :ok, fn id, :ok ->
+      case Oban.insert(ChunkFiles.new(%{"pending_chunk_id" => id})) do
+        {:ok, _job} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
 
   defp raw_row(source, slug, path, new_sha) do

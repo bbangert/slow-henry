@@ -36,13 +36,28 @@ defmodule RetrievalNode.Ingest.Workers.JiraSync do
   defp ingest(source, state, issues) do
     rows = Enum.map(issues, &raw_row(source, &1))
     {:ok, ids} = PendingChunks.insert_raw_all(rows)
-    Enum.each(ids, &Oban.insert(ChunkFiles.new(%{"pending_chunk_id" => &1})))
 
-    new_watermark =
-      issues |> Enum.map(& &1.resolutiondate) |> Enum.reject(&is_nil/1) |> Enum.max(fn -> nil end)
+    # Don't advance the watermark past issues whose ChunkFiles enqueue failed —
+    # error so Oban retries. Unique overlaps return {:ok, conflict?} and pass.
+    with :ok <- enqueue_chunk_files(ids) do
+      new_watermark =
+        issues
+        |> Enum.map(& &1.resolutiondate)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.max(fn -> nil end)
 
-    advance_watermark(state, new_watermark)
-    :ok
+      advance_watermark(state, new_watermark)
+      :ok
+    end
+  end
+
+  defp enqueue_chunk_files(ids) do
+    Enum.reduce_while(ids, :ok, fn id, :ok ->
+      case Oban.insert(ChunkFiles.new(%{"pending_chunk_id" => id})) do
+        {:ok, _job} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
 
   defp raw_row(source, issue) do

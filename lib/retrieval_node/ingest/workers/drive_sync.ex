@@ -41,18 +41,28 @@ defmodule RetrievalNode.Ingest.Workers.DriveSync do
     results = Enum.map(changed, &raw_row(source, &1))
     rows = for {:ok, row} <- results, do: row
     {:ok, ids} = PendingChunks.insert_raw_all(rows)
-    Enum.each(ids, &Oban.insert(ChunkFiles.new(%{"pending_chunk_id" => &1})))
 
-    # Advancing the cursor past a Doc we failed to export would skip it forever
-    # (it won't reappear in the next Changes page). If any export failed — likely a
-    # transient 429/5xx — stage the successes (idempotent via chunk_key) but leave
-    # the cursor put and error so Oban re-runs the page; the successes just upsert.
-    if Enum.any?(results, &match?({:error, _}, &1)) do
-      {:error, :export_incomplete}
-    else
-      advance_watermark(state, new_cursor)
-      :ok
+    # Advancing the cursor past a Doc we failed to export/enqueue would skip it
+    # forever (it won't reappear in the next Changes page). Stage the successes
+    # (idempotent via chunk_key), but if any export OR enqueue failed — typically a
+    # transient 429/5xx — leave the cursor put and error so Oban re-runs the page.
+    with :ok <- enqueue_chunk_files(ids) do
+      if Enum.any?(results, &match?({:error, _}, &1)) do
+        {:error, :export_incomplete}
+      else
+        advance_watermark(state, new_cursor)
+        :ok
+      end
     end
+  end
+
+  defp enqueue_chunk_files(ids) do
+    Enum.reduce_while(ids, :ok, fn id, :ok ->
+      case Oban.insert(ChunkFiles.new(%{"pending_chunk_id" => id})) do
+        {:ok, _job} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
 
   defp raw_row(source, doc) do

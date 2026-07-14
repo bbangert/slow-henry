@@ -136,6 +136,19 @@ defmodule RetrievalNode.Ingest.SourcesTest do
 
       assert {:snooze, 30} = perform_job(JiraSync, %{"source_id" => source.id})
     end
+
+    test "a 429 with a non-integer Retry-After falls back to the default (no crash)" do
+      source = Repo.insert!(%Source{source_type: :jira_project, name: "p", identifier: "P"})
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        conn
+        # an HTTP-date is RFC-valid but not delta-seconds — must NOT raise
+        |> Plug.Conn.put_resp_header("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")
+        |> Plug.Conn.send_resp(429, "rate limited")
+      end)
+
+      assert {:snooze, 60} = perform_job(JiraSync, %{"source_id" => source.id})
+    end
   end
 
   describe "DriveSync (Req.Test)" do
@@ -242,6 +255,16 @@ defmodule RetrievalNode.Ingest.SourcesTest do
       assert {:snooze, 45} = perform_job(DriveSync, %{"source_id" => source.id})
       assert Repo.all(PendingChunk) == []
       refute_enqueued(worker: ChunkFiles)
+    end
+
+    test "a 429 with a missing Retry-After falls back to the default (no crash)" do
+      source = Repo.insert!(%Source{source_type: :drive_folder, name: "f", identifier: "root"})
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        Plug.Conn.send_resp(conn, 429, "rate limited")
+      end)
+
+      assert {:snooze, 60} = perform_job(DriveSync, %{"source_id" => source.id})
     end
   end
 

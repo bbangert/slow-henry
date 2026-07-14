@@ -114,6 +114,43 @@ defmodule RetrievalNode.Ingest.GitMirror do
     end
   end
 
+  @doc """
+  Like `changed_files/3` but tags each path with its change status so callers can
+  tell a **true deletion** from a still-present file. First sync (`old_sha == nil`)
+  is every file as `:added`; otherwise `diff --name-status` (a rename `R` becomes
+  `:deleted` old + `:added` new, a copy `C` becomes `:added` new).
+  """
+  @spec changed_entries(repo, String.t() | nil, String.t()) ::
+          {:ok, [{:added | :modified | :deleted, String.t()}]} | {:error, reason}
+  def changed_entries(slug, nil, new_sha) do
+    with {:ok, files} <- changed_files(slug, nil, new_sha) do
+      {:ok, Enum.map(files, &{:added, &1})}
+    end
+  end
+
+  def changed_entries(slug, old_sha, new_sha) do
+    with {:ok, old_sha} <- safe_ref(old_sha),
+         {:ok, new_sha} <- safe_ref(new_sha),
+         {:ok, path} <- mirror_path(slug),
+         {:ok, out} <-
+           git(["--git-dir", path, "diff", "--name-status", "--end-of-options", old_sha, new_sha]) do
+      {:ok, parse_name_status(lines(out))}
+    end
+  end
+
+  # Each --name-status line is `<STATUS>\t<path>` (rename/copy: `<STATUS>\t<old>\t<new>`).
+  defp parse_name_status(lines) do
+    Enum.flat_map(lines, fn line ->
+      case String.split(line, "\t") do
+        ["D", path] -> [{:deleted, path}]
+        [<<"R", _::binary>>, old, new] -> [{:deleted, old}, {:added, new}]
+        [<<"C", _::binary>>, _old, new] -> [{:added, new}]
+        [_status, path] -> [{:modified, path}]
+        _ -> []
+      end
+    end)
+  end
+
   @doc "Return a file's exact bytes at `ref` (default HEAD). The sole full-content path."
   @spec show(repo, String.t(), String.t()) :: {:ok, String.t()} | {:error, reason}
   def show(slug, path, ref \\ "HEAD") do

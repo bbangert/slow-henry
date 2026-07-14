@@ -98,4 +98,33 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
     assert Repo.aggregate(from(c in Chunk, where: c.chunk_key == "k1"), :count, :id) == 0
   end
+
+  test "a modified file is re-enqueued, NOT treated as a deletion", ctx do
+    commit(ctx.src, [{"mod.py", "def m(): pass\n"}])
+    perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+    # a permanent chunk already exists for mod.py
+    Repo.insert!(%Chunk{
+      source_id: ctx.source.id,
+      source_type: :git_repo,
+      chunk_key: "mk1",
+      content_hash: "h",
+      content: "def m(): pass",
+      context_breadcrumb: "mod.py",
+      metadata: %{"path" => "mod.py"}
+    })
+
+    Repo.delete_all(PendingChunk)
+    commit(ctx.src, [{"mod.py", "def m(): return 42\n"}])
+
+    assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+    # modification is NOT a deletion — the existing chunk survives (it'll be
+    # upserted by the pipeline), and a fresh raw row is staged for re-chunking
+    assert Repo.aggregate(from(c in Chunk, where: c.chunk_key == "mk1"), :count, :id) == 1
+    raw = Repo.one!(from p in PendingChunk, where: p.status == "raw")
+    assert raw.natural_key == "repo:#{ctx.source.id}:mod.py"
+    assert raw.raw_content =~ "return 42"
+    assert_enqueued(worker: ChunkFiles)
+  end
 end
