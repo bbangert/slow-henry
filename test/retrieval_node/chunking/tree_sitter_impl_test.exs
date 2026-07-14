@@ -1,0 +1,87 @@
+defmodule RetrievalNode.Chunking.TreeSitterImplTest do
+  use ExUnit.Case, async: true
+
+  alias RetrievalNode.Chunking.TreeSitterImpl, as: TSI
+
+  describe "pre-flight guards (NIF-free — reject before reaching the parser)" do
+    test "rejects a file over the size cap" do
+      big = String.duplicate("x\n", 1_100_000)
+      assert {:error, :too_large} = TSI.chunk(big, "python")
+    end
+
+    test "rejects binary content (null byte)" do
+      assert {:error, :binary_content} = TSI.chunk("ok\x00bad", "python")
+    end
+
+    test "rejects a language not in the allowlist" do
+      assert {:error, :unsupported_language} = TSI.chunk("x = 1", "cobol")
+    end
+
+    test "allowed_languages/0 is the mainstream code set" do
+      assert "python" in TSI.allowed_languages()
+      refute "elixir" in TSI.allowed_languages()
+    end
+  end
+
+  describe "guarded/1 (NIF-free — the crash/timeout isolation wrapper)" do
+    # The crash/exit tests intentionally raise/exit inside the supervised Task,
+    # which the Task.Supervisor logs; capture it to keep test output clean.
+    @describetag capture_log: true
+
+    setup do
+      start_supervised!({Task.Supervisor, name: RetrievalNode.ChunkTaskSupervisor})
+      :ok
+    end
+
+    test "passes through an {:ok, chunks} result" do
+      assert {:ok, [:a, :b]} = TSI.guarded(fn -> {:ok, [:a, :b]} end)
+    end
+
+    test "passes through an {:error, reason} result" do
+      assert {:error, :nope} = TSI.guarded(fn -> {:error, :nope} end)
+    end
+
+    test "a raising parse becomes {:error, {:chunk_crashed, _}} — never kills the caller" do
+      assert {:error, {:chunk_crashed, _reason}} = TSI.guarded(fn -> raise "boom" end)
+      # The caller (this test process) is still alive.
+      assert Process.alive?(self())
+    end
+
+    test "an exiting parse becomes {:error, {:chunk_crashed, _}}" do
+      assert {:error, {:chunk_crashed, _}} = TSI.guarded(fn -> exit(:kaboom) end)
+    end
+
+    test "a hanging parse times out to {:error, :chunk_timeout}" do
+      # call_timeout_ms is 100 in test config; sleeping past it triggers shutdown.
+      assert {:error, :chunk_timeout} = TSI.guarded(fn -> Process.sleep(5_000) end)
+    end
+  end
+
+  # Real tree-sitter parsing loads the NIF; excluded by default to keep the suite
+  # NIF-free. Run with `mix test --include integration`.
+  describe "real AST chunking" do
+    @describetag :integration
+
+    setup do
+      start_supervised!({Task.Supervisor, name: RetrievalNode.ChunkTaskSupervisor})
+      :ok
+    end
+
+    test "chunks python at function/method boundaries with scoped breadcrumbs" do
+      src = "def top():\n    return 1\n\nclass Bar:\n    def m(self):\n        return 2\n"
+      {:ok, chunks} = TSI.chunk(src, "python")
+
+      crumbs = Enum.map(chunks, & &1.breadcrumb)
+      assert "top" in crumbs
+      assert "Bar > m" in crumbs
+      assert Enum.all?(chunks, &(&1.parse_status == :ok))
+    end
+
+    test "a class emits its methods (not a duplicate whole-class chunk)" do
+      src = "class A:\n    def one(self):\n        pass\n    def two(self):\n        pass\n"
+      {:ok, chunks} = TSI.chunk(src, "python")
+
+      assert Enum.map(chunks, & &1.breadcrumb) |> Enum.sort() == ["A > one", "A > two"]
+    end
+  end
+end

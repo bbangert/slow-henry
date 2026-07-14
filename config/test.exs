@@ -31,6 +31,9 @@ config :retrieval_node, :rrf_candidate_pool, 5
 # C-level crash taking the runner down.
 config :retrieval_node, chunking_impl: RetrievalNode.Chunking.HeuristicImpl
 
+# Short chunk timeout so the guarded-timeout test resolves fast (not the 5s prod default).
+config :retrieval_node, :chunking, call_timeout_ms: 100
+
 # Print only warnings and errors during test
 config :logger, level: :warning
 
