@@ -160,18 +160,24 @@ in naming, THIS section wins:
 
 ## Phase 5 — Secrets scrubbing `[security]` (from `design-oban.md` §1, `secrets-scrubbing.md`)
 
-- [ ] `RetrievalNode.Ingest.Scrubber` — `gitleaks_scan/1` (`System.cmd("gitleaks",
-      ["detect","--no-git","--source","-"], ...)`, parse JSON findings) for git
-      content; `regex_scan/1` (gitleaks-seeded patterns: AWS/GCP/GitHub/Slack/JWT/
-      PEM/connection-strings + entropy) for Jira/Drive text
-- [ ] Policy: **redact span in-place** (`[REDACTED:type]`) + write `SecretFinding`
-      audit row (`match_hash` only) + proceed. gitleaks missing/errored → **degrade
-      to regex scan (non-fatal), log warning**; regex-confirmed high-confidence
-      secret that survives redaction → `{:cancel, ...}` (discard, don't retry forever)
-- [ ] Fail-closed: content is never embedded before it has passed a scan (at least
-      the regex scanner, which has no external dep and cannot legitimately fail)
-- [ ] **Verify**: `mix test` — planted fake AWS key is redacted + audited; gitleaks
-      absent path falls back to regex without failing; Jira/Drive text path scanned
+- [x] `RetrievalNode.Ingest.Scrubber` — `gitleaks_scan/1` (**temp-file, not stdin** —
+      `System.cmd` has no `:stdin` option; the design's `--source -` is fictional) +
+      `parse_gitleaks_report/2` (locates byte offsets via the reported Match); `regex_scan/1`
+      (AWS/GCP/GitHub/Slack/JWT/PEM/connection-string patterns) for Jira/Drive text
+- [x] Policy (`scrub/2`): **redact span in-place** (`[REDACTED:type]`, byte-correct +
+      overlap-merged — design's codepoint `String.slice` on byte offsets was buggy) +
+      `record_findings/2` writes `SecretFinding` (`match_hash` sha256 only, never raw).
+      gitleaks missing/errored → **degrade to regex** (non-fatal, log + `[:retrieval_node,
+      :scrub, :degraded]` telemetry); high-confidence secret surviving redaction → `{:cancel, :unredactable_secret}`
+- [x] Fail-closed: `scrub/2` post-redaction re-scan; regex scanner (pure, no external
+      dep) is the floor — if it raises, `{:error, :scrub_unavailable}` (nothing indexed unscanned)
+- [x] **Verify**: 22 tests — planted AWS key redacted + audited (sha256, not raw; whole-row check);
+      gitleaks degrade forced via `:gitleaks_cmd` config + fires telemetry; jira/drive scanned;
+      PEM/dup/overlap/UTF-8 byte-offset redaction; fail-closed `redaction_left_secret?`; size cap.
+      credo/dialyzer/format clean.
+- [x] **Security hardening** (Phase 5 review, `reviews/phase-5-review.md`): temp file in a private
+      0700 dir + `find_executable` guard (no plaintext to /tmp when gitleaks absent); secrets kept
+      out of logs/telemetry; gitleaks dup-secret redaction (all occurrences); transactional audit.
 
 ## Phase 6 — Ingest pipeline `[oban]` (from `design-oban.md`) — the all-three-thin slice
 
