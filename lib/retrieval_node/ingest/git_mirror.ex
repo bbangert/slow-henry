@@ -27,6 +27,7 @@ defmodule RetrievalNode.Ingest.GitMirror do
           | :invalid_ref
           | :invalid_url
           | :file_too_large
+          | :git_timeout
           | {:git, integer(), String.t()}
 
   # A ref/sha that cannot be mistaken for a git option: alphanumeric start, then
@@ -69,11 +70,13 @@ defmodule RetrievalNode.Ingest.GitMirror do
   end
 
   defp clone_or_fetch(path, url) do
+    # Network ops legitimately take much longer than a local object-DB read, so they
+    # use the longer network_timeout rather than the short MCP-facing default.
     if File.dir?(path) do
-      git(["--git-dir", path, "fetch", "--prune", "origin"])
+      git(["--git-dir", path, "fetch", "--prune", "origin"], [0], network_timeout())
     else
       File.mkdir_p!(mirror_root())
-      git(["clone", "--mirror", "--end-of-options", url, path])
+      git(["clone", "--mirror", "--end-of-options", url, path], [0], network_timeout())
     end
   end
 
@@ -166,6 +169,10 @@ defmodule RetrievalNode.Ingest.GitMirror do
   Grep a repo at `ref` (default HEAD). Returns `[%{repo, path, line, text}]`.
   Exit 1 (no matches) is a normal empty result. `-I` skips binary files.
   """
+  # Per-file match cap (`-m`) so one huge file can't dump unbounded output; the tool
+  # layer caps the aggregate across repos too.
+  @grep_max_per_file 100
+
   @spec grep(repo, String.t(), String.t()) :: {:ok, [map()]} | {:error, reason}
   def grep(slug, pattern, ref \\ "HEAD") do
     # git grep doesn't accept --end-of-options; the validated ref (no leading dash)
@@ -174,21 +181,51 @@ defmodule RetrievalNode.Ingest.GitMirror do
     with {:ok, ref} <- safe_ref(ref),
          {:ok, gitdir} <- mirror_path(slug),
          {:ok, out} <-
-           git(["--git-dir", gitdir, "grep", "-n", "-I", "-z", "-e", pattern, ref], [0, 1]) do
+           git(
+             ["--git-dir", gitdir, "grep", "-n", "-I", "-z", "-m", "#{@grep_max_per_file}"] ++
+               ["-e", pattern, ref],
+             [0, 1]
+           ) do
       {:ok, parse_grep(slug, ref, out)}
     end
   end
 
   # --- internals ---
 
-  defp git(args, ok_codes \\ [0]) do
-    case System.find_executable("git") do
-      nil ->
-        {:error, :git_not_found}
+  # Hard ceiling on a single git invocation. A pathological pattern/tree can make git
+  # run unbounded; without this the caller (and the MCP session process) would hang.
+  # On timeout the task is killed, closing the port and terminating git. The default
+  # is short (bounds the untrusted MCP-facing grep/show); network ops (clone/fetch)
+  # pass `network_timeout/0`, which is legitimately slow. Both are config-overridable.
+  @default_git_timeout :timer.seconds(20)
+  @default_git_network_timeout :timer.minutes(10)
 
-      git ->
-        {out, code} = System.cmd(git, args, stderr_to_stdout: true)
+  defp default_timeout,
+    do: Application.get_env(:retrieval_node, :git_timeout_ms, @default_git_timeout)
+
+  defp network_timeout,
+    do:
+      Application.get_env(:retrieval_node, :git_network_timeout_ms, @default_git_network_timeout)
+
+  defp git(args, ok_codes \\ [0], timeout \\ default_timeout()) do
+    case System.find_executable("git") do
+      nil -> {:error, :git_not_found}
+      git -> run_git(git, args, ok_codes, timeout)
+    end
+  end
+
+  defp run_git(git, args, ok_codes, timeout) do
+    task = Task.async(fn -> System.cmd(git, args, stderr_to_stdout: true) end)
+
+    case Task.yield(task, timeout) do
+      {:ok, {out, code}} ->
         if code in ok_codes, do: {:ok, out}, else: {:error, {:git, code, String.trim(out)}}
+
+      # nil = still running (timed out); {:exit, _} = the task crashed. Either way
+      # kill it (closing the port → terminating git) and report a timeout.
+      _ ->
+        Task.shutdown(task, :brutal_kill)
+        {:error, :git_timeout}
     end
   end
 

@@ -12,8 +12,11 @@ defmodule RetrievalNode.Application do
       RetrievalNode.Repo,
       {DNSCluster, query: Application.get_env(:retrieval_node, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: RetrievalNode.PubSub},
-      # Start a worker by calling: RetrievalNode.Worker.start_link(arg)
-      # {RetrievalNode.Worker, arg},
+      # MCP server (streamable_http) — mounted on the Endpoint at /mcp. Anubis' own
+      # `start` gate keys off the Phoenix serve-endpoints flag, which is off under
+      # ConnTest, so we drive it from our own config (default on; a future
+      # worker-only release can set `mcp_server_start: false`).
+      {RetrievalNode.MCP.Server, transport: {:streamable_http, start: mcp_server_start?()}},
       # Start to serve requests, typically the last entry
       RetrievalNodeWeb.Endpoint
     ]
@@ -31,4 +34,6 @@ defmodule RetrievalNode.Application do
     RetrievalNodeWeb.Endpoint.config_change(changed, removed)
     :ok
   end
+
+  defp mcp_server_start?, do: Application.get_env(:retrieval_node, :mcp_server_start, true)
 end

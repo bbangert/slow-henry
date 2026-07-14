@@ -37,7 +37,7 @@ defmodule RetrievalNode.Ingest.GitMirrorTest do
     sha2 = String.trim(git!(src, ["rev-parse", "HEAD"]))
 
     {:ok, _} = GitMirror.ensure_mirror("acme/app", "file://" <> src)
-    %{sha1: sha1, sha2: sha2}
+    %{sha1: sha1, sha2: sha2, url: "file://" <> src}
   end
 
   defp git!(dir, args) do
@@ -109,6 +109,23 @@ defmodule RetrievalNode.Ingest.GitMirrorTest do
     test "ensure_mirror rejects a non-allowlisted transport (ext:: RCE vector)" do
       assert {:error, :invalid_url} = GitMirror.ensure_mirror("evil", "ext::sh -c whoami")
       assert {:error, :invalid_url} = GitMirror.ensure_mirror("evil", "-oProxyCommand=x")
+    end
+  end
+
+  describe "timeouts are per-command" do
+    test "the short default bounds show/grep but network ops use the longer one", %{url: url} do
+      # 0ms = poll once; a freshly-spawned git can't have finished, so any call on
+      # the default deterministically times out.
+      Application.put_env(:retrieval_node, :git_timeout_ms, 0)
+      on_exit(fn -> Application.delete_env(:retrieval_node, :git_timeout_ms) end)
+
+      # show/grep use the (now 1ms) default → they time out.
+      assert {:error, :git_timeout} = GitMirror.show("acme/app", "app.py")
+      assert {:error, :git_timeout} = GitMirror.grep("acme/app", "hello")
+
+      # fetch (via ensure_mirror on the existing mirror) uses network_timeout, which
+      # the 1ms default doesn't touch → it still succeeds.
+      assert {:ok, _path} = GitMirror.ensure_mirror("acme/app", url)
     end
   end
 end
