@@ -11,7 +11,8 @@ config :retrieval_node, RetrievalNode.Repo,
   database: "retrieval_node_dev",
   stacktrace: true,
   show_sensitive_data_on_connection_error: true,
-  pool_size: 10
+  # num_queues (4) + sum(queue limits: 3+2+1+5) + buffer for MCP/ad-hoc Repo use.
+  pool_size: 20
 
 # For development, we disable any cache and enable
 # debugging and code reloading.

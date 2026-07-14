@@ -34,6 +34,10 @@ config :retrieval_node, chunking_impl: RetrievalNode.Chunking.HeuristicImpl
 # Short chunk timeout so the guarded-timeout test resolves fast (not the 5s prod default).
 config :retrieval_node, :chunking, call_timeout_ms: 100
 
+# Oban in :manual testing mode — jobs are not run automatically; tests drive them
+# via Oban.Testing (perform_job / assert_enqueued).
+config :retrieval_node, Oban, testing: :manual
+
 # Print only warnings and errors during test
 config :logger, level: :warning
 
