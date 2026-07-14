@@ -26,8 +26,14 @@ defmodule RetrievalNode.Ingest.Workers.SyncScheduler do
     Source
     |> where([s], s.source_type == ^source_type and s.active == true and s.policy == :allow)
     |> Repo.all()
-    |> Enum.each(fn source -> Oban.insert(worker.new(%{"source_id" => source.id})) end)
-
-    :ok
+    |> Enum.reduce_while(:ok, fn source, :ok ->
+      # A unique-constraint overlap comes back as {:ok, %{conflict?: true}} — fine.
+      # A genuine {:error, _} would otherwise be swallowed and the cron tick would
+      # look healthy despite the fan-out failing; surface it so Oban retries.
+      case Oban.insert(worker.new(%{"source_id" => source.id})) do
+        {:ok, _job} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
 end

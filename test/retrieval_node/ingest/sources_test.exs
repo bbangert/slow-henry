@@ -200,6 +200,36 @@ defmodule RetrievalNode.Ingest.SourcesTest do
       assert state.cursor["start_page_token"] == "tok-9"
     end
 
+    test "a failed export does NOT advance the cursor (no permanent skip)" do
+      source = Repo.insert!(%Source{source_type: :drive_folder, name: "f", identifier: "root"})
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        if String.ends_with?(conn.request_path, "/export") do
+          Plug.Conn.send_resp(conn, 500, "boom")
+        else
+          Req.Test.json(conn, %{
+            "newStartPageToken" => "tok-next",
+            "changes" => [
+              %{
+                "fileId" => "d1",
+                "file" => %{
+                  "id" => "d1",
+                  "name" => "Doc",
+                  "mimeType" => "application/vnd.google-apps.document"
+                }
+              }
+            ]
+          })
+        end
+      end)
+
+      assert {:error, :export_incomplete} = perform_job(DriveSync, %{"source_id" => source.id})
+
+      # cursor left un-advanced so the next run re-fetches the same page
+      state = Repo.get_by!(SyncState, source_id: source.id)
+      refute Map.get(state.cursor || %{}, "start_page_token")
+    end
+
     test "a 429 returns {:snooze, _} and writes nothing" do
       source = Repo.insert!(%Source{source_type: :drive_folder, name: "f", identifier: "root"})
 
