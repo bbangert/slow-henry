@@ -134,23 +134,29 @@ in naming, THIS section wins:
 
 ## Phase 4 — Chunking subsystem `[otp]` `[security-adjacent]` (from `design-otp.md` §2-3)
 
-- [ ] `RetrievalNode.Chunking` behaviour (`chunk/2`, `allowed_languages/0`)
-- [ ] `Chunking.TreeSitterImpl` — pre-flight guards (`@max_bytes 2_000_000`,
-      null-byte/binary detection, language allowlist) → `run_guarded/2` using
-      `Task.Supervisor.async_nolink(ChunkTaskSupervisor, ...)` + `Task.yield(5_000)`
-      + `Task.shutdown(:brutal_kill)`. Returns `{:error, :chunk_timeout | {:chunk_crashed, _}}`
-      — never lets an abnormal task exit kill the caller
-- [ ] `Chunking.HeuristicImpl` — pure line/blank-line/brace-balance chunker; the
-      automatic fallback + `:test`-env default
-- [ ] **IMPLEMENTATION-PHASE ACTION ITEM** (from `design-otp.md` §2): inspect
-      `tree_sitter_language_pack` Rust source for `schedule = "DirtyCpu"` on the
-      parse NIF. If absent, a slow parse blocks a *regular* scheduler → flag and
-      raise priority of the peer-node escape hatch. Record finding in scratchpad.
-- [ ] Breadcrumb builder: `path.ex > Module > fun/arity` (code) /
-      `Doc Title > Section` (docs), prepended to chunk text before embedding
-- [ ] **Verify**: `mix test` — guards reject oversized/binary/unsupported; a
-      deliberately pathological input returns an error tuple, not a crash;
-      heuristic fallback produces chunks
+- [x] `RetrievalNode.Chunking` behaviour (`chunk/2`, `allowed_languages/0`) + facade
+- [x] `Chunking.TreeSitterImpl` — pre-flight guards (`@max_bytes 2M` compile_env,
+      null-byte/binary detection, language allowlist) → `guarded/1` (exposed for
+      NIF-free testing) using `Task.Supervisor.async_nolink(ChunkTaskSupervisor, ...)`
+      + `Task.yield(@call_timeout_ms)` + `Task.shutdown(:brutal_kill)`. Returns
+      `{:error, :chunk_timeout | {:chunk_crashed, _}}`. NOTE: design's fictional
+      `TreeSitterLanguagePack.parse/2` doesn't exist — built the low-level
+      parser/cursor tree-walk (leaf-def emission, class→methods, scoped breadcrumbs)
+      over the real API. Allowlist = python/js/ts/go/rust/ruby/java (7 mainstream);
+      elixir/heex/eex → heuristic until native-AST path (fast-follow, per plan)
+- [x] `Chunking.HeuristicImpl` — pure line/blank-line/brace-balance chunker;
+      automatic fallback + `:test`-env default. `parse_status: :heuristic_fallback`
+- [x] **ACTION ITEM DONE**: tree-sitter parse NIF is **NOT dirty-scheduled**
+      (all `#[rustler::nif]` plain in crate source) → slow parse degrades regular
+      scheduler → raises peer-node priority. Recorded in scratchpad.
+- [x] Breadcrumb builder — `RetrievalNode.Chunking.Breadcrumb.build/2` (path/title +
+      symbol trail) + `prepend/2` (attach to text before embedding)
+- [x] **Verify**: ~23 Phase-4 NIF-free unit tests (guards reject oversized/binary/unsupported;
+      `guarded/1` crash→`{:chunk_crashed}` & timeout→`:chunk_timeout` without killing caller;
+      heuristic blank/brace boundaries + hard-cap safety valve + CRLF; breadcrumb sanitize) + 2
+      tagged `:integration` real-parse tests (python/js AST chunking). credo/dialyzer/format clean.
+      Post-review hardening: heuristic hard byte-cap (unbounded-chunk fix), cursor-based O(n)
+      named-children, guard reorder, breadcrumb newline sanitize (see reviews/phase-4-review.md).
 
 ## Phase 5 — Secrets scrubbing `[security]` (from `design-oban.md` §1, `secrets-scrubbing.md`)
 
@@ -184,7 +190,10 @@ in naming, THIS section wins:
         fallback on final attempt** (the `attempt >= max` pattern from `design-oban.md`
         §5); writes chunk rows to `pending_chunks`; enqueues one `EmbedBatch`.
         `timeout/1` 45s, `max_attempts: 5`, short custom backoff, unique on
-        `pending_chunk_id`
+        `pending_chunk_id`. **Fallback only on parse failures** (`:chunk_timeout` /
+        `:chunk_crashed` / `:unsupported_language`) — NOT on `:too_large` /
+        `:binary_content` (hard rejections → skip the file; the heuristic must not
+        re-chunk oversized/binary input). Phase 4 review finding.
   - [ ] `EmbedBatch` (`:embed`) — `Embedding.embed_batch/1` over the batch → write
         384-dim `embedding` back → enqueue `UpsertChunks`. `max_attempts: 3`
   - [ ] `UpsertChunks` (`:upsert`) — `Ecto.Multi.insert_all` into `Retrieval.Chunk`

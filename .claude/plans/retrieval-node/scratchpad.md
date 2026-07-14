@@ -40,8 +40,17 @@ Companion to `plan.md`. Records why things are the way they are, and paths NOT t
 
 ## Open action items (carried into implementation)
 
-- [ ] **Verify tree-sitter NIF is dirty-scheduled** (`schedule = "DirtyCpu"` in crate
-      source). If NOT, slow parses block a regular scheduler → raises peer-node priority.
+- [x] **Verify tree-sitter NIF is dirty-scheduled** — DONE, and the answer is **NO**.
+      `deps/tree_sitter_language_pack/native/.../src/lib.rs`: every `#[rustler::nif]` is
+      plain (no `schedule = "DirtyCpu"`); the only "schedule" hit is a code comment.
+      **Consequence (as the design warned):** a slow/hung parse runs on a REGULAR BEAM
+      scheduler thread and degrades whole-node scheduling fairness, not just the caller.
+      The `Task.yield`+`shutdown(:brutal_kill)` timeout still bounds a *hang*, but not the
+      scheduler-fairness cost of a merely-slow parse. → **Raises peer-node escape hatch
+      priority** (design-otp §3.3/§3.4). Mitigation in v1: input guards (size/binary/
+      allowlist) reject the worst inputs pre-NIF; monitor. Also: the dep has NO high-level
+      `parse(source, lang) -> {:ok, chunks}` (design assumed one); only a low-level
+      parser/cursor/node API — TreeSitterImpl builds the tree-walk chunk extraction itself.
 - [ ] **Spot-check Anubis tool-failure return tuple** against `deps/anubis_mcp` source
       (docs only confirmed the success path + `Response.error/2`).
 - [ ] Confirm arm64 grammar prefetch works for the full language allowlist at build time.
