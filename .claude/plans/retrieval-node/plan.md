@@ -252,6 +252,11 @@ in naming, THIS section wins:
 - [ ] `/healthz` readiness gates: (1) grammar-cache present for allowlist,
       (2) `Nx.default_backend()` is EXLA (not silent BinaryBackend), (3) Nx.Serving
       warmed, (4) DB reachable — ready only when all pass
+  - [ ] **`Embedding.Serving.ready?/0` must not go stale across a serving crash/restart**
+        (Copilot review, PR #2): the `:persistent_term` flag stays `true` after the
+        supervised serving restarts without re-warming. Reset it to `false` when the
+        serving (re)starts and re-run `warmup/0`, OR have the gate also confirm the
+        serving pid is the one that warmed — decide when wiring warmup into the tree here.
 - [ ] Postgres via apt (PGDG arm64) + pgvector; `/var/lib/retrieval_node/git-mirrors/`,
       nightly `pg_dump` snapshot to NVMe
 - [ ] Dev (x86-64) deltas: skip ELF gate, `mix phx.server` not release/systemd,
