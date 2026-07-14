@@ -47,9 +47,9 @@ defmodule RetrievalNode.Embedding.NxServingImplTest do
       result = NxServingImpl.matryoshka(Nx.broadcast(0.0, {768}))
 
       assert length(result) == 384
+      # All entries equal 0.0 — which also proves none are NaN (NaN == 0.0 is false),
+      # so the epsilon floor prevented the divide-by-zero NaN.
       assert Enum.all?(result, &(&1 == 0.0))
-      # NaN is the only float that is not equal to itself.
-      refute Enum.any?(result, fn x -> x != x end)
     end
   end
 
