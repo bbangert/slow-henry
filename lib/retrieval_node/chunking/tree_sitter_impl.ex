@@ -78,20 +78,23 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
           {:ok, [map()]}
           | {:error, :chunk_timeout | :chunk_supervisor_down | {:chunk_crashed, term()} | term()}
   def guarded(fun) when is_function(fun, 0) do
-    # If the supervisor isn't running (misconfiguration / started before Phase 8
-    # wires it in), async_nolink would exit :noproc in THIS process — which the
-    # crash isolation below can't catch. Guard it so even that case returns an
-    # error tuple, fully honoring "never crash the caller".
-    if Process.whereis(@supervisor) do
-      run_guarded(fun)
-    else
-      {:error, :chunk_supervisor_down}
+    with {:ok, task} <- start_task(fun) do
+      await_task(task)
     end
   end
 
-  defp run_guarded(fun) do
-    task = Task.Supervisor.async_nolink(@supervisor, fun)
+  # If the supervisor is absent — never started, OR it dies between a check and
+  # this call (the TOCTTOU race) — async_nolink exits :noproc in THIS process,
+  # which await_task's task-crash isolation can't catch (no task exists yet).
+  # Catch it at the source so even that case returns an error tuple, fully
+  # honoring "never crash the caller".
+  defp start_task(fun) do
+    {:ok, Task.Supervisor.async_nolink(@supervisor, fun)}
+  catch
+    :exit, {:noproc, _} -> {:error, :chunk_supervisor_down}
+  end
 
+  defp await_task(task) do
     # NOTE: the `yield || shutdown` race is handled by Task itself — if the task
     # replies just as the timeout fires, Task.shutdown's flush picks up the reply
     # and returns {:ok, result}; only a genuine kill returns nil. Do not "fix"
