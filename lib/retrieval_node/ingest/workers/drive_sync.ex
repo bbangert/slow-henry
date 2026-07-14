@@ -88,12 +88,13 @@ defmodule RetrievalNode.Ingest.Workers.DriveSync do
   defp delete_removed(_source, []), do: :ok
 
   defp delete_removed(source, doc_ids) do
-    Enum.each(doc_ids, fn doc_id ->
-      from(c in Chunk,
-        where: c.source_id == ^source.id and fragment("?->>'doc_id' = ?", c.metadata, ^doc_id)
-      )
-      |> Repo.delete_all()
-    end)
+    # One DELETE with an IN over the extracted JSONB doc_id — not one per removal.
+    from(c in Chunk,
+      where: c.source_id == ^source.id and fragment("?->>'doc_id'", c.metadata) in ^doc_ids
+    )
+    |> Repo.delete_all()
+
+    :ok
   end
 
   defp advance_watermark(_state, nil), do: :ok

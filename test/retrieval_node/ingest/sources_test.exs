@@ -160,9 +160,28 @@ defmodule RetrievalNode.Ingest.SourcesTest do
       :ok
     end
 
+    test "first run with no cursor seeds the startPageToken and stages nothing" do
+      source = Repo.insert!(%Source{source_type: :drive_folder, name: "seed", identifier: "root"})
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        assert String.ends_with?(conn.request_path, "/changes/startPageToken")
+        Req.Test.json(conn, %{"startPageToken" => "tok-seed"})
+      end)
+
+      assert :ok = perform_job(DriveSync, %{"source_id" => source.id})
+
+      assert Repo.all(PendingChunk) == []
+      refute_enqueued(worker: ChunkFiles)
+      state = Repo.get_by!(SyncState, source_id: source.id)
+      assert state.cursor["start_page_token"] == "tok-seed"
+    end
+
     test "exports a changed Doc, stages it, prunes a removed Doc, advances the cursor" do
       source =
         Repo.insert!(%Source{source_type: :drive_folder, name: "folder", identifier: "root"})
+
+      # already seeded from a prior run, so this sync pages real changes
+      Repo.insert!(%SyncState{source_id: source.id, cursor: %{"start_page_token" => "tok-0"}})
 
       # a pre-existing chunk for the doc that this sync reports as removed
       Repo.insert!(
@@ -215,6 +234,7 @@ defmodule RetrievalNode.Ingest.SourcesTest do
 
     test "a failed export does NOT advance the cursor (no permanent skip)" do
       source = Repo.insert!(%Source{source_type: :drive_folder, name: "f", identifier: "root"})
+      Repo.insert!(%SyncState{source_id: source.id, cursor: %{"start_page_token" => "tok-0"}})
 
       Req.Test.stub(__MODULE__, fn conn ->
         if String.ends_with?(conn.request_path, "/export") do
@@ -238,9 +258,9 @@ defmodule RetrievalNode.Ingest.SourcesTest do
 
       assert {:error, :export_incomplete} = perform_job(DriveSync, %{"source_id" => source.id})
 
-      # cursor left un-advanced so the next run re-fetches the same page
+      # cursor left un-advanced (still tok-0, not tok-next) so the next run re-pages
       state = Repo.get_by!(SyncState, source_id: source.id)
-      refute Map.get(state.cursor || %{}, "start_page_token")
+      assert state.cursor["start_page_token"] == "tok-0"
     end
 
     test "a 429 returns {:snooze, _} and writes nothing" do

@@ -9,6 +9,8 @@ defmodule RetrievalNode.Ingest.PendingChunksTest do
     Map.merge(
       %{
         source: "git",
+        source_id: Ecto.UUID.generate(),
+        source_type: "git_repo",
         natural_key: "repo:acme/app:lib/foo.ex",
         content_hash: "hash-#{System.unique_integer([:positive])}",
         raw_content: "def foo, do: :ok"

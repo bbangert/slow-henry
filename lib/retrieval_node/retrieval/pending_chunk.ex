@@ -74,7 +74,16 @@ defmodule RetrievalNode.Retrieval.PendingChunk do
     pending_chunk
     |> cast(attrs, [:raw_content | @provenance])
     |> put_change(:status, "raw")
-    |> validate_required([:source, :natural_key, :content_hash, :raw_content])
+    # source_id/source_type are provenance the downstream pipeline (UpsertChunks)
+    # assumes exists — require them so a raw row can't be staged without them.
+    |> validate_required([
+      :source,
+      :source_id,
+      :source_type,
+      :natural_key,
+      :content_hash,
+      :raw_content
+    ])
   end
 
   @doc "Changeset for a chunk row split out of a raw row (`ChunkFiles`)."

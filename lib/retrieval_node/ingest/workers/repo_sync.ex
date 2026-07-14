@@ -76,23 +76,28 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   defp delete_removed(_source, []), do: :ok
 
   defp delete_removed(source, paths) do
-    Enum.each(paths, fn path ->
-      from(c in Chunk,
-        where: c.source_id == ^source.id and fragment("?->>'path' = ?", c.metadata, ^path)
-      )
-      |> Repo.delete_all()
-    end)
+    # One DELETE with an IN over the extracted JSONB path — not one query per path.
+    from(c in Chunk,
+      where: c.source_id == ^source.id and fragment("?->>'path'", c.metadata) in ^paths
+    )
+    |> Repo.delete_all()
+
+    :ok
   end
 
   defp enqueue_changed(_source, _slug, [], _new_sha), do: :ok
 
   defp enqueue_changed(source, slug, paths, new_sha) do
-    rows = Enum.flat_map(paths, &raw_row(source, slug, &1, new_sha))
-    {:ok, ids} = PendingChunks.insert_raw_all(rows)
+    with {:ok, rows} <- build_rows(source, slug, paths, new_sha) do
+      {:ok, ids} = PendingChunks.insert_raw_all(rows)
+      enqueue_chunk_files(ids)
+    end
+  end
 
-    # Surface a failed enqueue ({:error, _}) so perform errors and the watermark
-    # isn't advanced past staged rows that never got a ChunkFiles job. A unique
-    # overlap comes back {:ok, conflict?} and is fine.
+  # Surface a failed enqueue ({:error, _}) so perform errors and the watermark isn't
+  # advanced past staged rows that never got a ChunkFiles job. A unique overlap comes
+  # back {:ok, conflict?} and is fine.
+  defp enqueue_chunk_files(ids) do
     Enum.reduce_while(ids, :ok, fn id, :ok ->
       case Oban.insert(ChunkFiles.new(%{"pending_chunk_id" => id})) do
         {:ok, _job} -> {:cont, :ok}
@@ -101,25 +106,41 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
     end)
   end
 
+  # Build raw rows, halting on any *unexpected* show error so the job retries
+  # (watermark not advanced) rather than silently dropping the file forever. Only a
+  # known-non-indexable :file_too_large is skipped — the file exists, we just can't
+  # embed it, so there's nothing to retry.
+  defp build_rows(source, slug, paths, new_sha) do
+    Enum.reduce_while(paths, {:ok, []}, fn path, {:ok, acc} ->
+      case raw_row(source, slug, path, new_sha) do
+        {:ok, row} -> {:cont, {:ok, [row | acc]}}
+        :skip -> {:cont, {:ok, acc}}
+        {:error, reason} -> {:halt, {:error, {path, reason}}}
+      end
+    end)
+  end
+
   defp raw_row(source, slug, path, new_sha) do
     case GitMirror.show(slug, path, new_sha) do
       {:ok, content} ->
-        [
-          %{
-            source: "git",
-            source_id: source.id,
-            source_type: "git_repo",
-            repo: slug,
-            lang: lang_for(path),
-            natural_key: "repo:#{source.id}:#{path}",
-            content_hash: sha256(content),
-            raw_content: content,
-            metadata: %{"path" => path, "ref" => new_sha}
-          }
-        ]
+        {:ok,
+         %{
+           source: "git",
+           source_id: source.id,
+           source_type: "git_repo",
+           repo: slug,
+           lang: lang_for(path),
+           natural_key: "repo:#{source.id}:#{path}",
+           content_hash: sha256(content),
+           raw_content: content,
+           metadata: %{"path" => path, "ref" => new_sha}
+         }}
 
-      {:error, _} ->
-        []
+      {:error, :file_too_large} ->
+        :skip
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

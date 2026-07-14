@@ -13,15 +13,34 @@ defmodule RetrievalNode.Ingest.Drive do
   @type changes :: %{changed: [doc], removed: [String.t()], cursor: String.t() | nil}
 
   @doc """
-  Fetch changes since `cursor` (a `startPageToken`, or nil to start fresh). Returns
+  Fetch changes since `cursor` (an opaque `startPageToken`). With `cursor == nil`
+  (first run) there is no valid token to page from — Drive tokens are opaque, so we
+  can't fabricate one — so we seed it from `changes/getStartPageToken` and return an
+  empty page carrying that cursor; the next run pages real changes from it. Returns
   `{:ok, %{changed:, removed:, cursor:}}`, `{:snooze, seconds}` on a 429, or
   `{:error, reason}`.
   """
   @spec fetch_changes(String.t() | nil) ::
           {:ok, changes} | {:snooze, pos_integer()} | {:error, term()}
+  def fetch_changes(nil) do
+    case Req.get(req(), url: "/drive/v3/changes/startPageToken") do
+      {:ok, %{status: 200, body: %{"startPageToken" => token}}} ->
+        {:ok, %{changed: [], removed: [], cursor: token}}
+
+      {:ok, %{status: 429} = resp} ->
+        {:snooze, retry_after(resp)}
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, {:drive_http, status, truncate(body)}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   def fetch_changes(cursor) do
     params = [
-      pageToken: cursor || "1",
+      pageToken: cursor,
       fields: "newStartPageToken,changes(fileId,removed,file(id,name,mimeType))"
     ]
 
