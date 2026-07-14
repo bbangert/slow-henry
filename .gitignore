@@ -1,0 +1,40 @@
+# The directory Mix will write compiled artifacts to.
+/_build/
+
+# If you run "mix test --cover", coverage assets end up here.
+/cover/
+
+# The directory Mix downloads your dependencies sources to.
+/deps/
+
+# Where 3rd-party dependencies like ExDoc output generated docs.
+/doc/
+
+# Ignore .fetch files in case you like to edit your project deps locally.
+/.fetch
+
+# If the VM crashes, it generates a dump, let's ignore it too.
+erl_crash.dump
+
+# Also ignore archive artifacts (built via "mix archive.build").
+*.ez
+
+# Temporary files, for example, from tests.
+/tmp/
+
+# Ignore package tarball (built via "mix hex.build").
+retrieval_node-*.tar
+
+# Dialyzer PLT artifacts (the directory is kept via .gitkeep; the PLTs are built
+# in CI and cached, never committed).
+/priv/plts/*.plt
+/priv/plts/*.plt.hash
+
+# Claude Code transient agent state. The design docs and plan under
+# .claude/plans/ and .claude/settings.json are intentionally tracked; these
+# subdirectories are per-session scratch and should not be.
+/.claude/agent-memory/
+/.claude/skill-metrics/
+/.claude/audit/
+/.claude/research/
+

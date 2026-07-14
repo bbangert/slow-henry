@@ -1,0 +1,33 @@
+{
+  "name": "Slow Henry",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "runArgs": ["--network=host"],
+  "remoteUser": "ubuntu",
+  "containerUser": "ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "configureZshAsDefaultShell": true
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1": {}
+  },
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "postStartCommand": "sudo pg_ctlcluster 18 main start 2>/dev/null || true",
+  "remoteEnv": {
+    "PATH": "/home/ubuntu/.local/share/mise/shims:${containerEnv:PATH}",
+    "SHELL": "/bin/zsh"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "elixir-lsp.elixir-ls",
+        "phoenixframework.phoenix",
+        "anthropic.claude-code"
+      ]
+    }
+  }
+}

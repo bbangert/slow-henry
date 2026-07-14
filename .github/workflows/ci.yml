@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  ELIXIR_VERSION: "1.20.2-otp-29"
+  OTP_VERSION: "29.0.3"
+  # System packages needed to compile NIFs pulled in by mix deps.get — chiefly
+  # EXLA (builds a C++ shim against a downloaded XLA archive).
+  APT_PACKAGES: build-essential automake autoconf pkg-config libssl-dev
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - uses: actions/cache@v6
+        with:
+          path: deps
+          key: ${{ runner.os }}-deps-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-deps-
+      - run: mix deps.get
+      - run: mix format --check-formatted
+
+  compile:
+    name: Compile (warnings as errors)
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: dev
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build/dev
+          key: ${{ runner.os }}-dev-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-dev-
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+
+  credo:
+    name: Credo
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: dev
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build/dev
+          key: ${{ runner.os }}-dev-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-dev-
+      - run: mix deps.get
+      - run: mix credo --strict
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: test
+    services:
+      # PostgreSQL 18 with pgvector preinstalled — matches the app's store and
+      # satisfies the migration's `vector >= 0.5.0` guard.
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build/test
+          key: ${{ runner.os }}-test-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-test-
+      - run: mix deps.get
+      # The `test` alias runs ecto.create + ecto.migrate before the suite; the
+      # migrate step exercises the extension/HNSW setup against real pgvector.
+      - run: mix test --warnings-as-errors
+
+  dialyzer:
+    name: Dialyzer
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: dev
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build/dev
+          key: ${{ runner.os }}-dev-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-dev-
+      - uses: actions/cache@v6
+        with:
+          path: priv/plts
+          key: ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+      - run: mix deps.get
+      - run: mix dialyzer --format github
+
+  hex-audit:
+    name: Hex audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - uses: actions/cache@v6
+        with:
+          path: deps
+          key: ${{ runner.os }}-deps-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-deps-
+      - run: mix deps.get
+      - run: mix hex.audit
+      - run: mix deps.unlock --check-unused
