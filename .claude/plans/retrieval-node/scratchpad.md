@@ -55,28 +55,28 @@ Companion to `plan.md`. Records why things are the way they are, and paths NOT t
       `websearch_to_tsquery('english', ...)` in the raw-SQL RRF (handles quoted
       phrases / -exclude / OR safely on raw MCP-caller text). Used consistently.
 
-## ⚠️ ENVIRONMENT: Postgres (read before any DB work)
+## ENVIRONMENT: Postgres
 
-The devcontainer has **two** Postgres installs and the obvious one is the wrong one:
+**FIXED in the devcontainer (effective on rebuild):** the container now installs
+**PostgreSQL 18 + pgvector** itself (`.devcontainer/Dockerfile`, PGDG repo) and
+runs it on the standard **port 5432** (`setup.sh` starts it + sets the password;
+`postStartCommand` restarts it on later boots). App config uses `port: PGPORT ||
+5432`. Superuser `postgres` / `postgres`.
 
-- **Port 5432** = an unmanaged **PG 16** server (from the `itsmechlark/postgresql`
-  devcontainer feature) running in a separate namespace — NOT visible via `ps`,
-  NOT in `pg_lsclusters`, and its SHAREDIR has **no pgvector**. `CREATE EXTENSION
-  vector` fails there. Don't use it.
-- **Port 5433** = the Debian-managed **PG 18** cluster (`pg_lsclusters`), which
-  HAS `postgresql-18-pgvector` **0.8.5** installed and visible. This is the one
-  the app uses. Started with `sudo pg_ctlcluster 18 main start` after
-  `sudo pg_conftool 18 main set port 5433` + `listen_addresses localhost`.
-- `setup.sh` installs pgvector keyed to the **highest** installed major (18),
-  but the feature *runs* 16 — that mismatch is the root cause. Also
-  `postgresql-16-pgvector` was apt-installed but the running 16 server (other
-  namespace) still can't see it, so 16 is a dead end regardless.
-- App config: `config/dev.exs` + `config/test.exs` use `port: PGPORT || 5433`.
-- Superuser: `postgres` / `postgres` (set via `su postgres -c psql`, peer auth on
-  `/var/run/postgresql` socket — `PGHOST=localhost` is set in the shell env, so
-  bare `psql` goes to TCP and prompts for a password; use `-h /var/run/postgresql`
-  as the postgres OS user, or `PGPASSWORD=postgres psql -h localhost -p 5433`).
-- **If the cluster is down after a container restart**: `sudo pg_ctlcluster 18 main start`.
+- We **removed** the `ghcr.io/itsmechlark/postgresql` devcontainer feature: it
+  installed **PG 16 without pgvector** and squatted 5432 in a separate namespace
+  (invisible to `ps`/`pg_lsclusters`, own filesystem) — the original root cause.
+
+### Transitional note (this pre-rebuild session ONLY)
+Until the container is rebuilt, the OLD state persists: the foreign **PG 16 still
+holds 5432** (no pgvector, uncontrollable from here) and **PG 18 is on 5433**
+(started manually: `pg_conftool 18 main set port 5433` + `pg_ctlcluster start`).
+So in THIS session run mix with `PGPORT=5433` (e.g. `PGPORT=5433 mix test`). After
+a rebuild, plain 5432 works and the override is unnecessary.
+
+Superuser access via socket (peer auth): `PGHOST=localhost` is set in the shell,
+so bare `psql` goes to TCP and prompts for a password — use `PGPASSWORD=postgres
+psql -h localhost -p <port>` or `sudo su postgres -c "psql -h /var/run/postgresql ..."`.
 
 ## Sudo note
 

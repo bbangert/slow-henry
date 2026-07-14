@@ -6,42 +6,34 @@ set -euo pipefail
 echo 'eval "$(mise activate bash)"' >> ~/.bashrc
 echo 'eval "$(mise activate zsh)"'  >> ~/.zshrc
 
-# Install the pgvector extension for the Postgres server that the devcontainer
-# postgresql feature installed. The feature installs the server but not
-# pgvector, which is the app's vector store (Postgres + pgvector, HNSW index).
-# Key the package to the installed major version; fall back to a source build.
-install_pgvector() {
-  local pg_major
-  pg_major="$(ls -1 /usr/lib/postgresql 2>/dev/null | sort -V | tail -1 || true)"
-  if [ -z "${pg_major}" ] && command -v pg_config >/dev/null 2>&1; then
-    pg_major="$(pg_config --version | grep -oE '[0-9]+' | head -1)"
-  fi
-  if [ -z "${pg_major}" ]; then
-    echo "warning: no Postgres install detected; skipping pgvector" >&2
+# Bring up the PostgreSQL 18 cluster (installed WITH pgvector in the Dockerfile)
+# on the standard port 5432 and give the `postgres` superuser a known password so
+# the app can connect over TCP (config/dev.exs, config/test.exs). The cluster is
+# auto-created by postgresql-common when postgresql-18 is installed; here we just
+# start it and set the password. `postStartCommand` restarts it on later boots.
+setup_postgres() {
+  sudo pg_ctlcluster 18 main start 2>/dev/null || true
+
+  # Wait for the cluster to accept connections on its unix socket (peer auth as
+  # the postgres OS user), then set the TCP password.
+  local ready=""
+  for _ in $(seq 1 15); do
+    if sudo su postgres -c "psql -p 5432 -h /var/run/postgresql -tAc 'SELECT 1'" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+
+  if [ -z "${ready}" ]; then
+    echo "warning: PostgreSQL 18 did not become ready on port 5432" >&2
     return 0
   fi
 
-  if dpkg -s "postgresql-${pg_major}-pgvector" >/dev/null 2>&1; then
-    return 0
-  fi
-
-  sudo apt-get update
-  if sudo apt-get install -y "postgresql-${pg_major}-pgvector"; then
-    return 0
-  fi
-
-  # Fallback: build pgvector from source against the installed server.
-  echo "pgvector package unavailable; building from source" >&2
-  sudo apt-get install -y "postgresql-server-dev-${pg_major}"
-  local tmp
-  tmp="$(mktemp -d)"
-  git clone --depth 1 https://github.com/pgvector/pgvector.git "${tmp}/pgvector"
-  make -C "${tmp}/pgvector"
-  sudo make -C "${tmp}/pgvector" install
-  rm -rf "${tmp}"
+  sudo su postgres -c "psql -p 5432 -h /var/run/postgresql -c \"ALTER USER postgres PASSWORD 'postgres';\""
 }
 
-install_pgvector
+setup_postgres
 
 mise install
 

@@ -12,13 +12,11 @@
       "installZsh": true,
       "configureZshAsDefaultShell": true
     },
-    "ghcr.io/itsmechlark/features/postgresql:1": {
-      "version": "latest"
-    },
     "ghcr.io/devcontainers/features/github-cli:1": {},
     "ghcr.io/anthropics/devcontainer-features/claude-code:1": {}
   },
   "postCreateCommand": "bash .devcontainer/setup.sh",
+  "postStartCommand": "sudo pg_ctlcluster 18 main start 2>/dev/null || true",
   "remoteEnv": {
     "PATH": "/home/ubuntu/.local/share/mise/shims:${containerEnv:PATH}",
     "SHELL": "/bin/zsh"

@@ -5,9 +5,9 @@ config :retrieval_node, RetrievalNode.Repo,
   username: "postgres",
   password: "postgres",
   hostname: "localhost",
-  # Managed PG 18 cluster (pgvector 0.8.5) runs on 5433; 5432 is an unmanaged
-  # PG 16 from the devcontainer feature that lacks pgvector. See scratchpad.
-  port: String.to_integer(System.get_env("PGPORT") || "5433"),
+  # PostgreSQL 18 + pgvector, installed and started by the devcontainer on the
+  # standard port 5432 (see .devcontainer/). Override with PGPORT if needed.
+  port: String.to_integer(System.get_env("PGPORT") || "5432"),
   database: "retrieval_node_dev",
   stacktrace: true,
   show_sensitive_data_on_connection_error: true,

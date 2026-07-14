@@ -44,10 +44,10 @@ mix phx.server     # start the server (MCP endpoint mounts at /mcp)
 mix test           # run the suite
 ```
 
-> **Dev DB note:** this devcontainer ships two Postgres installs; the app uses
-> the managed **PG 18 cluster on port 5433** (which has pgvector). If the DB is
-> unreachable after a container restart: `sudo pg_ctlcluster 18 main start`.
-> See `.claude/plans/retrieval-node/scratchpad.md` for the full story.
+> **Dev DB:** the devcontainer installs **PostgreSQL 18 + pgvector** and runs it
+> on the standard port **5432** (`.devcontainer/Dockerfile` + `setup.sh`;
+> `postStartCommand` restarts it on later boots). If the DB is ever unreachable:
+> `sudo pg_ctlcluster 18 main start`.
 
 ## Project plan
 

@@ -9,8 +9,8 @@ config :retrieval_node, RetrievalNode.Repo,
   username: "postgres",
   password: "postgres",
   hostname: "localhost",
-  # Managed PG 18 cluster (pgvector 0.8.5) on 5433 — see config/dev.exs / scratchpad.
-  port: String.to_integer(System.get_env("PGPORT") || "5433"),
+  # PostgreSQL 18 + pgvector on the standard port 5432 (see .devcontainer/).
+  port: String.to_integer(System.get_env("PGPORT") || "5432"),
   database: "retrieval_node_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: System.schedulers_online() * 2
