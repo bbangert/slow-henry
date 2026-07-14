@@ -25,7 +25,7 @@ defmodule RetrievalNode.Ingest.PendingChunksTest do
 
   test "insert_raw_all bulk-inserts in a single round-trip" do
     assert {:ok, 2} = PendingChunks.insert_raw_all([raw_attrs(), raw_attrs()])
-    assert Repo.aggregate(PendingChunk, :count) == 2
+    assert Repo.aggregate(PendingChunk, :count, :id) == 2
   end
 
   test "insert_raw_all is atomic — a NOT NULL violation aborts the whole batch" do
@@ -33,7 +33,7 @@ defmodule RetrievalNode.Ingest.PendingChunksTest do
       PendingChunks.insert_raw_all([raw_attrs(), raw_attrs(%{natural_key: nil})])
     end
 
-    assert Repo.aggregate(PendingChunk, :count) == 0
+    assert Repo.aggregate(PendingChunk, :count, :id) == 0
   end
 
   test "write_chunks splits a raw row into N chunk rows sharing natural_key/content_hash" do
@@ -63,7 +63,7 @@ defmodule RetrievalNode.Ingest.PendingChunksTest do
 
     # Distinct per-dimension values so a transposed/garbled write would be caught.
     vector = for i <- 1..384, do: i * 0.001
-    assert :ok = PendingChunks.set_embeddings([%{id: chunk.id, embedding: vector}])
+    assert {:ok, :ok} = PendingChunks.set_embeddings([%{id: chunk.id, embedding: vector}])
 
     reloaded = PendingChunks.fetch!(chunk.id)
     assert reloaded.status == "embedded"
@@ -72,6 +72,13 @@ defmodule RetrievalNode.Ingest.PendingChunksTest do
     assert length(round_tripped) == 384
     # vector(384) stores float32, so compare within tolerance.
     assert Enum.zip(round_tripped, vector) |> Enum.all?(fn {a, b} -> abs(a - b) < 1.0e-4 end)
+  end
+
+  test "set_embeddings rolls back if an id doesn't exist (no silent drop)" do
+    vector = for _ <- 1..384, do: 0.0
+
+    assert {:error, {:no_such_pending_chunk, 999_999}} =
+             PendingChunks.set_embeddings([%{id: 999_999, embedding: vector}])
   end
 
   test "fetch_many! and delete_by_ids operate on a set of ids" do

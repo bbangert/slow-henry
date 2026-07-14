@@ -26,11 +26,13 @@ defmodule RetrievalNode.Ingest.PendingChunks do
 
     entries =
       Enum.map(rows, fn attrs ->
+        # Map.get (not dot access) so a missing key becomes nil → a consistent DB
+        # NOT NULL failure, rather than a KeyError before we ever reach the DB.
         %{
-          source: attrs.source,
-          natural_key: attrs.natural_key,
-          content_hash: attrs.content_hash,
-          raw_content: attrs.raw_content,
+          source: Map.get(attrs, :source),
+          natural_key: Map.get(attrs, :natural_key),
+          content_hash: Map.get(attrs, :content_hash),
+          raw_content: Map.get(attrs, :raw_content),
           status: "raw",
           inserted_at: now,
           updated_at: now
@@ -82,17 +84,28 @@ defmodule RetrievalNode.Ingest.PendingChunks do
     end
   end
 
-  @doc "Write embeddings back onto chunk rows. `pairs` is `[%{id:, embedding:}]`."
-  @spec set_embeddings([%{id: integer(), embedding: [float()]}]) :: :ok
+  @doc """
+  Write embeddings back onto chunk rows. `pairs` is `[%{id:, embedding:}]`.
+  Each update must affect exactly one row — a missing id would otherwise silently
+  drop the embedding and leave the row `chunked`, so it rolls the batch back
+  (`{:error, {:no_such_pending_chunk, id}}`). Sets `updated_at` (update_all bypasses
+  Ecto's automatic timestamps).
+  """
+  @spec set_embeddings([%{id: integer(), embedding: [float()]}]) ::
+          {:ok, :ok} | {:error, {:no_such_pending_chunk, integer()}}
   def set_embeddings(pairs) do
-    Repo.transaction(fn ->
-      Enum.each(pairs, fn %{id: id, embedding: embedding} ->
-        by_ids([id])
-        |> Repo.update_all(set: [embedding: Pgvector.new(embedding), status: "embedded"])
-      end)
-    end)
+    now = DateTime.utc_now()
 
-    :ok
+    Repo.transaction(fn -> Enum.each(pairs, &update_embedding(&1, now)) end)
+  end
+
+  defp update_embedding(%{id: id, embedding: embedding}, now) do
+    set = [embedding: Pgvector.new(embedding), status: "embedded", updated_at: now]
+
+    case Repo.update_all(by_ids([id]), set: set) do
+      {1, _} -> :ok
+      {_other, _} -> Repo.rollback({:no_such_pending_chunk, id})
+    end
   end
 
   @doc "Query for the given ids (composable / used for delete)."

@@ -133,9 +133,11 @@ defmodule RetrievalNode.Ingest.GitMirror do
   def grep(slug, pattern, ref \\ "HEAD") do
     # git grep doesn't accept --end-of-options; the validated ref (no leading dash)
     # is what prevents it being read as an option, and `-e` guards the pattern.
+    # `-z` NUL-delimits fields so a `:` in a file path can't corrupt parsing.
     with {:ok, ref} <- safe_ref(ref),
          {:ok, gitdir} <- mirror_path(slug),
-         {:ok, out} <- git(["--git-dir", gitdir, "grep", "-n", "-I", "-e", pattern, ref], [0, 1]) do
+         {:ok, out} <-
+           git(["--git-dir", gitdir, "grep", "-n", "-I", "-z", "-e", pattern, ref], [0, 1]) do
       {:ok, parse_grep(slug, ref, out)}
     end
   end
@@ -199,17 +201,18 @@ defmodule RetrievalNode.Ingest.GitMirror do
 
   defp lines(out), do: String.split(out, "\n", trim: true)
 
-  # `git grep -n <ref>` lines look like "ref:path:line:text". Fall through to []
-  # on any line that doesn't parse (e.g. an unexpected non-numeric field) rather
-  # than raising, honoring the "always {:ok, _} | {:error, _}" contract.
+  # With `-z`, each record is `<ref>:<path>\0<lineno>\0<text>` (records still \n-
+  # separated). NUL field separators mean a `:` anywhere in <path> is safe. Fall
+  # through to [] on any record that doesn't parse rather than raising, honoring the
+  # "always {:ok, _} | {:error, _}" contract.
   defp parse_grep(slug, ref, out) do
     prefix = ref <> ":"
 
     out
     |> lines()
-    |> Enum.flat_map(fn line ->
-      with stripped <- String.replace_prefix(line, prefix, ""),
-           [path, line_no, text] <- String.split(stripped, ":", parts: 3),
+    |> Enum.flat_map(fn record ->
+      with stripped <- String.replace_prefix(record, prefix, ""),
+           [path, line_no, text] <- String.split(stripped, "\0", parts: 3),
            {n, ""} <- Integer.parse(line_no) do
         [%{repo: slug, path: path, line: n, text: text}]
       else
