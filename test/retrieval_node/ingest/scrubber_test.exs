@@ -1,5 +1,7 @@
 defmodule RetrievalNode.Ingest.ScrubberTest do
-  use RetrievalNode.DataCase, async: true
+  # async: false — this module mutates global application env (`:gitleaks_cmd`)
+  # and attaches telemetry handlers, which would race under concurrent tests.
+  use RetrievalNode.DataCase, async: false
 
   alias RetrievalNode.Ingest.Scrubber
   alias RetrievalNode.Repo

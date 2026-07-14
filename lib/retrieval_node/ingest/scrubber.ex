@@ -185,7 +185,9 @@ defmodule RetrievalNode.Ingest.Scrubber do
   # type), so the reconstruction in redact/2 never double-cuts a byte range.
   defp merge_spans(spans) do
     spans
-    |> Enum.sort()
+    # Sort by position only (stable) so ties keep the first-encountered type —
+    # findings arrive in @patterns order (high-confidence first), not alphabetical.
+    |> Enum.sort_by(fn {s, e, _t} -> {s, e} end)
     |> Enum.reduce([], fn
       {s, e, _t}, [{ps, pe, pt} | rest] when s <= pe -> [{ps, max(pe, e), pt} | rest]
       span, acc -> [span | acc]
@@ -254,7 +256,11 @@ defmodule RetrievalNode.Ingest.Scrubber do
         {_out, code} -> {:error, {:gitleaks_exit, code}}
       end
     rescue
-      e in [ErlangError, File.Error] -> {:error, {:gitleaks_unavailable, e.__struct__}}
+      # ErlangError/:enoent = binary broke mid-run; File.Error = temp I/O;
+      # Jason.DecodeError = a malformed report. All degrade to regex rather than
+      # crash scrub/2 (which would break the fail-closed degrade guarantee).
+      e in [ErlangError, File.Error, Jason.DecodeError] ->
+        {:error, {:gitleaks_unavailable, e.__struct__}}
     after
       File.rm_rf(dir)
     end
@@ -311,30 +317,36 @@ defmodule RetrievalNode.Ingest.Scrubber do
   only a `sha256` of the matched text — never the raw secret. `attrs` needs
   `:source_id` and `:file_reference`; `:chunk_id` is optional.
   """
-  @spec record_findings([finding], map()) :: {:ok, non_neg_integer()}
+  @spec record_findings([finding], map()) ::
+          {:ok, non_neg_integer()} | {:error, Ecto.Changeset.t()}
   def record_findings(findings, attrs) do
     now = DateTime.utc_now()
 
     Repo.transaction(fn ->
-      Enum.each(findings, fn f ->
-        %SecretFinding{}
-        |> SecretFinding.changeset(%{
-          source_id: attrs.source_id,
-          chunk_id: Map.get(attrs, :chunk_id),
-          file_reference: attrs.file_reference,
-          detector: f.detector,
-          rule_id: f.rule_id,
-          secret_type: f.secret_type,
-          span: %{"start" => f.start, "length" => f.length},
-          match_hash: :crypto.hash(:sha256, f.match) |> Base.encode16(case: :lower),
-          action: :redacted,
-          detected_at: now
-        })
-        |> Repo.insert!()
-      end)
-
-      length(findings)
+      Enum.reduce(findings, 0, &insert_finding(&1, attrs, now, &2))
     end)
+  end
+
+  defp insert_finding(finding, attrs, now, count) do
+    case Repo.insert(finding_changeset(finding, attrs, now)) do
+      {:ok, _row} -> count + 1
+      {:error, changeset} -> Repo.rollback(changeset)
+    end
+  end
+
+  defp finding_changeset(finding, attrs, now) do
+    SecretFinding.changeset(%SecretFinding{}, %{
+      source_id: attrs.source_id,
+      chunk_id: Map.get(attrs, :chunk_id),
+      file_reference: attrs.file_reference,
+      detector: finding.detector,
+      rule_id: finding.rule_id,
+      secret_type: finding.secret_type,
+      span: %{"start" => finding.start, "length" => finding.length},
+      match_hash: :crypto.hash(:sha256, finding.match) |> Base.encode16(case: :lower),
+      action: :redacted,
+      detected_at: now
+    })
   end
 
   defp gitleaks_cmd, do: Application.get_env(:retrieval_node, :gitleaks_cmd, "gitleaks")
