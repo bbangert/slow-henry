@@ -16,6 +16,12 @@ defmodule RetrievalNode.Embedding.LlamaCppSidecarImpl do
 
   @behaviour RetrievalNode.Embedding
 
+  # embed/1 and embed_batch/1 are intentional v1 stubs that always raise, so they
+  # have no local return — which dialyzer flags against the behaviour's `:: vector`
+  # callback. Silence it here; the raising is the desired contract until the real
+  # llama.cpp client lands.
+  @dialyzer {:nowarn_function, [embed: 1, embed_batch: 1]}
+
   @dimensions 384
 
   @impl true
