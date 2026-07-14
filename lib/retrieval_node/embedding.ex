@@ -30,11 +30,9 @@ defmodule RetrievalNode.Embedding do
   @doc """
   The configured embedding implementation module.
 
-  Raises a clear `ArgumentError` if the configured module isn't loaded — the
-  concrete implementations (`NxServingImpl`, `LlamaCppSidecarImpl`) land in
-  Phase 3, so until then callers should pass a precomputed vector via the
-  `:embedding` option (e.g. `Search.hybrid_search(query, embedding: vec)`) rather
-  than hit a cryptic `UndefinedFunctionError`.
+  Raises a clear `ArgumentError` if the configured `:embedding_impl` module isn't
+  loaded (a misconfiguration), rather than letting call sites hit a cryptic
+  `UndefinedFunctionError`.
   """
   @spec impl() :: module()
   def impl do
@@ -42,9 +40,8 @@ defmodule RetrievalNode.Embedding do
 
     unless Code.ensure_loaded?(mod) do
       raise ArgumentError,
-            "configured :embedding_impl #{inspect(mod)} is not available yet " <>
-              "(embedding implementations land in Phase 3). Until then, pass a " <>
-              "precomputed vector via the :embedding option."
+            "configured :embedding_impl #{inspect(mod)} is not loaded — check that " <>
+              ":embedding_impl points at a compiled module."
     end
 
     mod

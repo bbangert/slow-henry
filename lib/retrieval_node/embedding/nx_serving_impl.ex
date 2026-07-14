@@ -32,16 +32,12 @@ defmodule RetrievalNode.Embedding.NxServingImpl do
 
   @impl true
   def embed_batch(texts) when is_list(texts) do
+    # The input is always a list, so Bumblebee's serving always returns a list of
+    # per-text `%{embedding: tensor}` results (never a bare single map).
     Serving.name()
     |> Nx.Serving.batched_run(texts)
-    |> as_list()
     |> Enum.map(&matryoshka/1)
   end
-
-  # Nx.Serving may return a single result map or a list depending on input shape;
-  # normalize to a list of per-text results.
-  defp as_list(%{embedding: _} = single), do: [single]
-  defp as_list(results) when is_list(results), do: results
 
   @doc """
   Matryoshka post-processing: truncate a full-dimension embedding to the leading
@@ -58,12 +54,19 @@ defmodule RetrievalNode.Embedding.NxServingImpl do
     |> Nx.to_flat_list()
   end
 
+  # Epsilon floor on the norm so an all-zero (truncated) vector normalizes to
+  # zeros (finite) rather than NaN — a NaN embedding would silently poison
+  # pgvector inserts/search. Real embeddings are never all-zero, so this only
+  # ever affects the degenerate case.
+  @norm_epsilon 1.0e-12
+
   defp l2_normalize(tensor) do
     norm =
       tensor
       |> Nx.pow(2)
       |> Nx.sum(axes: [-1], keep_axes: true)
       |> Nx.sqrt()
+      |> Nx.max(@norm_epsilon)
 
     Nx.divide(tensor, norm)
   end

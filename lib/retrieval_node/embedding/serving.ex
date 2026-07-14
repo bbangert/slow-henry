@@ -71,6 +71,17 @@ defmodule RetrievalNode.Embedding.Serving do
       )
 
       :error
+  catch
+    # batched_run is a GenServer.call — a not-yet-registered serving or a call
+    # timeout surfaces as an exit, which `rescue` does not catch. Handle it here
+    # so warmup logs and returns cleanly instead of crashing the Task. `ready?`
+    # stays false (the put above never ran), which is the correct polarity.
+    :exit, reason ->
+      Logger.error(
+        "Embedding warmup exited: #{inspect(reason)} — first real request will pay JIT cost"
+      )
+
+      :error
   end
 
   @doc "Whether warmup has completed (consumed by /healthz). Defaults to false."

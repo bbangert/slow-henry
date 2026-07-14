@@ -40,6 +40,17 @@ defmodule RetrievalNode.Embedding.NxServingImplTest do
       tensor = Nx.tensor(for i <- 1..768, do: i * 0.01)
       assert NxServingImpl.matryoshka(%{embedding: tensor}) == NxServingImpl.matryoshka(tensor)
     end
+
+    test "an all-zero vector yields a finite (zero) result, not NaN" do
+      # Guards the epsilon floor in l2_normalize: dividing by a zero norm would
+      # otherwise produce NaN, which would silently poison pgvector.
+      result = NxServingImpl.matryoshka(Nx.broadcast(0.0, {768}))
+
+      assert length(result) == 384
+      assert Enum.all?(result, &(&1 == 0.0))
+      # NaN is the only float that is not equal to itself.
+      refute Enum.any?(result, fn x -> x != x end)
+    end
   end
 
   # Loads the real model + EXLA and embeds through the serving. Excluded by
