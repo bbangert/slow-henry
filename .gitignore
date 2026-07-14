@@ -25,6 +25,11 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 retrieval_node-*.tar
 
+# Dialyzer PLT artifacts (the directory is kept via .gitkeep; the PLTs are built
+# in CI and cached, never committed).
+/priv/plts/*.plt
+/priv/plts/*.plt.hash
+
 # Claude Code transient agent state. The design docs and plan under
 # .claude/plans/ and .claude/settings.json are intentionally tracked; these
 # subdirectories are per-session scratch and should not be.

@@ -10,7 +10,17 @@ defmodule RetrievalNode.MixProject do
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
       deps: deps(),
+      dialyzer: dialyzer(),
       listeners: [Phoenix.CodeReloader]
+    ]
+  end
+
+  # Keep the PLT in priv/plts so CI can cache it as a stable path.
+  defp dialyzer do
+    [
+      plt_local_path: "priv/plts",
+      plt_core_path: "priv/plts",
+      plt_add_apps: [:mix, :ex_unit]
     ]
   end
 
@@ -62,9 +72,10 @@ defmodule RetrievalNode.MixProject do
       {:req, "~> 0.5"},
       {:sourceror, "~> 1.0"},
 
-      # Tooling used by per-phase verification (mix credo/sobelow)
+      # Tooling used by per-phase verification (mix credo/sobelow) and CI (dialyzer)
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false}
+      {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev], runtime: false}
     ]
   end
 
