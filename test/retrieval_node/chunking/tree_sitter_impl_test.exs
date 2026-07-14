@@ -84,5 +84,25 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
 
       assert Enum.map(chunks, & &1.breadcrumb) |> Enum.sort() == ["A > one", "A > two"]
     end
+
+    test "chunks javascript functions and class methods" do
+      src = "function foo() { return 1 }\nclass A { bar() { return 2 } }\n"
+      {:ok, chunks} = TSI.chunk(src, "javascript")
+
+      crumbs = Enum.map(chunks, & &1.breadcrumb)
+      assert "foo" in crumbs
+      assert "A > bar" in crumbs
+      assert Enum.all?(chunks, &(&1.parse_status == :ok))
+    end
+  end
+
+  # No supervisor started here — verifies guarded/1 fails closed rather than
+  # crashing the caller when RetrievalNode.ChunkTaskSupervisor is absent.
+  describe "guarded/1 without the supervisor running" do
+    test "returns {:error, :chunk_supervisor_down} instead of crashing" do
+      refute Process.whereis(RetrievalNode.ChunkTaskSupervisor)
+      assert {:error, :chunk_supervisor_down} = TSI.guarded(fn -> {:ok, []} end)
+      assert Process.alive?(self())
+    end
   end
 end

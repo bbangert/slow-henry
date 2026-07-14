@@ -75,8 +75,21 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   without the NIF.
   """
   @spec guarded((-> {:ok, [map()]} | {:error, term()})) ::
-          {:ok, [map()]} | {:error, :chunk_timeout | {:chunk_crashed, term()} | term()}
+          {:ok, [map()]}
+          | {:error, :chunk_timeout | :chunk_supervisor_down | {:chunk_crashed, term()} | term()}
   def guarded(fun) when is_function(fun, 0) do
+    # If the supervisor isn't running (misconfiguration / started before Phase 8
+    # wires it in), async_nolink would exit :noproc in THIS process — which the
+    # crash isolation below can't catch. Guard it so even that case returns an
+    # error tuple, fully honoring "never crash the caller".
+    if Process.whereis(@supervisor) do
+      run_guarded(fun)
+    else
+      {:error, :chunk_supervisor_down}
+    end
+  end
+
+  defp run_guarded(fun) do
     task = Task.Supervisor.async_nolink(@supervisor, fun)
 
     # NOTE: the `yield || shutdown` race is handled by Task itself — if the task

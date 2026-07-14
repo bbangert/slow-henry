@@ -9,13 +9,17 @@ defmodule RetrievalNode.Chunking do
       language pre-flight + a supervised `Task` timeout) so a slow or crashing
       parse degrades to an error tuple, never takes down the caller.
     * `RetrievalNode.Chunking.HeuristicImpl` — a pure-Elixir line/blank-line/
-      brace-balance chunker with no NIF involvement. The automatic fallback (size
-      cap, binary content, unsupported language, or a tree-sitter timeout/crash)
+      brace-balance chunker with no NIF involvement. The pipeline's fallback impl
       and the `:test`-env default (keeps the suite NIF-free).
 
-  Callers (`Ingest.Workers.ChunkFiles`) only ever call `chunk/2` — never the NIF
-  directly — so promoting to the peer-node isolation escape hatch later is a
-  config change plus one module, not a call-site rewrite.
+  `chunk/2` is **pure dispatch** — it delegates to the configured impl and returns
+  whatever that impl returns, including `{:error, reason}`. It does NOT itself
+  fall back. The fallback *orchestration* — deciding which error reasons re-run
+  through `HeuristicImpl` (`:chunk_timeout`/`:chunk_crashed`/`:unsupported_language`)
+  versus skip the file (`:too_large`/`:binary_content`) — lives in the ingest
+  worker (`Ingest.Workers.ChunkFiles`, Phase 6). That worker only ever calls
+  `chunk/2`, never the NIF directly, so promoting to the peer-node isolation
+  escape hatch later is a config change plus one module, not a call-site rewrite.
   """
 
   @type language :: String.t()
