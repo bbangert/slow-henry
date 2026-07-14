@@ -171,9 +171,13 @@ in naming, THIS section wins:
       :scrub, :degraded]` telemetry); high-confidence secret surviving redaction → `{:cancel, :unredactable_secret}`
 - [x] Fail-closed: `scrub/2` post-redaction re-scan; regex scanner (pure, no external
       dep) is the floor — if it raises, `{:error, :scrub_unavailable}` (nothing indexed unscanned)
-- [x] **Verify**: 12 tests — planted AWS key redacted + audited (sha256, not raw);
-      gitleaks-absent (`:enoent`) degrades to regex + fires telemetry; jira/drive scanned;
-      PEM/multi-secret/byte-offset redaction; gitleaks JSON parsing. credo/dialyzer/format clean
+- [x] **Verify**: 22 tests — planted AWS key redacted + audited (sha256, not raw; whole-row check);
+      gitleaks degrade forced via `:gitleaks_cmd` config + fires telemetry; jira/drive scanned;
+      PEM/dup/overlap/UTF-8 byte-offset redaction; fail-closed `redaction_left_secret?`; size cap.
+      credo/dialyzer/format clean.
+- [x] **Security hardening** (Phase 5 review, `reviews/phase-5-review.md`): temp file in a private
+      0700 dir + `find_executable` guard (no plaintext to /tmp when gitleaks absent); secrets kept
+      out of logs/telemetry; gitleaks dup-secret redaction (all occurrences); transactional audit.
 
 ## Phase 6 — Ingest pipeline `[oban]` (from `design-oban.md`) — the all-three-thin slice
 
