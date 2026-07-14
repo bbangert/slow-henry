@@ -80,6 +80,11 @@ defmodule RetrievalNode.Ingest.GitMirrorTest do
     assert {:ok, []} = GitMirror.grep("acme/app", "zzz_no_such_token")
   end
 
+  test "ensure_mirror on an existing mirror takes the fetch path (not clone)" do
+    # setup already cloned acme/app; a second call must succeed via git fetch.
+    assert {:ok, _path} = GitMirror.ensure_mirror("acme/app", "file://irrelevant")
+  end
+
   describe "safety guards" do
     test "show rejects a path-traversal path" do
       assert {:error, :invalid_path} = GitMirror.show("acme/app", "../../../etc/passwd")
@@ -87,6 +92,23 @@ defmodule RetrievalNode.Ingest.GitMirrorTest do
 
     test "mirror_path rejects a traversal repo slug" do
       assert {:error, :invalid_repo} = GitMirror.mirror_path("../evil")
+    end
+
+    test "a git-option-injection ref is rejected everywhere (no RCE / file write)" do
+      # `--output=…` / `--open-files-in-pager=…` would be a git flag; safe_ref blocks it.
+      assert {:error, :invalid_ref} = GitMirror.show("acme/app", "app.py", "--output=/tmp/pwn")
+
+      assert {:error, :invalid_ref} =
+               GitMirror.grep("acme/app", "x", "--open-files-in-pager=touch /tmp/pwn")
+
+      assert {:error, :invalid_ref} = GitMirror.head_sha("acme/app", "-abc")
+      assert {:error, :invalid_ref} = GitMirror.changed_files("acme/app", nil, "--flag")
+      refute File.exists?("/tmp/pwn")
+    end
+
+    test "ensure_mirror rejects a non-allowlisted transport (ext:: RCE vector)" do
+      assert {:error, :invalid_url} = GitMirror.ensure_mirror("evil", "ext::sh -c whoami")
+      assert {:error, :invalid_url} = GitMirror.ensure_mirror("evil", "-oProxyCommand=x")
     end
   end
 end

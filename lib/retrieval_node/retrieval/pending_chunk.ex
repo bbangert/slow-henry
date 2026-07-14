@@ -34,7 +34,7 @@ defmodule RetrievalNode.Retrieval.PendingChunk do
   @doc "Changeset for a freshly-discovered raw row (`*Sync` workers)."
   def raw_changeset(pending_chunk, attrs) do
     pending_chunk
-    |> cast(attrs, [:source, :natural_key, :content_hash, :raw_content, :status])
+    |> cast(attrs, [:source, :natural_key, :content_hash, :raw_content])
     |> put_change(:status, "raw")
     |> validate_required([:source, :natural_key, :content_hash, :raw_content])
   end

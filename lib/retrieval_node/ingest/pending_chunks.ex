@@ -11,21 +11,34 @@ defmodule RetrievalNode.Ingest.PendingChunks do
 
   import Ecto.Query
 
-  alias RetrievalNode.Ingest.PendingChunks
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.PendingChunk
 
-  @doc "Bulk-insert freshly-discovered raw rows. Returns the count inserted."
-  @spec insert_raw_all([map()]) :: {:ok, non_neg_integer()} | {:error, Ecto.Changeset.t()}
+  @doc """
+  Bulk-insert freshly-discovered raw rows in a single `insert_all` (one round-trip,
+  atomic). Rows come from the internal `*Sync` clients; NOT NULL constraints at the
+  DB enforce required fields (a malformed row raises → the Oban job retries).
+  Returns `{:ok, count}`.
+  """
+  @spec insert_raw_all([map()]) :: {:ok, non_neg_integer()}
   def insert_raw_all(rows) do
-    Repo.transaction(fn -> Enum.reduce(rows, 0, &insert_raw_row/2) end)
-  end
+    now = DateTime.utc_now()
 
-  defp insert_raw_row(attrs, count) do
-    case Repo.insert(PendingChunk.raw_changeset(%PendingChunk{}, attrs)) do
-      {:ok, _} -> count + 1
-      {:error, changeset} -> Repo.rollback(changeset)
-    end
+    entries =
+      Enum.map(rows, fn attrs ->
+        %{
+          source: attrs.source,
+          natural_key: attrs.natural_key,
+          content_hash: attrs.content_hash,
+          raw_content: attrs.raw_content,
+          status: "raw",
+          inserted_at: now,
+          updated_at: now
+        }
+      end)
+
+    {count, _} = Repo.insert_all(PendingChunk, entries)
+    {:ok, count}
   end
 
   @doc "Insert a single raw row, returning the persisted record."
@@ -88,5 +101,5 @@ defmodule RetrievalNode.Ingest.PendingChunks do
 
   @doc "Delete consumed staging rows by id. Returns the count deleted."
   @spec delete_by_ids([integer()]) :: {non_neg_integer(), nil}
-  def delete_by_ids(ids), do: Repo.delete_all(PendingChunks.by_ids(ids))
+  def delete_by_ids(ids), do: Repo.delete_all(by_ids(ids))
 end
