@@ -76,7 +76,11 @@ fi
 
 if ! run_as_postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '${db_name}'" | grep -q 1; then
   log "creating database $db_name owned by $db_user"
-  run_as_postgres -c "CREATE DATABASE ${db_name} OWNER ${db_user};"
+  # Same psql :"var" identifier-quoting as the role block above — no shell
+  # interpolation into SQL text.
+  run_as_postgres -v db_name="$db_name" -v db_user="$db_user" <<'SQL'
+CREATE DATABASE :"db_name" OWNER :"db_user";
+SQL
 else
   log "database $db_name already exists"
 fi
