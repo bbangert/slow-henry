@@ -12,9 +12,9 @@ defmodule RetrievalNode.Bench.Metrics do
   relevance levels).
 
   `ranked_ids` is the result list in rank order (best first); `relevant_ids` is
-  a `MapSet` (or anything `MapSet.member?/2` accepts) of the ids considered
-  relevant for this query. Only the leading `k` of `ranked_ids` count toward
-  DCG, matching the standard nDCG@k definition.
+  a `MapSet` of the ids considered relevant for this query. Only the leading
+  `k` of `ranked_ids` count toward DCG, matching the standard nDCG@k
+  definition.
 
   Returns `0.0` when `relevant_ids` is empty — there is no ideal ranking to
   normalize against, so by convention this is treated as a perfect-recall

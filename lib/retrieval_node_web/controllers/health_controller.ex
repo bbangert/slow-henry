@@ -29,6 +29,7 @@ defmodule RetrievalNodeWeb.HealthController do
 
   use RetrievalNodeWeb, :controller
 
+  alias RetrievalNode.Chunking
   alias RetrievalNode.Chunking.Grammars
   alias RetrievalNode.Embedding.Serving
   alias RetrievalNode.Repo
@@ -118,7 +119,7 @@ defmodule RetrievalNodeWeb.HealthController do
     e -> error(%{reason: Exception.message(e)})
   end
 
-  defp chunking_impl, do: Application.get_env(:retrieval_node, :chunking_impl)
+  defp chunking_impl, do: Chunking.impl()
 
   defp embedding_serving_start?,
     do: Application.get_env(:retrieval_node, :embedding_serving_start, true)

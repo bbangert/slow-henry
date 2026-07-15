@@ -93,22 +93,28 @@ sudo scripts/deploy.sh _build/prod/retrieval_node-0.1.0.tar.gz
 
 `deploy.sh`:
 1. Unpacks the tarball to `/opt/retrieval_node/releases/<timestamp>/`.
-2. Atomically repoints `/opt/retrieval_node/current` (`ln -sfn`).
-3. Sources `/etc/retrieval_node/env` (same file the systemd unit loads via
+2. Sources `/etc/retrieval_node/env` (same file the systemd unit loads via
    `EnvironmentFile=`) and runs
-   `bin/retrieval_node eval "RetrievalNode.Release.migrate()"` against the
-   *new* release's code while the *old* release is still the one bound to
-   the port — this is the standard mix-release migration order. It's safe
-   for additive migrations (new columns/tables/indexes the old code
-   ignores); migrations that drop/rename columns the old code still reads
-   need a maintenance window instead of a plain deploy. If migration fails,
-   the script aborts **before** restarting the service, so the old release
-   keeps running untouched.
+   `bin/retrieval_node eval "RetrievalNode.Release.migrate()"` directly
+   against the *new* release's own binary in
+   `/opt/retrieval_node/releases/<timestamp>/` — **not** via the `current`
+   symlink, which still points at the *old* release (and stays bound to the
+   port; nothing has restarted yet). This is the standard mix-release
+   migration order. It's safe for additive migrations (new columns/tables/
+   indexes the old code ignores); migrations that drop/rename columns the
+   old code still reads need a maintenance window instead of a plain
+   deploy. If migration fails, the script aborts **before** repointing
+   `current` or restarting the service, so the old release keeps running
+   completely untouched — no symlink change to undo.
+3. Only once migrations succeed: atomically repoints `/opt/retrieval_node/current`
+   (`ln -sfn`) at the new release.
 4. `systemctl restart retrieval_node`.
 5. Polls `http://localhost:4000/healthz` until it returns 200 or the
    60s timeout is hit (nonzero exit + a `journalctl -u retrieval_node`
-   hint on timeout — the previous release is left in place; repoint
-   `/opt/retrieval_node/current` manually to roll back if needed).
+   hint on timeout — by this point `current` already points at the new
+   release and the service was already restarted, so roll back by
+   repointing `/opt/retrieval_node/current` at the prior release timestamp
+   under `/opt/retrieval_node/releases/` and restarting again).
 
 ## Disk layout
 

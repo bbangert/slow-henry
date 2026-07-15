@@ -47,4 +47,34 @@ defmodule RetrievalNodeWeb.HealthControllerTest do
              } = json_response(conn, 503)
     end
   end
+
+  describe "GET /healthz — grammar_cache gate mirrors Chunking.impl/0, not a raw config lookup" do
+    alias RetrievalNode.Chunking.{FakeGrammarPack, Grammars}
+
+    setup do
+      # Simulate a host where :chunking_impl was never set — Chunking.impl/0
+      # then falls back to TreeSitterImpl, so grammar_cache must actually run
+      # (not report "skipped" the way a bare Application.get_env/2 with no
+      # default would).
+      original_chunking_impl = Application.get_env(:retrieval_node, :chunking_impl)
+      Application.delete_env(:retrieval_node, :chunking_impl)
+      Application.put_env(:retrieval_node, :grammar_pack_mod, FakeGrammarPack)
+      Application.put_env(:retrieval_node, :fake_downloaded_languages, Grammars.required())
+
+      on_exit(fn ->
+        Application.put_env(:retrieval_node, :chunking_impl, original_chunking_impl)
+        Application.delete_env(:retrieval_node, :grammar_pack_mod)
+        Application.delete_env(:retrieval_node, :fake_downloaded_languages)
+      end)
+
+      :ok
+    end
+
+    test "grammar_cache runs (not skipped) when :chunking_impl is unset", %{conn: conn} do
+      conn = get(conn, ~p"/healthz")
+
+      assert %{"checks" => %{"grammar_cache" => %{"status" => "ok"}}} =
+               json_response(conn, 200)
+    end
+  end
 end

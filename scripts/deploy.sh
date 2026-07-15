@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
 # Deploy a retrieval_node release tarball (built by scripts/build_arm64.sh) to
-# this host: unpack under /opt/retrieval_node/releases/<timestamp>/, flip the
-# /opt/retrieval_node/current symlink atomically, run Ecto migrations via the
-# new release, restart the systemd service, and wait for /healthz to report
-# ready before returning success.
+# this host: unpack under /opt/retrieval_node/releases/<timestamp>/, run Ecto
+# migrations via the new release (before anything points at it), then flip
+# the /opt/retrieval_node/current symlink atomically, restart the systemd
+# service, and wait for /healthz to report ready before returning success.
 #
 # Usage: sudo scripts/deploy.sh <path-to-release-tarball>
 #
@@ -49,9 +49,6 @@ if command -v chown >/dev/null 2>&1 && [ "$(id -u)" = "0" ]; then
   chown -R "$deploy_user:$deploy_group" "$release_dir"
 fi
 
-log "repointing $current_link -> $release_dir"
-ln -sfn "$release_dir" "$current_link"
-
 if [ -f "$env_file" ]; then
   set -a
   # shellcheck disable=SC1090
@@ -61,22 +58,25 @@ else
   die "env file not found: $env_file (required for migrations — see deploy/README.md)"
 fi
 
-# Migrations run against the live DB using the *new* release's code while the
-# *old* release is still the one bound to the port (systemctl hasn't
-# restarted yet). That's the standard mix-release migration order and is
-# safe for additive migrations (new columns/tables/indexes the old code just
+# Migrations run against the live DB using the *new* release's code, invoked
+# directly from the freshly-extracted $release_dir — NOT via $current_link,
+# which still points at the *old* release (and stays bound to the port until
+# systemctl restart below). Running migrations before the symlink flip means
+# a failed migration leaves both $current_link and the running service
+# untouched: nothing to roll back beyond fixing the migration and re-running
+# this script. This is the standard mix-release migration order and is safe
+# for additive migrations (new columns/tables/indexes the old code just
 # ignores); it is NOT safe for migrations that drop/rename columns the old
 # code still reads — coordinate those with a maintenance window instead of
 # a plain deploy. See deploy/README.md.
-#
-# Failing here aborts *before* systemctl restart, so the old release keeps
-# running untouched — nothing to roll back beyond fixing the migration and
-# re-running this script.
-log "running migrations: $current_link/bin/$service_name eval \"RetrievalNode.Release.migrate()\""
-if ! "$current_link/bin/$service_name" eval "RetrievalNode.Release.migrate()"; then
-  die "migration failed — old release is still running untouched (not restarted).
+log "running migrations: $release_dir/bin/$service_name eval \"RetrievalNode.Release.migrate()\""
+if ! "$release_dir/bin/$service_name" eval "RetrievalNode.Release.migrate()"; then
+  die "migration failed — $current_link and $service_name are untouched (not repointed, not restarted).
 Fix the migration, then re-run: sudo $0 $tarball"
 fi
+
+log "repointing $current_link -> $release_dir"
+ln -sfn "$release_dir" "$current_link"
 
 log "systemctl restart $service_name"
 systemctl restart "$service_name"
@@ -88,9 +88,10 @@ until curl -fsS -o /dev/null -m 2 "$health_url" 2>/dev/null; do
     echo
     die "$health_url did not return 200 within ${health_timeout}s.
 Check the service: journalctl -u $service_name -n 200 --no-pager
-The previous release is still at whatever $current_link pointed to before this
-run — inspect $releases_dir and re-point $current_link manually if you need to
-roll back, then 'systemctl restart $service_name'."
+$current_link already points at this deploy's $release_dir (migrations ran
+and the symlink flipped before this health check) — inspect $releases_dir for
+the prior release timestamp and re-point $current_link manually if you need
+to roll back, then 'systemctl restart $service_name'."
   fi
   sleep 2
   elapsed=$((elapsed + 2))
