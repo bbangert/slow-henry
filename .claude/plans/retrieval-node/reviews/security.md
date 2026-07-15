@@ -1,82 +1,45 @@
-# Security Audit: retrieval_node (Phase 0–2)
+# Security Review: Phases 8+9 (retrieval-node, uncommitted diff vs 7a77ca2)
 
 ## Executive Summary
-Clean. No BLOCKERS. The primary concern — raw SQL in `hybrid_query.ex` — is
-**not** an injection surface: every user/query-derived value is a bound
-parameter; the only string interpolation is a compile-time integer module
-attribute. Schemas correctly avoid storing plaintext secrets. A few low-severity
-hardening SUGGESTIONS below.
-
-## Primary Questions — Answered
-
-### 1. Raw SQL injection surface — NONE (confirmed)
-`lib/retrieval_node/search/hybrid_query.ex:46-85`. The `@sql` heredoc contains
-exactly one interpolation: `#{@candidate_pool}` (line 58, 67), which is a
-compile-time module attribute = integer literal `200`. All user/query-influenced
-values are bound Postgrex parameters passed via `Repo.query!/2` (lines 98-108):
-- `$1` embedding → `Pgvector.new(embedding)` (bound)
-- `$2` text_query → bound, consumed only by `websearch_to_tsquery`
-- `$3` rrf_k (compile-time), `$4` top_k (bound)
-- `$5` source_id, `$6` repo, `$7` lang → bound
-No user value reaches the SQL via interpolation. **Confirmed safe.**
-
-### 2. websearch_to_tsquery on untrusted text — SAFE (confirmed)
-`websearch_to_tsquery` is Postgres' web-search-syntax parser, designed for raw
-end-user input; it never raises on malformed input (unlike `to_tsquery`) and the
-argument is a bound parameter, not concatenated SQL. Correct choice.
-
-### 3. secret_findings — no plaintext (confirmed)
-`secret_finding.ex` / migration `...120006`: stores `match_hash` (sha256) only.
-No field holds the raw secret. `file_reference` is a path, `span` a jsonb
-offset map. **Confirmed.** See SUGGESTION S1 on `span`.
-
-### 4. Chunk back-link projection — no content leak (confirmed)
-`hybrid_query.ex` SELECT (lines 78-84) never selects `content`; `row_to_result`
-and `search.ex` `to_hit/1` (lines 44-56) project only `id, source_type, repo,
-lang, context_breadcrumb, metadata`. Hot path is content-free by design.
-**Confirmed.**
-
-### 5. Secrets in config — dev/test defaults only (low sev)
-`config/dev.exs:30` and `config/test.exs:22` carry hardcoded `secret_key_base`;
-dev/test DB use `postgres/postgres`. These are standard Phoenix-generated
-non-production defaults. Prod loads `SECRET_KEY_BASE` + `DATABASE_URL` from env
-in `runtime.exs` (raises if missing). Acceptable; noted.
+No injection/authz-bypass found in the new code. LAN-only/no-auth v1 scope is accepted
+by design and not re-flagged. Two real findings worth fixing before the auth/TLS
+fast-follow ships; one design gap worth a decision; one low-severity info-leak note.
 
 ## Findings
 
-### S1 — SUGGESTION: guarantee `span` stores offsets, not matched text
-`secret_finding.ex:19` `span` is a free `:map`. Schema is correct today, but the
-(later-phase) writer must store character offsets only — never the matched
-substring — or the "never stores the raw secret" invariant leaks via jsonb.
-Add a test asserting `span` contains no secret material.
+### 1. `git grep` subprocess is not guaranteed to die when the budget/timeout closes the Port
+- **Severity**: WARNING
+- **Location**: `lib/retrieval_node/ingest/git_mirror.ex:300-323` (`grep_receive/4`), also applies to the existing `run_git/4` timeout path (`:263`)
+- **Issue**: `Port.close/1` (and killing the owning `Task` via `brutal_kill`) closes the Erlang-side port but does **not** send a signal to the spawned OS process. `git grep` only notices via `SIGPIPE`/`EPIPE` the next time it tries to write to the now-closed pipe — which may not happen promptly if it's mid-tree-walk without a pending write (e.g. scanning many non-matching files, or already past `-m 100` on the current file). The module doc's claim that killing the task "clos[es] the port and terminat[es] git" isn't guaranteed. Since the budget-triggered early stop (`grep_max_bytes`/`grep_max_matches`, hit routinely, not just on rare timeout) is new, unauthenticated LAN behavior, a caller can cheaply spawn `git grep` processes over large mirrors that keep running/consuming CPU after the RPC has already returned truncated results — a real, repeatable resource-exhaustion vector, not just an edge case.
+- **Fix**: Capture the OS pid (`Port.info(port, :os_pid)`) right after `Port.open` and explicitly kill it (`System.cmd("kill", [...])` or a wrapper like `muontrap`/`erlexec`) whenever the port is closed early, in both `grep_receive/4` and the `run_git/4` timeout branch.
 
-### S2 — SUGGESTION: `sources.config` may hold live credentials, unredacted
-`source.ex:19` `config` (jsonb) is the natural home for git tokens / Jira API
-keys / Drive creds. It is a plain `:map` with no `redact: true` and no
-`:filter_parameters` coverage. If a `Source` struct or its changeset is ever
-logged/inspected, credentials leak. Recommend: mark sensitive keys redacted,
-configure `config :phoenix, :filter_parameters`, and consider encryption-at-rest
-(e.g. Cloak) before Phase where ingestion creds land.
+### 2. Backup dump file inherits default (world/group-readable) permissions
+- **Severity**: WARNING
+- **Location**: `deploy/backup_postgres.sh:31`
+- **Issue**: `pg_dump --no-owner "$db_name" | gzip >"$dest"` creates `$dest` with the process umask (no explicit `chmod`), typically `644` under a default `postgres`-user umask — world-readable to any local account on the host. The dump contains the full `pending_chunks` staging table, which stores `raw_content` **pre-scrub** (redaction happens when chunks are written, not on the raw ingest row) — so a backup taken mid-pipeline can persist plaintext secrets on disk, readable by any local user, for the whole retention window (14 days by default).
+- **Fix**: `umask 077` at the top of the script (or `chmod 600 "$dest"` right after the pipe), and set `backup_dir` to `0700`.
 
-### S3 — SUGGESTION: `raw_content` in `pending_chunks` transiently holds secrets
-Migration `...120007`: `raw_content`/`chunk_content` hold pre-scrub file content
-that may contain secrets until UpsertChunks deletes the row. By design, but
-ensure failed/abandoned rows are reaped (no indefinitely-retained plaintext) and
-that these columns are excluded from any debug logging.
+### 3. `RETRIEVAL_NODE_DB_PASSWORD` passed as literal SQL text on the `psql -c` command line
+- **Severity**: WARNING
+- **Location**: `deploy/setup_postgres.sh:66` (`run_as_postgres -c "CREATE ROLE ${db_user} WITH LOGIN PASSWORD '${db_password}';"`)
+- **Issue**: The password is interpolated straight into the SQL string passed via `-c`, so it's visible in `/proc/<pid>/cmdline` / `ps aux` output to any local user for the process's lifetime, and would appear in shell debug (`set -x`) or process-accounting logs if either is ever enabled. It's a one-time setup script (not attacker-facing over the network), so this is a WARNING not a BLOCKER, but it's an easy fix.
+- **Fix**: Feed the `CREATE ROLE` statement via stdin (`printf ... | run_as_postgres -f -`) instead of embedding it in `-c`'s argv.
 
-### S4 — SUGGESTION: bound `top_k` / validate it's a small positive integer
-`hybrid_query.ex:96` `top_k` flows to `LIMIT $4` unbounded. Not injectable (bound
-param), but a caller-supplied huge value is a mild resource/DoS lever once search
-is exposed via MCP. Clamp to a sane max (e.g. ≤100).
+### 4. `/healthz` error detail may over-share internals to any LAN caller
+- **Severity**: SUGGESTION
+- **Location**: `lib/retrieval_node_web/controllers/health_controller.ex:110-119` (`db_check/0`), `:70-79` (`grammar_cache_check/0`)
+- **Issue**: `db_check` returns `inspect(reason)` (a raw Postgrex/DBConnection error struct) and the rescue branch returns `Exception.message(e)` verbatim in the JSON response; `grammar_cache_check` echoes `Grammars.missing()` (filesystem paths) directly. Route is unauthenticated by design (accepted), but detail granularity is higher than a readiness probe needs — fine for LAN-only, but should be trimmed (or gated behind the eventual auth) before internet exposure, since it can leak absolute paths / driver internals to any caller. No DoS amplification found: every gate is either a cheap in-memory check or a single `SELECT 1` — no expensive work per request.
+- **Fix**: Reduce to a fixed reason atom (e.g. `%{reason: "db_unreachable"}`) once this route is reachable off-LAN; not urgent for the current slice.
 
-## Posture
-Checked: SQL injection (parameterized, safe), XSS (no templates/`raw/1`),
-atom exhaustion (no `String.to_atom` on user input; `String.to_integer` only on
-operator env vars), changeset coverage (all writes via changesets), secrets
-(prod via env). No `binary_to_term`, no path traversal, no unsafe deserialization
-in scope. All clean.
+## Clean / verified (no findings)
+- `git_mirror.ex` `grep/3`: arg-list-only `Port.open({:spawn_executable, ...})`, `safe_ref/1` (no leading `-`) + `-e`-guarded pattern preserved as the flag-injection defense (git grep has no `--end-of-options`); `Path.safe_relative` on slug/show-path; transport allowlist (`safe_url/1`, blocks `ext::`) all carried through the Port rewrite unchanged. `complete_records/1` correctly drops a partial trailing record on budget cutoff (no parser desync/corruption). Per-chunk reads are pipe-buffer-bounded, so the budget check can only be overrun by roughly one OS pipe buffer, not unbounded.
+- `scrubber.ex` `sobelow_skip` comments (`Traversal.FileModule`, `CI.System`) match reality: paths are self-generated random names inside an exclusively-created `0700` temp dir, `System.cmd` is arg-list-only behind a `find_executable` guard. `.sobelow-conf`'s `Config.HTTPS` ignore is the documented, in-scope LAN-only decision.
+- `pending_chunks.ex`/`chunking.ex` `binary_content?/1`: routing guard only (keeps invalid-UTF-8 out of a `text` column); doesn't weaken the scrub/secrets guarantee since redaction runs on chunk content downstream regardless.
+- `upsert_chunks.ex` `to_enum/2`: resolves staged enum strings via `Ecto.Enum.mappings/2` (a closed allowlist keyed off the schema) rather than `String.to_atom`/`to_existing_atom` — correctly atom-exhaustion-resistant and rejects unknown values instead of silently mapping them.
+- `rn.seed.ex`: `--git-url` is an operator-supplied CLI arg (not remote input) and still passes through `GitMirror.safe_url/1`'s transport allowlist before any `git clone` — no bypass.
+- `retrieval_node.service`: hardening present (`NoNewPrivileges`, `ProtectSystem=full`, `ProtectHome`), secrets kept in a separate `EnvironmentFile` (documented `root:root 0600`) rather than the world-readable unit file. `rel/env.sh.eex` echoes no secrets.
 
-## Tools to Recommend (run manually — no Bash access here)
-- `mix sobelow --exit medium` (sobelow already in deps)
-- `mix deps.audit` / `mix hex.audit`
-- `mix credo --strict`
+## Tools to Recommend
+- `mix sobelow --exit low` (matches `.sobelow-conf`'s configured threshold)
+- `mix deps.audit`
+- `mix hex.audit`

@@ -1,0 +1,17 @@
+[Unit]
+Description=retrieval_node nightly Postgres backup
+After=postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+User=postgres
+# BACKUP_DIR (NVMe-backed path) and BACKUP_RETENTION_DAYS are read from this
+# env file so the destination/rotation window can be tuned per host without
+# editing the unit. See deploy/README.md.
+EnvironmentFile=-/etc/retrieval_node/backup-env
+# Installed by deploy/setup_postgres.sh from deploy/backup_postgres.sh.
+ExecStart=/usr/local/bin/retrieval_node-backup.sh
+
+[Install]
+WantedBy=multi-user.target

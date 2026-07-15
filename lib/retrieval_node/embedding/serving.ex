@@ -5,8 +5,8 @@ defmodule RetrievalNode.Embedding.Serving do
   `Nx.Serving` is the OTP-aware abstraction here — batching, batch-timeout and
   backpressure are its runtime reason to exist as a process, so no bespoke
   GenServer wrapper is needed. `NxServingImpl` applies Matryoshka truncation to
-  384 dims on the results; the serving itself emits full-dimension, L2-normalized
-  hidden states.
+  384 dims on the results; the serving itself emits a full-dimension (768),
+  mean-pooled, L2-normalized sentence embedding per input text.
 
   ## One serving for query and batch
 
@@ -24,17 +24,29 @@ defmodule RetrievalNode.Embedding.Serving do
 
   `Nx.Serving.child_spec/1`'s `:compile` option runs a template-shaped EXLA
   compile pass synchronously inside its `init`, forcing the expensive JIT during
-  `Supervisor.start_link/2` rather than on the first real request. `warmup/0`
-  (fired fire-and-forget via `Task.start/1` after boot) is additional defense: it
-  runs a real dummy inference through the full pipeline and flips a
-  `:persistent_term` readiness flag consumed by `/healthz`. If warmup crashes it
-  logs and lets the next real call pay the JIT cost inline — never take down boot
-  over a best-effort optimization.
+  `Supervisor.start_link/2` rather than on the first real request. `warmup/0` is
+  additional defense: it runs a real dummy inference through the full pipeline
+  and flips a `:persistent_term` readiness flag consumed by `/healthz`. If warmup
+  crashes it logs and lets the next real call pay the JIT cost inline — never
+  take down boot over a best-effort optimization.
+
+  Warmup itself is driven by a sibling `RetrievalNode.Embedding.Warmer` GenServer
+  under `RetrievalNode.Embedding.Supervisor`, a `:rest_for_one` supervisor
+  ordered `[Serving, Warmer]`. `handle_continue` in the Warmer defers the actual
+  `warmup/0` call until after its own `init/1` returns, so boot is never blocked
+  on model load/JIT. `rest_for_one` is the reason this process doesn't fire
+  `Task.start/1` on its own: if this serving crashes and restarts, the readiness
+  flag must go stale (`false`) again until a fresh warmup completes, and
+  `rest_for_one` restarting the Warmer alongside it is what makes that happen
+  automatically — a `one_for_one` sibling would never re-run warmup, leaving
+  `/healthz` reporting `ready? == true` against a serving that just rebuilt its
+  state from scratch.
   """
 
   require Logger
 
   alias Bumblebee.Text.TextEmbedding
+  alias RetrievalNode.Embedding.NxServingImpl
 
   @name RetrievalNode.Embedding.ServingProcess
 
@@ -49,6 +61,7 @@ defmodule RetrievalNode.Embedding.Serving do
         compile: [batch_size: batch_size(), sequence_length: sequence_length()],
         defn_options: [compiler: EXLA],
         output_attribute: :hidden_state,
+        output_pool: :mean_pooling,
         embedding_processor: :l2_norm
       )
 
@@ -59,9 +72,25 @@ defmodule RetrievalNode.Embedding.Serving do
   @doc """
   Dummy inference through the full pipeline, forcing EXLA JIT before real traffic
   and flipping the `/healthz` readiness flag. Fire-and-forget; never raises out.
+
+  Goes through `NxServingImpl.embed/1` (not a raw `Nx.Serving.batched_run/2`) so
+  warmup exercises the exact same Matryoshka post-processing production calls
+  do — including `matryoshka/1`'s dimension guard. Calling the concrete impl
+  module directly (rather than the generic `Embedding` facade) is deliberate:
+  warmup is inherently about this serving process specifically, and only ever
+  runs where `NxServingImpl` is configured (`:embedding_serving_start` is false
+  everywhere else). A misconfigured serving (e.g. missing `output_pool`) then
+  fails loudly here instead of silently flipping `ready?` on a malformed
+  embedding.
   """
   def warmup do
-    Nx.Serving.batched_run(@name, ["warmup"])
+    vector = NxServingImpl.embed("warmup")
+
+    unless length(vector) == NxServingImpl.dimensions() do
+      raise "warmup embedding has #{length(vector)} dims, expected " <>
+              "#{NxServingImpl.dimensions()}"
+    end
+
     :persistent_term.put({__MODULE__, :ready?}, true)
     :ok
   rescue
@@ -86,6 +115,14 @@ defmodule RetrievalNode.Embedding.Serving do
 
   @doc "Whether warmup has completed (consumed by /healthz). Defaults to false."
   def ready?, do: :persistent_term.get({__MODULE__, :ready?}, false)
+
+  @doc """
+  Clear the readiness flag back to `false`. Called by `Embedding.Warmer`'s
+  `init/1`, before it re-runs `warmup/0`, so `/healthz` never reports stale
+  `true` for the window between a serving restart and the next warmup
+  completing.
+  """
+  def reset_ready, do: :persistent_term.put({__MODULE__, :ready?}, false)
 
   defp model_info, do: load!(:model, &Bumblebee.load_model/1)
   defp tokenizer, do: load!(:tokenizer, &Bumblebee.load_tokenizer/1)

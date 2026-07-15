@@ -61,7 +61,7 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
     %{
       source_id: row.source_id,
       # staged enums are strings; insert_all's dump wants the atom.
-      source_type: to_enum(row.source_type),
+      source_type: to_enum(:source_type, row.source_type),
       repo: row.repo,
       lang: row.lang,
       chunk_key: row.chunk_key,
@@ -71,16 +71,37 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
       context_breadcrumb: row.context_breadcrumb,
       metadata: row.metadata,
       embedding: row.embedding,
-      parse_status: to_enum(row.parse_status),
-      secrets_status: to_enum(row.secrets_status),
+      parse_status: to_enum(:parse_status, row.parse_status),
+      secrets_status: to_enum(:secrets_status, row.secrets_status),
       inserted_at: {:placeholder, :now},
       updated_at: {:placeholder, :now}
     }
   end
 
-  defp to_enum(nil), do: nil
-  defp to_enum(value) when is_atom(value), do: value
-  defp to_enum(value) when is_binary(value), do: String.to_existing_atom(value)
+  # Resolve staged enum strings against the Chunk schema's own Ecto.Enum
+  # mappings rather than String.to_existing_atom/1: the latter depends on some
+  # already-loaded module having interned the atom, which is load-order
+  # dependent under the BEAM's lazy (interactive-mode) module loading — e.g.
+  # :heuristic_fallback only enters the atom table once a module using it is
+  # loaded. Mappings are also a strict allowlist: an unknown string raises
+  # instead of resolving to an unrelated pre-existing atom.
+  defp to_enum(_field, nil), do: nil
+  defp to_enum(_field, value) when is_atom(value), do: value
+
+  defp to_enum(field, value) when is_binary(value) do
+    Chunk
+    |> Ecto.Enum.mappings(field)
+    |> Enum.find(fn {_atom, dump} -> dump == value end)
+    |> case do
+      {atom, _dump} ->
+        atom
+
+      nil ->
+        raise ArgumentError,
+              "#{inspect(value)} is not a valid dump value for Chunk.#{field} " <>
+                "(expected one of #{inspect(Ecto.Enum.dump_values(Chunk, field))})"
+    end
+  end
 
   defp sha256(bin), do: :crypto.hash(:sha256, bin) |> Base.encode16(case: :lower)
 end

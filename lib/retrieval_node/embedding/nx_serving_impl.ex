@@ -39,13 +39,48 @@ defmodule RetrievalNode.Embedding.NxServingImpl do
     |> Enum.map(&matryoshka/1)
   end
 
+  @doc false
+  # Bench-only seam (RetrievalNode.Bench.Runner's Matryoshka stability probe):
+  # returns the untruncated, L2-normalized 768-dim serving output, bypassing the
+  # truncation `embed/1` always applies. No other caller should reach for this —
+  # every stored/query vector in the system is 384-dim by design (see
+  # `Embedding.vector` typedoc); this exists only so the bench harness can
+  # reconstruct a 384-dim vector from the pre-truncation output and compare it
+  # against `embed/1`'s normal-path output.
+  @spec embed_full_dims(String.t()) :: [float()]
+  def embed_full_dims(text) when is_binary(text) do
+    [result] = Nx.Serving.batched_run(Serving.name(), [text])
+    full_dims(result)
+  end
+
+  defp full_dims(%{embedding: tensor}), do: Nx.to_flat_list(tensor)
+
   @doc """
   Matryoshka post-processing: truncate a full-dimension embedding to the leading
   `#{@dimensions}` dims and L2-renormalize to unit length, returning a plain list
   of floats. Pure (no serving/model), so it is unit-testable in isolation.
+
+  Raises if the input isn't a single pooled sentence embedding (a rank-1 tensor).
+  A rank-2 tensor (sequence_length x hidden_size) means the serving is emitting
+  unpooled per-token hidden states — e.g. `Serving.text_embedding/3` missing
+  `output_pool: :mean_pooling` — and must fail loudly here rather than silently
+  flattening into a many-thousand-float "vector" that corrupts every downstream
+  pgvector write.
   """
   @spec matryoshka(%{embedding: Nx.Tensor.t()} | Nx.Tensor.t()) :: [float()]
   def matryoshka(%{embedding: tensor}), do: matryoshka(tensor)
+
+  def matryoshka(%Nx.Tensor{shape: shape}) when tuple_size(shape) != 1 do
+    raise "expected a pooled 1-D sentence embedding, got tensor of shape " <>
+            "#{inspect(shape)} — the serving is likely missing " <>
+            "`output_pool: :mean_pooling` (RetrievalNode.Embedding.Serving)"
+  end
+
+  def matryoshka(%Nx.Tensor{shape: {dims}}) when dims < @dimensions do
+    raise "expected a pooled sentence embedding with at least #{@dimensions} dims, " <>
+            "got #{dims} — the serving is likely misconfigured " <>
+            "(RetrievalNode.Embedding.Serving)"
+  end
 
   def matryoshka(%Nx.Tensor{} = tensor) do
     tensor

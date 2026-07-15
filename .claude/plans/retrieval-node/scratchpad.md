@@ -2,6 +2,41 @@
 
 Companion to `plan.md`. Records why things are the way they are, and paths NOT taken.
 
+## [2026-07-15] PLAN COMPLETE — Phases 8+9 done, all 63 tasks checked
+
+All gates green: 175 tests (+2 real-model `:integration`), credo --strict, format,
+compile -w-as-errors, `mix sobelow --exit` 0 findings (dispositions in
+`.sobelow-conf` + `# sobelow_skip` comments). Work is UNCOMMITTED on `main` —
+Phase 8 (supervision tree, /healthz, grep streaming, build/deploy artifacts) +
+Phase 9 (rn.seed, rn.bench, 3 live-corpus bug fixes, DoD proven live).
+
+**Manual residuals** (cannot be done in this container):
+1. First arm64 on-device run: `scripts/build_arm64.sh` → `scripts/deploy.sh`
+   (ELF gate, grammar prefetch on arm64, systemd, /healthz on the box).
+2. Jira/Drive live sync rounds: set JIRA_BASE_URL/JIRA_EMAIL/JIRA_API_TOKEN/
+   JIRA_PROJECT_KEY and DRIVE_ACCESS_TOKEN, rerun `mix rn.seed`.
+3. LAN drive of /mcp from another device (protocol proven locally over HTTP).
+4. Benchmark numbers: `mix rn.bench` runs; grow queries.jsonl toward 50–100.
+
+## [2026-07-14] HANDOFF → Phase 8 (fresh session)
+Phases 0–7 merged to `main` (last: PR #7, MCP tools). `main` @ `7a77ca2`. All gates green
+(122 tests, credo/dialyzer/format). Resume with `/phx:work .claude/plans/retrieval-node/plan.md`.
+
+**Phase 8 = Supervision, build & deploy.** Key context beyond the plan checkboxes:
+- **Supervision tree** currently has only: Telemetry, Repo, DNSCluster, PubSub,
+  `{MCP.Server, transport: {:streamable_http, start: mcp_server_start?()}}`, Endpoint.
+  Phase 8 must add (order per design-otp §1): Finch (shared Jira/Drive HTTP pool) →
+  `{Task.Supervisor, ChunkTaskSupervisor}` → `Embedding.Serving` (Nx.Serving) → Oban.
+  Oban config already exists (`config/config.exs`) but Oban is NOT started yet — cron
+  won't fire until it joins the tree. `:test` keeps `testing: :manual`.
+- **Deferred items to fold in** (all listed below): git-grep streaming/bounding
+  (PR #7 #3), `ready?/0` reset-on-restart, ChunkTaskSupervisor + Serving in tree.
+- **arm64-only, on-device build** (never cross-build): tree-sitter NIF + EXLA .so are
+  arch-specific; ELF `file` verification gate must hard-fail on x86. NO Erlang
+  distribution / peer node in v1 (Option C) — ignore design-build's RELEASE_COOKIE steps.
+- The MCP `start:` gate (`:mcp_server_start`, default true) is the pattern to reuse for a
+  future worker-only release.
+
 ## Decisions
 
 - **One unified `chunks` table** (not per-source). RRF must rank across all sources
@@ -53,13 +88,10 @@ Companion to `plan.md`. Records why things are the way they are, and paths NOT t
       parser/cursor/node API — TreeSitterImpl builds the tree-walk chunk extraction itself.
 - [ ] **Spot-check Anubis tool-failure return tuple** against `deps/anubis_mcp` source
       (docs only confirmed the success path + `Response.error/2`).
-- [ ] **Phase 8 hardening — stream/bound `git grep` output (PR #7 Copilot #3).** `GitMirror`
-      shells out via `System.cmd`, which buffers ALL stdout before the tool's aggregate
-      cap. `-m 100` (per-file) + the 20s timeout bound the worst case, but a common
-      unblocked pattern (`def`) across many files can still spike memory pre-cap. Fix:
-      switch grep to a `Port`/`System.cmd(into:)` stream that stops after N bytes/matches
-      and closes early (needs NUL-chunk-boundary-safe parsing). Deferred from the Phase 7
-      review as a LAN-trust-acceptable robustness item.
+- [x] **Phase 8 hardening — stream/bound `git grep` output (PR #7 Copilot #3)** — DONE
+      (Phase 8): raw `Port` receive loop in `GitMirror.grep`; budgets `:grep_max_bytes`
+      1MB / `:grep_max_matches` 500; early `Port.close` → `{:ok, matches, truncated?}`;
+      partial trailing record dropped; outer Task.yield timeout unchanged.
 - [ ] Confirm arm64 grammar prefetch works for the full language allowlist at build time.
 - [ ] Benchmark chunk-size cap + Matryoshka 384-vs-768 delta during the first slice.
 - [x] **Verify Postgres `vector` extension ≥ 0.5.0** (HNSW) — DONE. Installed 0.8.5,
@@ -70,6 +102,59 @@ Companion to `plan.md`. Records why things are the way they are, and paths NOT t
 - [x] Reconcile `websearch_to_tsquery` vs `plainto_tsquery` — DONE. Picked
       `websearch_to_tsquery('english', ...)` in the raw-SQL RRF (handles quoted
       phrases / -exclude / OR safely on raw MCP-caller text). Used consistently.
+
+## Phase 8 session notes (2026-07-14)
+
+- **`ready?/0` staleness** fixed via `Embedding.Supervisor` (`:rest_for_one` over
+  Serving + `Warmer`); `Warmer.init` resets the persistent_term then re-warms in
+  `handle_continue`. Gated by `:embedding_serving_start` (false in test).
+- **`config :nx, default_backend: EXLA.Backend` was missing entirely** — the
+  /healthz nx_backend gate would have failed everywhere. Added globally in
+  config.exs (Phase 8 healthz agent caught this).
+- **Port 4000 on 127.0.0.1 is squatted by an invisible-namespace process** in the
+  pre-rebuild container (same pathology as the foreign PG16 on 5432; even
+  `sudo ss -ltnp` shows no owning pid). Dev boot verification uses `PORT=4001`.
+  Should disappear after the devcontainer rebuild.
+- systemd `StartLimitBurst/IntervalSec` belong in `[Unit]`, not `[Service]` —
+  design-build.md's example was invalid; caught by `systemd-analyze verify`.
+
+## Phase 9 session notes (2026-07-15)
+
+- **BUG (live-corpus find #1): binary files crashed staging.** `RepoSync` staged raw
+  bytes into `pending_chunks.raw_content` (text col); favicon.ico → Postgrex 22021.
+  The Phase 4 binary guard sat downstream in chunking — too late. Fix: shared
+  `Chunking.binary_content?/1` (NUL **or** `not String.valid?`) enforced at
+  `PendingChunks.insert_raw_all` (covers all 3 sync workers); TreeSitterImpl guard
+  now delegates to it. Lesson: guards must sit at the *staging* choke point, not
+  only at the consumer.
+- **BUG (live-corpus find #2, CRITICAL): `output_pool: :mean_pooling` was missing**
+  from `Serving.child_spec` → serving emitted the full padded hidden state
+  `{512, 768}` per text, matryoshka flattened it to 196,608 floats, and since
+  196608 = 3×65536 the **pgvector uint16 dim header overflowed to exactly 0** →
+  `vector must have at least 1 dimension` + `Pgvector.to_list` MatchError while
+  logging params. EVERY EmbedBatch + query-side embed was broken; warmup/healthz
+  stayed green (they never checked dims). Why tests missed it: the only tests that
+  run the real model are tagged `:integration` and excluded by default — they
+  assert 384 and would have caught it. Lessons: (a) fire the `:integration`
+  embedding tests at least once whenever serving opts change; (b) dimension
+  assertions now live in `matryoshka/1` (raise on rank-2/wrong length) and
+  `warmup/0` (ready? stays false unless a real 384-dim embed succeeds).
+- **The `output_pool` omission originated in the DESIGN**: `design-otp.md` §2.1's
+  serving sketch has the identical bug (no `output_pool`). Faithfully implemented
+  = faithfully broken. Treat design-doc serving/API sketches as unverified until
+  an integration test exercises them.
+- **BUG (live-corpus find #3): `UpsertChunks` used `String.to_existing_atom`** on
+  staged enum strings (`"heuristic_fallback"`) — crashes under `mix run` lazy
+  module loading when no loaded module has interned the atom (all 120 jobs
+  discarded). Latent until embedding worked. Fix: resolve via
+  `Ecto.Enum.mappings(Chunk, field)` — authoritative allowlist, forces schema
+  load, never mints atoms.
+- The first e2e proof of the whole ingest pipeline against a REAL repo happened
+  only here in Phase 9 (Phase 6's e2e used the test stub embedder) — all three
+  bugs above were invisible to the stubbed suite.
+- Pipeline proven 2026-07-15: 2326 chunks @ vector_dims 384, EmbedBatch 120/120 +
+  UpsertChunks 120/120 completed, pending_chunks drained to 0, hybrid_search live
+  hits sane (top hits = design-ecto.md for "where is the RRF fusion query").
 
 ## ENVIRONMENT: Postgres
 
@@ -106,3 +191,8 @@ The first `planning-orchestrator` run returned a "still waiting" message instead
 digest and wrote nothing; the design was recovered by spawning ecto/oban/otp specialists
 directly. Its late children (build, mcp) landed afterward and were folded in. If
 re-running: spawn design specialists directly rather than via the orchestrator.
+
+## API Failure — 2026-07-15 00:23
+
+Turn ended due to API error. Check progress.md for last completed task.
+Resume with: /phx:work --continue

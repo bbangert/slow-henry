@@ -9,6 +9,14 @@ defmodule RetrievalNodeWeb.Router do
     pipe_through :api
   end
 
+  # Readiness probe — top-level (not under /api), no auth: a LAN-only slice
+  # queried by a load balancer / uptime check, not an MCP client.
+  scope "/", RetrievalNodeWeb do
+    pipe_through :api
+
+    get "/healthz", HealthController, :show
+  end
+
   # Enable LiveDashboard in development
   if Application.compile_env(:retrieval_node, :dev_routes) do
     # If you want to use the LiveDashboard in production, you should put

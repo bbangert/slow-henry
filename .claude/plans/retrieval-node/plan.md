@@ -272,51 +272,130 @@ in naming, THIS section wins:
 
 ## Phase 8 — Supervision, build & deploy `[otp]` `[deploy]` (from `design-otp.md` §1, `design-build.md`)
 
-- [ ] `RetrievalNode.Application` supervision tree (order from `design-otp.md` §1):
+- [x] `RetrievalNode.Application` supervision tree (order from `design-otp.md` §1):
       `Repo → PubSub → Finch (shared Jira/Drive HTTP pool) → {Task.Supervisor,
       ChunkTaskSupervisor} → Embedding.Serving → Oban → Endpoint` (`:one_for_one`);
       Anubis rides the Endpoint acceptor pool. **No Erlang distribution / peer node
       in v1** (Option C) — ignore `design-build.md`'s RELEASE_COOKIE/peer-node steps
-- [ ] arm64 build pipeline (`design-build.md`): self-hosted arm64 runner (NOT
+      — DONE: full order wired; Embedding sub-tree = `Embedding.Supervisor`
+      (`:rest_for_one` over Serving + new `Warmer` GenServer), gated by
+      `:embedding_serving_start` (false in test); Oban started app-wide (removed 4
+      test-local `start_supervised!` Obans); Jira/Drive Req clients pass
+      `finch: RetrievalNode.Finch`; explicit `{:finch, "~> 0.23"}` dep
+- [x] arm64 build pipeline (`design-build.md`): self-hosted arm64 runner (NOT
       cross-built), `MIX_ENV=prod XLA_TARGET_PLATFORM=aarch64-linux-gnu mix compile`
       (compiles tree-sitter NIF on-device), grammar **prefetch** Mix task
       (`elixir,heex,eex` + `python,js,ts,go,rust,ruby,java`) into pinned
       `XDG_CACHE_HOME`, **ELF `file` verification gate** (tree-sitter `.so`, EXLA
       `.so`, `beam.smp` must all read `ARM aarch64`; hard-fail on x86), glibc ≥ 2.31
       check, `mix release` with grammar cache baked in via overlay
-- [ ] systemd unit (`design-build.md`): `Type=exec`, atomic `current` symlink,
+      — DONE: `scripts/build_arm64.sh` (uname/glibc guards, ELF gate pre+post release);
+      `mix rn.grammars.prefetch` (all 10 langs, exit-nonzero if missing; ran green in
+      sandbox); `mix.exs` `releases:` + `:tar` step; `rel/env.sh.eex` sets
+      `RELEASE_DISTRIBUTION=none` + `XDG_CACHE_HOME→$RELEASE_ROOT/grammar-cache`
+      (staged into `rel/overlays/grammar-cache` by the build script). On-arm64 run
+      itself = deferred to first deploy (no arm64 hardware in this container)
+- [x] systemd unit (`design-build.md`): `Type=exec`, atomic `current` symlink,
       `Restart=on-failure RestartSec=2 StartLimitBurst=10/300s` (OS-level backstop
       for C-level segfaults that bypass OTP), `EnvironmentFile=-/etc/retrieval_node/env`
-- [ ] `/healthz` readiness gates: (1) grammar-cache present for allowlist,
+      — DONE: `deploy/retrieval_node.service` (StartLimit* moved to `[Unit]` —
+      design doc's `[Service]` placement was invalid, caught by systemd-analyze) +
+      `scripts/deploy.sh` (unpack → `ln -sfn current` → restart → poll /healthz)
+- [x] `/healthz` readiness gates: (1) grammar-cache present for allowlist,
       (2) `Nx.default_backend()` is EXLA (not silent BinaryBackend), (3) Nx.Serving
       warmed, (4) DB reachable — ready only when all pass
-- [ ] **Harden `git grep` memory (deferred from Phase 7 review, Copilot #3)**: `GitMirror`
+      — DONE: `HealthController` (200/503 + per-gate JSON); config-disabled
+      subsystems report "skipped" and count as passing; `Chunking.Grammars` facade
+      (NIF behind `:grammar_pack_mod` seam for tests). ALSO: `config :nx,
+      default_backend: EXLA.Backend` was missing entirely — added globally
+      (gate 2 would otherwise fail everywhere; this is what it guards)
+- [x] **Harden `git grep` memory (deferred from Phase 7 review, Copilot #3)**: `GitMirror`
       buffers all `System.cmd` stdout before the tool caps it. `-m 100`/file + 20s timeout
       bound it, but stream via `Port`/`System.cmd(into:)` with an N-byte/N-match budget +
       early close so the cap is enforced during collection (NUL-boundary-safe parsing)
-  - [ ] **`Embedding.Serving.ready?/0` must not go stale across a serving crash/restart**
+      — DONE: raw `Port` receive loop; budgets `:grep_max_bytes` 1MB /
+      `:grep_max_matches` 500 (= tool-layer aggregate cap); early `Port.close` →
+      `{:ok, matches, truncated?}` 3-tuple (tool layer already used that shape);
+      partial trailing record dropped; timeout still outer Task.yield/brutal_kill
+  - [x] **`Embedding.Serving.ready?/0` must not go stale across a serving crash/restart**
         (Copilot review, PR #2): the `:persistent_term` flag stays `true` after the
         supervised serving restarts without re-warming. Reset it to `false` when the
         serving (re)starts and re-run `warmup/0`, OR have the gate also confirm the
         serving pid is the one that warmed — decide when wiring warmup into the tree here.
-- [ ] Postgres via apt (PGDG arm64) + pgvector; `/var/lib/retrieval_node/git-mirrors/`,
+        — DONE via `rest_for_one` `Embedding.Supervisor`: Serving crash restarts
+        `Warmer`, whose init calls new `Serving.reset_ready/0` then re-warms in
+        `handle_continue` (boot never blocked)
+- [x] Postgres via apt (PGDG arm64) + pgvector; `/var/lib/retrieval_node/git-mirrors/`,
       nightly `pg_dump` snapshot to NVMe
-- [ ] Dev (x86-64) deltas: skip ELF gate, `mix phx.server` not release/systemd,
+      — DONE: `deploy/setup_postgres.sh` (PGDG, postgresql-18 + -pgvector, role/db,
+      git-mirrors dir 0750) + `backup_postgres.sh` + systemd service/timer (03:15 UTC,
+      N-day rotation); `runtime.exs` prod `:git_mirror_root` → env-overridable
+- [x] Dev (x86-64) deltas: skip ELF gate, `mix phx.server` not release/systemd,
       default `~/.cache` grammar path
-- [ ] **Verify**: build on arm64 → ELF gate passes; deploy → `/healthz` green;
+      — DONE: documented in `deploy/README.md`; build script hard-fails on x86 by
+      design; dev keeps default grammar cache + `PGPORT` note
+- [x] **Verify**: build on arm64 → ELF gate passes; deploy → `/healthz` green;
       x86 dev boots via `mix phx.server`
+      — x86 dev boot VERIFIED: `PORT=4001 PGPORT=5433 mix phx.server` → /healthz 200
+      in ~20s, all four gates ok (incl. real model warmup + grammar cache). Port 4000
+      is namespace-squatted pre-rebuild (see scratchpad). Full gates green: 136 tests,
+      credo --strict, format, compile -w. arm64 build+deploy legs = MANUAL on first
+      on-device run (`scripts/build_arm64.sh` then `scripts/deploy.sh`)
 
 ## Phase 9 — First-slice validation & benchmark harness
 
-- [ ] Seed thin corpus: 1 git repo, a handful of resolved Jira issues, 1 Drive folder
-- [ ] Benchmark harness (`embedding-model.md` protocol): 50–100 labeled queries;
+- [x] Seed thin corpus: 1 git repo, a handful of resolved Jira issues, 1 Drive folder
+      — DONE (git leg): `mix rn.seed` (idempotent upsert on [:source_type, :identifier];
+      insert-only Oban client — overrides queues/serving off so jobs run on the real
+      supervised app, not the short-lived task). Registered this repo via
+      `file:///workspaces/slow-henry/.git`. Jira/Drive legs = SKIPPED until creds:
+      JIRA_BASE_URL/JIRA_EMAIL/JIRA_API_TOKEN/JIRA_PROJECT_KEY, DRIVE_ACCESS_TOKEN
+      (task prints exact vars). FOUND REAL BUG: binary files (favicon.ico) crash
+      staging INSERT (22021, invalid UTF-8 into text col) — guard only existed
+      downstream in chunking; fix in flight (skip binary pre-staging)
+- [x] **Live-corpus fixes** (first REAL ingest; all invisible to the stubbed suite —
+      details in scratchpad "Phase 9 session notes"): (1) binary staging guard
+      `Chunking.binary_content?/1` at `insert_raw_all` (covers all 3 sync workers);
+      (2) **`output_pool: :mean_pooling` missing from `Serving.child_spec`** — same
+      omission exists in design-otp §2.1; unpooled {512,768} → 196608 floats →
+      pgvector uint16 dim header ≡ 0 → every embed broken; fixed + loud dim guards
+      in `matryoshka/1` + `warmup/0` (ready? only after a real 384-dim embed);
+      (3) `UpsertChunks` `String.to_existing_atom` → `Ecto.Enum.mappings`.
+      PIPELINE PROVEN: 2326 chunks @384 dims, 120/120 EmbedBatch+UpsertChunks
+      completed, staging drained, live hybrid_search hits sane. Real-model
+      `:integration` tests pass (2)
+- [x] Benchmark harness (`embedding-model.md` protocol): 50–100 labeled queries;
       measure nDCG@10 (target ≥ 0.55), query p99 (≤ 300 ms), embed throughput
       (≥ 10 passages/s), RAM peak (≤ 1.5 GB). Test Matryoshka 384 vs 768 delta (<2%)
-- [ ] **Definition of done**: all 4 MCP tools answer over the thin corpus via LAN;
+      — DONE: `mix rn.bench` + `Bench.Metrics`/`Bench.Runner`; 15 starter queries in
+      `priv/bench/queries.jsonl` (matchers = repo/path_prefix/breadcrumb_substring,
+      DB-id-free; 50–100 remains the target set). PASS/FAIL/SKIPPED table vs targets;
+      graceful skips verified on unseeded corpus. 768-vs-384: corpus stores only
+      vector(384) → implemented as an honest truncation-stability proxy (always
+      SKIPPED vs the <2% target, needs corpus re-embed for the real delta);
+      `NxServingImpl.embed_full_dims/1` bench-only seam
+- [x] **Definition of done**: all 4 MCP tools answer over the thin corpus via LAN;
       one incremental-sync round proven per source; secrets scrubbing runs on the
       git path; benchmark harness exists (numbers tuned later)
-- [ ] **Verify**: full `mix compile --warnings-as-errors`, `mix format --check-formatted`,
+      — PROVEN live (2026-07-15, evidence in session scratchpad `mcp_*.raw`):
+      initialize/tools/list/tools/call over streamable HTTP (SSE + mcp-session-id);
+      list_repos/grep/get_file/semantic_search all correct (search top hit =
+      scrubber.ex for the secrets query; no content in hits). Incremental round on
+      scratch repo: watermark 026c01a→117897d (= HEAD), new file's chunks landed,
+      semantic_search finds them. Scrub live: secret_findings sha256-only, 0 raw
+      keys in DB, `[REDACTED:aws_access_key_id]` in chunk content, gitleaks→regex
+      degrade logged. LAN-from-another-device = the one remaining manual step.
+      NOTE (recall gap, fast-follow): def-free files chunk to [] under tree-sitter
+      (fail-closed, zero chunks) — consider heuristic fallback on empty results.
+      Jira/Drive incremental rounds = pending real creds (Req.Test-covered in suite)
+- [x] **Verify**: full `mix compile --warnings-as-errors`, `mix format --check-formatted`,
       `mix credo --strict`, `mix test`, `mix sobelow` (security)
+      — ALL GREEN (2026-07-15): 175 tests + 2 real-model `:integration`, credo
+      --strict 0 issues, `mix sobelow --exit` 0 findings after disposition:
+      `# sobelow_skip` comments (NOT @attributes — those break -w-as-errors) on
+      scrubber/git_mirror/bench false positives with rationale; `.sobelow-conf`
+      ignores Config.HTTPS (LAN-only v1 by design; TLS at tunnel with the auth
+      fast-follow — revisit then)
 
 ---
 
@@ -330,6 +409,10 @@ in naming, THIS section wins:
   language-pack chunking first
 - Peer-node/`:peer` chunker isolation escape hatch (only if segfaults observed)
 - Reranker / LLM chunk summaries (v2)
+- **Heuristic fallback on EMPTY tree-sitter results** (recall gap found in Phase 9
+  DoD): def-free files (configs, constants-only modules) chunk to `[]` under the
+  leaf-def tree-walk and become invisible to search — fail-closed but lossy.
+  Fall back to the heuristic chunker when `{:ok, []}`, like parse failures do.
 
 ## Iron Law compliance check
 

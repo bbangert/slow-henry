@@ -62,7 +62,6 @@ defmodule RetrievalNode.Ingest.SourcesTest do
 
   describe "SyncScheduler" do
     setup do
-      start_supervised!({Oban, Application.fetch_env!(:retrieval_node, Oban)})
       :ok
     end
 
@@ -89,7 +88,6 @@ defmodule RetrievalNode.Ingest.SourcesTest do
 
   describe "JiraSync (Req.Test)" do
     setup do
-      start_supervised!({Oban, Application.fetch_env!(:retrieval_node, Oban)})
       prev = Application.get_env(:retrieval_node, :jira_req_options)
       Application.put_env(:retrieval_node, :jira_req_options, plug: {Req.Test, __MODULE__})
       on_exit(fn -> Application.put_env(:retrieval_node, :jira_req_options, prev) end)
@@ -153,7 +151,6 @@ defmodule RetrievalNode.Ingest.SourcesTest do
 
   describe "DriveSync (Req.Test)" do
     setup do
-      start_supervised!({Oban, Application.fetch_env!(:retrieval_node, Oban)})
       prev = Application.get_env(:retrieval_node, :drive_req_options)
       Application.put_env(:retrieval_node, :drive_req_options, plug: {Req.Test, __MODULE__})
       on_exit(fn -> Application.put_env(:retrieval_node, :drive_req_options, prev) end)
@@ -290,7 +287,6 @@ defmodule RetrievalNode.Ingest.SourcesTest do
 
   describe "worker uniqueness" do
     setup do
-      start_supervised!({Oban, Application.fetch_env!(:retrieval_node, Oban)})
       :ok
     end
 

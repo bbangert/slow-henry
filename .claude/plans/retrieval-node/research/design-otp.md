@@ -131,6 +131,15 @@ defmodule RetrievalNode.Embedding.Serving do
         compile: [batch_size: batch_size(), sequence_length: sequence_length()],
         defn_options: [compiler: EXLA],
         output_attribute: :hidden_state,
+        # ⚠️ output_pool is REQUIRED with :hidden_state (nomic uses masked mean
+        # pooling). An earlier revision of this sketch omitted it and shipped a
+        # real bug: the serving emits the full padded {seq_len, 768} hidden-state
+        # sequence per text instead of one pooled {768} embedding; downstream
+        # Matryoshka truncation then flattens it to seq_len*384 floats — and at
+        # sequence_length 512 that is 196,608 = 3×65,536, which overflows
+        # pgvector's uint16 dimension header to exactly 0 ("vector must have at
+        # least 1 dimension"). Caught only by the real-model :integration tests.
+        output_pool: :mean_pooling,
         embedding_processor: :l2_norm
       )
 

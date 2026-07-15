@@ -1,60 +1,76 @@
-# Test Review: test/retrieval_node/search/hybrid_query_test.exs
+# Testing Review: Phases 8+9 test files (retrieval-node)
 
 ## Summary
-Three focused tests cover RRF top-rank ordering, filter isolation, and the
-public API's back-link projection. Structure is sound (async: true, DataCase
-sandbox, deterministic axis vectors). The filter-isolation test's core claim —
-"would catch a post-fusion filter regression" — does not hold at the current
-dataset size; this is the highest-value fix.
+Overall solid: budget/truncation, binary-skip, and Oban reconciliation tests
+are well built with hand-computed assertions and real-git fixtures. Two real
+async hazards and one supervision-behavior coverage gap stand out.
 
 ## Iron Law Violations
-None (no Mox, no Process.sleep, appropriate async use).
+- ASYNC BY DEFAULT: `serving_test.exs` (async: true) and
+  `tree_sitter_impl_test.exs`'s "without the supervisor" describe block
+  (module is async: true) both mutate process-global/application-supervision
+  state — see Warnings below.
 
 ## Issues Found
 
 ### Critical
-- [ ] **Filter-isolation test cannot catch the regression it targets** (lines 74-106).
-  The real bug this test's docstring guards against (`hybrid_query.ex` moduledoc
-  lines 10-14) is a filter applied *after* `LIMIT $4` — i.e. an out-of-scope
-  chunk consuming a rank-1 slot in the pre-filter top-`k` window, starving an
-  in-scope chunk that would otherwise have made the cut. With only 2 total
-  chunks and default `top_k: 20`, no truncation can ever occur — both rows
-  always survive to the final filter regardless of where it's applied, so a
-  regression that moves the filter to after `LIMIT` would pass this test
-  unnoticed. Fix: seed >20 repo-b chunks that all score above `in_scope`, pass
-  `top_k: 1` (or the default with enough decoys), and assert `in_scope.id` is
-  still returned. This is the load-bearing property per the module docs — worth
-  the extra fixture setup even for a Phase-2 slice.
+None. No new public context function, `handle_event`, Oban worker, or
+LiveView route in this diff lacks coverage.
 
 ### Warnings
-- [ ] **Fixtures bypass changesets** (`chunk_fixture/2`, `source_fixture/1` use
-  `Repo.insert!(struct(...))` directly). This skips `validate_required` and any
-  future upsert-changeset logic, so schema/changeset drift (e.g., a newly
-  required field) won't surface as a test failure here even though it would in
-  production ingestion. Prefer `Chunk.upsert_changeset/2 |> Repo.insert!()`.
-- [ ] **No nil-embedding coverage.** `hybrid_query.ex` explicitly excludes
-  `embedding IS NULL` chunks from `vector_search` (line 56) but still lets them
-  participate via `fts_search` alone. No test verifies a text-only chunk (nil
-  embedding) still surfaces with a fusion score from FTS rank only — an easy
-  regression to introduce (e.g. an accidental `INNER JOIN` change) with no test
-  to catch it.
-- [ ] **No empty-result-path test** — `text_query` matching nothing / embedding
-  with no candidates should return `[]`, not error.
-- [ ] **No `top_k` truncation test** — nothing exercises `top_k:` actually
-  limiting the returned count when more matches exist than the limit.
-- [ ] Ordering test only inspects the head element; doesn't assert `_miss` is
-  present-but-ranked-lower, so a fusion bug that drops `_miss` entirely (vs.
-  ranking it 2nd) wouldn't be distinguished. Minor given test 2 covers filter
-  drops separately.
+
+- **Global-state async hazard: `Serving` readiness flag mutated under
+  `async: true`.** `test/retrieval_node/embedding/serving_test.exs` (`use
+  ExUnit.Case, async: true`) directly pokes the process-wide
+  `:persistent_term.put({Serving, :ready?}, ...)` key and calls
+  `Serving.reset_ready/0`. `test/.../health_controller_test.exs` deliberately
+  uses `async: false` *because* it touches this same global flag — but since
+  it's a different module marked async, ExUnit can schedule it concurrently
+  with the async `ServingTest`, racing the same key. Mark `ServingTest`
+  `async: false` too (cheap; it's 2 tests), or route it through a
+  dependency-injected name instead of the shared `{Serving, :ready?}` key.
+
+- **`tree_sitter_impl_test.exs` "guarded/1 without the supervisor running"**
+  (lines 101–118) terminates and restarts the real, application-tree-owned
+  `RetrievalNode.ChunkTaskSupervisor` child of `RetrievalNode.Supervisor`
+  while the module is `async: true`. The comment argues no other test in
+  *this file* depends on it concurrently, but `async: true` means other test
+  *files* can run concurrently too — any future test exercising
+  `TreeSitterImpl.guarded/1` from a different module (chunking_impl is
+  HeuristicImpl in `:test` today, but that's incidental, not enforced) would
+  flake against this one tearing down the shared supervisor mid-run. This
+  test mutates global supervision state and should be `async: false`, not
+  rely on "nothing else needs it today."
+
+- **No test coverage for `RetrievalNode.Embedding.Supervisor`'s
+  `:rest_for_one` restart semantics.** `lib/retrieval_node/embedding/supervisor.ex`'s
+  moduledoc spends several paragraphs justifying `:rest_for_one` over
+  `:one_for_one` as load-bearing (a `Serving` crash must restart `Warmer` to
+  re-run warmup and reset readiness). Nothing in the diff (`serving_test.exs`
+  only exercises `Warmer.init/1` standalone via `start_supervised!(Warmer)`,
+  never under the real `Supervisor`) verifies that killing `Serving` actually
+  restarts `Warmer` and flips `ready?` back to `false`. This is exactly the
+  kind of OTP-topology claim that silently bit-rots if the strategy is ever
+  changed back to `:one_for_one`; a small test starting `Supervisor` with
+  fake config, killing the `Serving` child, and asserting `Warmer` restarts
+  would close the gap.
 
 ### Suggestions
-- [ ] If `chunks.embedding` has an ANN index (ivfflat/HNSW) rather than exact
-  search, note that approximate recall is probabilistic even at tiny scale
-  depending on `ef_search`/`probes` settings — worth confirming the migration
-  uses exact search (no index, or brute force) for these tests, or the ordering
-  assertions could flake under CI load. Not verified from the test file alone.
-- [ ] Consider a `describe "search/1 tie-breaks"` case for two chunks with
-  identical fused scores, to document/pin the resulting secondary sort (or
-  absence thereof) rather than leaving it implicit.
-- [ ] `chunk_fixture/2` uniqueness relies on `System.unique_integer/1` for
-  `chunk_key`/`content_hash` — good, no hardcoded-collision risk.
+
+- `test/support/fake_grammar_pack.ex` has no `@behaviour` and there is no
+  `@callback` contract defined for the `:grammar_pack_mod` seam (unlike
+  `Chunking`'s and `Embedding`'s own `@callback`-defined impl seams — both
+  confirmed present in `lib/retrieval_node/chunking.ex` and
+  `lib/retrieval_node/embedding.ex`, which this module's own moduledoc says
+  it mirrors). `TreeSitterLanguagePack` is an external hex dep so wrapping it
+  is correct, but the fake currently only agrees with the real module by
+  naming convention, not a compiler-checked contract. Consider a thin
+  `@behaviour` (e.g. `RetrievalNode.Chunking.GrammarPack`) implemented by
+  both `FakeGrammarPack` and a real adapter module, per the stated pattern.
+
+- `Serving.warmup/0`'s `rescue` branch (malformed-embedding exception, as
+  opposed to the `:exit`/`:noproc` path already exercised via
+  `ServingTest`'s `Warmer.init/1` test) has no direct test. Low priority
+  since `nx_serving_impl_test.exs` covers the underlying `matryoshka/1` raise
+  conditions, but nothing confirms `warmup/0` itself catches and logs rather
+  than propagating a raised error.

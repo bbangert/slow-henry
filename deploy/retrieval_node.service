@@ -1,0 +1,49 @@
+[Unit]
+Description=retrieval_node (MCP knowledge server)
+After=network.target postgresql.service
+Requires=postgresql.service
+
+# OS-level backstop, not boilerplate: a tree-sitter C-level segfault kills the
+# whole BEAM VM outright, bypassing OTP supervision entirely (see
+# .claude/plans/retrieval-node/research/design-build.md). RestartSec=2 (below)
+# plus this burst/interval pair lets systemd recover automatically from an
+# isolated crash while still bounding a fast crash-loop so it can't hammer
+# Postgres connections or fill the disk with logs. (StartLimit* belongs in
+# [Unit], not [Service] — systemd rejects it there.)
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=exec
+User=retrieval_node
+Group=retrieval_node
+WorkingDirectory=/opt/retrieval_node/current
+ExecStart=/opt/retrieval_node/current/bin/retrieval_node start
+# No ExecStop: `bin/retrieval_node stop` RPCs the running node over Erlang
+# distribution, which v1 disables (RELEASE_DISTRIBUTION=none, see
+# rel/env.sh.eex) — that RPC would always fail. Omitting ExecStop makes
+# systemd send SIGTERM directly to the ExecStart process (the BEAM handles
+# SIGTERM cleanly), which is the correct stop mechanism for a
+# no-distribution release. TimeoutStopSec bounds how long systemd waits
+# after SIGTERM before escalating to SIGKILL.
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=2
+
+# PHX_SERVER, DATABASE_URL, SECRET_KEY_BASE, PHX_HOST, PORT, and any
+# GIT_MIRROR_ROOT/XDG_CACHE_HOME overrides live here, not inline in this unit
+# file (which is world-readable via `systemctl cat`). See deploy/README.md
+# for the expected contents. Leading '-' makes the file optional so the unit
+# can still be syntax-checked/started without it during local testing.
+EnvironmentFile=-/etc/retrieval_node/env
+
+# Basic hardening. Deliberately not stricter (e.g. no ProtectSystem=strict,
+# no NoExecPaths) because EXLA's XLA client and the tree-sitter NIF both
+# load/exec native .so files out of the release tree at runtime.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/retrieval_node
+
+[Install]
+WantedBy=multi-user.target

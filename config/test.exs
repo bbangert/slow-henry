@@ -42,6 +42,10 @@ config :retrieval_node, Oban, testing: :manual
 # downloading nomic-embed-text or compiling EXLA.
 config :retrieval_node, embedding_impl: RetrievalNode.Embedding.StubImpl
 
+# Never start the real Nx.Serving sub-tree in test — it would load the ~1.2 GB
+# model and JIT-compile it. StubImpl (above) stands in for RetrievalNode.Embedding.
+config :retrieval_node, embedding_serving_start: false
+
 # Print only warnings and errors during test
 config :logger, level: :warning
 

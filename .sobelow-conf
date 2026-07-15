@@ -1,0 +1,18 @@
+# Sobelow configuration — read automatically by `mix sobelow` (config: true is
+# the default; see deps/sobelow/lib/mix/tasks/sobelow.ex `run/1`, which loads
+# `<root>/.sobelow-conf` before parsing CLI opts). CLI flags still win over
+# this file.
+#
+# `ignore: ["Config.HTTPS"]` — Config.HTTPS: HTTPS Not Enabled (High
+# Confidence) is accepted by design for the v1 slice: retrieval-node is
+# LAN-only with no auth (see plan). TLS termination arrives at a
+# Cloudflare/Tailscale tunnel when internet exposure lands — a mandatory
+# fast-follow alongside auth. Revisit (drop this ignore) when that fast-follow
+# ships.
+[
+  verbose: false,
+  private: false,
+  skip: true,
+  exit: "low",
+  ignore: ["Config.HTTPS"]
+]
