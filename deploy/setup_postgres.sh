@@ -50,11 +50,18 @@ apt-get install -y "postgresql-${pg_major}" "postgresql-${pg_major}-pgvector"
 systemctl enable --now postgresql
 
 # --- Query profiling (pg_stat_statements) --------------------------------------
-# Must be in shared_preload_libraries before the cluster can use it; overwriting
-# is safe on a fresh box (the value is unset by default). Restart picks it up.
-log "enabling pg_stat_statements"
-pg_conftool "$pg_major" main set shared_preload_libraries pg_stat_statements
-systemctl restart "postgresql@${pg_major}-main"
+# Must be in shared_preload_libraries before the cluster can use it. Append
+# idempotently (never clobber other preloaded libs) and restart ONLY when the
+# setting actually changed, preserving this script's safe-to-re-run promise.
+preload=$(pg_conftool -s "$pg_major" main show shared_preload_libraries 2>/dev/null || echo "")
+if ! printf '%s' "$preload" | grep -q pg_stat_statements; then
+  log "enabling pg_stat_statements (restarting postgres)"
+  pg_conftool "$pg_major" main set shared_preload_libraries \
+    "${preload:+${preload},}pg_stat_statements"
+  systemctl restart "postgresql@${pg_major}-main"
+else
+  log "pg_stat_statements already preloaded"
+fi
 
 # --- Service user --------------------------------------------------------------
 if ! id "$service_user" >/dev/null 2>&1; then

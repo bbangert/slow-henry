@@ -13,10 +13,15 @@ echo 'eval "$(mise activate zsh)"'  >> ~/.zshrc
 # start it and set the password. `postStartCommand` restarts it on later boots.
 setup_postgres() {
   # Query profiling: pg_stat_statements must be preloaded before cluster start
-  # (a running cluster needs a restart to pick it up). The extension itself is
-  # created per-database by the app's migrations/dev bootstrap or manually:
-  #   CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
-  sudo pg_conftool 18 main set shared_preload_libraries pg_stat_statements
+  # (a running cluster needs a restart to pick it up). Append idempotently so
+  # re-runs / other preloaded libraries are never clobbered. The extension
+  # itself is created per-database below.
+  local preload
+  preload=$(sudo pg_conftool -s 18 main show shared_preload_libraries 2>/dev/null || echo "")
+  if ! printf '%s' "$preload" | grep -q pg_stat_statements; then
+    sudo pg_conftool 18 main set shared_preload_libraries \
+      "${preload:+${preload},}pg_stat_statements"
+  fi
 
   sudo pg_ctlcluster 18 main start 2>/dev/null || true
 
