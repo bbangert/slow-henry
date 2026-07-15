@@ -49,6 +49,13 @@ apt-get install -y "postgresql-${pg_major}" "postgresql-${pg_major}-pgvector"
 
 systemctl enable --now postgresql
 
+# --- Query profiling (pg_stat_statements) --------------------------------------
+# Must be in shared_preload_libraries before the cluster can use it; overwriting
+# is safe on a fresh box (the value is unset by default). Restart picks it up.
+log "enabling pg_stat_statements"
+pg_conftool "$pg_major" main set shared_preload_libraries pg_stat_statements
+systemctl restart "postgresql@${pg_major}-main"
+
 # --- Service user --------------------------------------------------------------
 if ! id "$service_user" >/dev/null 2>&1; then
   log "creating system user $service_user"
@@ -84,6 +91,10 @@ SQL
 else
   log "database $db_name already exists"
 fi
+
+# pg_stat_statements is per-database; idempotent. (The `vector` extension stays
+# with Ecto migrations — this one is ops tooling, not app schema.)
+run_as_postgres -d "$db_name" -c 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements;'
 
 # The `vector` extension itself is NOT created here — retrieval_node's Ecto
 # migrations run `CREATE EXTENSION IF NOT EXISTS vector` as part of
