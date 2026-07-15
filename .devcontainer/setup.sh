@@ -12,6 +12,17 @@ echo 'eval "$(mise activate zsh)"'  >> ~/.zshrc
 # auto-created by postgresql-common when postgresql-18 is installed; here we just
 # start it and set the password. `postStartCommand` restarts it on later boots.
 setup_postgres() {
+  # Query profiling: pg_stat_statements must be preloaded before cluster start
+  # (a running cluster needs a restart to pick it up). Append idempotently so
+  # re-runs / other preloaded libraries are never clobbered. The extension
+  # itself is created per-database below.
+  local preload
+  preload=$(sudo pg_conftool -s 18 main show shared_preload_libraries 2>/dev/null || echo "")
+  if ! printf '%s' "$preload" | grep -q pg_stat_statements; then
+    sudo pg_conftool 18 main set shared_preload_libraries \
+      "${preload:+${preload},}pg_stat_statements"
+  fi
+
   sudo pg_ctlcluster 18 main start 2>/dev/null || true
 
   # Wait for the cluster to accept connections on its unix socket (peer auth as
@@ -31,6 +42,7 @@ setup_postgres() {
   fi
 
   sudo su postgres -c "psql -p 5432 -h /var/run/postgresql -c \"ALTER USER postgres PASSWORD 'postgres';\""
+  sudo su postgres -c "psql -p 5432 -h /var/run/postgresql -c 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements;'"
 }
 
 setup_postgres

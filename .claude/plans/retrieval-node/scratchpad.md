@@ -82,6 +82,14 @@ Phases 0–7 merged to `main` (last: PR #7, MCP tools). `main` @ `7a77ca2`. All 
 
 ## Open action items (carried into implementation)
 
+- [ ] **Org-scale ingest bugs (found live on the NabuCasa pull, 2026-07-15) — filed
+      as GitHub issues #9/#10/#11**: (9) staging `insert_all` blows the PG 65,535
+      bind-parameter cap on repos >~5.4k files — batch it in
+      `PendingChunks.insert_raw_all`; (10) submodule gitlink entries make
+      `git show` fail and kill the whole RepoSync — filter mode-160000 in
+      ls-tree/diff + skip-not-fail per-file; (11) empty repos (unborn HEAD) crash
+      `head_sha` → should no-op sync. 4 of 71 NC sources discarded on these.
+
 - [x] **Verify tree-sitter NIF is dirty-scheduled** — DONE, and the answer is **NO**.
       `deps/tree_sitter_language_pack/native/.../src/lib.rs`: every `#[rustler::nif]` is
       plain (no `schedule = "DirtyCpu"`); the only "schedule" hit is a code comment.

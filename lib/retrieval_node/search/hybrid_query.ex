@@ -7,11 +7,25 @@ defmodule RetrievalNode.Search.HybridQuery do
   `with_cte`/full-join DSL: a two-CTE RRF fusion with window functions is right
   at the edge of what the macro DSL expresses cleanly, and the load-bearing
   correctness property is far easier to read (and `EXPLAIN ANALYZE`) in plain
-  SQL. That property: the optional `source_id`/`repo`/`lang` filters are applied
-  **inside** a shared `candidates` CTE that feeds *both* the vector and FTS
-  ranking CTEs — so the `row_number()` window ranks only the already-filtered
-  set. A filter applied after fusion could let an out-of-scope chunk consume a
-  rank-1 slot and starve an in-scope chunk, silently degrading filtered recall.
+  SQL. That property: the optional `source_id`/`repo`/`lang`/`source_type`
+  filters are applied **inside each leg's own `WHERE`** — so the `row_number()`
+  window ranks only the already-filtered set. A filter applied after fusion
+  could let an out-of-scope chunk consume a rank-1 slot and starve an in-scope
+  chunk, silently degrading filtered recall.
+
+  The two legs query `chunks` directly and do **not** share a `candidates` CTE.
+  An earlier version filtered via `SELECT id FROM chunks WHERE (filters)` in a
+  CTE joined into both legs; Postgres materializes a CTE referenced more than
+  once, which forces a hash/nested-loop join against that materialized set —
+  and that join, not the filters themselves, is what defeated both
+  `chunks_embedding_hnsw_idx` and `chunks_tsv_gin_idx` (confirmed live:
+  `pg_stat_user_indexes` showed the HNSW index at `idx_scan = 0`). Inlining the
+  same filter predicates directly into each leg's `WHERE` lets the planner push
+  them below the `ORDER BY ... LIMIT`, so `vector_search` drives off the HNSW
+  index (pgvector 0.8.5 supports iterative index scans, so a `WHERE` predicate
+  alongside `ORDER BY embedding <=> $1` does not force it back to an exact
+  scan) and `fts_search` drives off the GIN index, instead of both falling
+  back to a sequential scan + sort over the whole table.
 
   Returns back-link projection maps (no `content`) ordered by fused score desc;
   full content is fetched separately (`get_file` / targeted `Repo.get`) only when
@@ -50,27 +64,28 @@ defmodule RetrievalNode.Search.HybridQuery do
         ]
 
   @sql """
-  WITH candidates AS (
-    SELECT id FROM chunks
-    WHERE ($5::uuid IS NULL OR source_id = $5)
+  WITH vector_search AS (
+    SELECT id, row_number() OVER (ORDER BY embedding <=> $1::vector) AS rank
+    FROM chunks
+    WHERE embedding IS NOT NULL
+      AND ($5::uuid IS NULL OR source_id = $5)
       AND ($6::text IS NULL OR repo = $6)
       AND ($7::text IS NULL OR lang = $7)
       AND ($8::text IS NULL OR source_type = $8)
-  ),
-  vector_search AS (
-    SELECT c.id, row_number() OVER (ORDER BY c.embedding <=> $1::vector) AS rank
-    FROM chunks c JOIN candidates ON candidates.id = c.id
-    WHERE c.embedding IS NOT NULL
-    ORDER BY c.embedding <=> $1::vector
+    ORDER BY embedding <=> $1::vector
     LIMIT #{@candidate_pool}
   ),
   fts_search AS (
-    SELECT c.id, row_number() OVER (
-      ORDER BY ts_rank(c.tsv, websearch_to_tsquery('english', $2)) DESC
+    SELECT id, row_number() OVER (
+      ORDER BY ts_rank(tsv, websearch_to_tsquery('english', $2)) DESC
     ) AS rank
-    FROM chunks c JOIN candidates ON candidates.id = c.id
-    WHERE c.tsv @@ websearch_to_tsquery('english', $2)
-    ORDER BY ts_rank(c.tsv, websearch_to_tsquery('english', $2)) DESC
+    FROM chunks
+    WHERE tsv @@ websearch_to_tsquery('english', $2)
+      AND ($5::uuid IS NULL OR source_id = $5)
+      AND ($6::text IS NULL OR repo = $6)
+      AND ($7::text IS NULL OR lang = $7)
+      AND ($8::text IS NULL OR source_type = $8)
+    ORDER BY ts_rank(tsv, websearch_to_tsquery('english', $2)) DESC
     LIMIT #{@candidate_pool}
   ),
   fused AS (

@@ -49,13 +49,23 @@ config :retrieval_node, Oban,
   ]
 
 # Embedding serving (Bumblebee/Nx.Serving over nomic-embed-text-v1.5). `compile`
-# forces a JIT pass at init (batch_size 16, sequence_length 512); batch_timeout
-# groups concurrent query/indexing calls. The model emits 768-dim vectors; the
-# impl Matryoshka-truncates to 384.
+# forces a JIT pass at init (batch_size 16); batch_timeout groups concurrent
+# query/indexing calls. The model emits 768-dim vectors; the impl
+# Matryoshka-truncates to 384.
+#
+# `sequence_length` is a list of shape-bucket lengths rather than one fixed
+# length: Bumblebee's tokenizer pads each input to the smallest bucket that
+# fits it (`Bumblebee.Text.PreTrainedTokenizer`'s `:length` option), and
+# `Nx.Serving` JIT-compiles one EXLA program per bucket (`Bumblebee.Shared.
+# sequence_batch_keys/1`). A fixed 512 padded every chunk to 512 tokens
+# regardless of actual length (~250ms/chunk observed), even though most chunks
+# are far shorter. Bucketing means most chunks compute at 128 or 256 instead of
+# always 512 — a real throughput win — at the cost of a few extra JIT passes
+# (one per bucket) during boot warmup.
 config :retrieval_node, RetrievalNode.Embedding.Serving,
   model: "nomic-ai/nomic-embed-text-v1.5",
   batch_size: 16,
-  sequence_length: 512,
+  sequence_length: [128, 256, 512],
   batch_timeout_ms: 50
 
 # EXLA as the global Nx default backend — without this, any tensor op NOT
