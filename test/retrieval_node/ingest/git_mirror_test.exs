@@ -167,6 +167,81 @@ defmodule RetrievalNode.Ingest.GitMirrorTest do
     assert {:ok, _path} = GitMirror.ensure_mirror("acme/app", "file://irrelevant")
   end
 
+  describe "submodules (gitlinks)" do
+    # Adds a gitlink entry at `sublib` via update-index --cacheinfo (mode 160000)
+    # rather than `git submodule add`, which would need a real submodule repo
+    # reachable over a configured protocol — the low-level cacheinfo form gets the
+    # same tree entry without any of that network/config machinery. Committed in
+    # the working-tree `src` repo (not the bare mirror directly), then fetched
+    # into the mirror the same way any real update would arrive.
+    setup %{sha1: sha1, url: url} do
+      src = String.trim_leading(url, "file://")
+
+      sub = Path.join(System.tmp_dir!(), "gm-sub-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(sub)
+      on_exit(fn -> File.rm_rf(sub) end)
+      git!(sub, ["init", "-q"])
+      git!(sub, ["config", "user.email", "t@t"])
+      git!(sub, ["config", "user.name", "t"])
+      File.write!(Path.join(sub, "f.txt"), "hi\n")
+      git!(sub, ["add", "."])
+      git!(sub, ["commit", "-qm", "sub"])
+      sub_sha = String.trim(git!(sub, ["rev-parse", "HEAD"]))
+
+      git!(src, ["update-index", "--add", "--cacheinfo", "160000,#{sub_sha},sublib"])
+      git!(src, ["commit", "-qm", "add submodule"])
+      sha3 = String.trim(git!(src, ["rev-parse", "HEAD"]))
+
+      {:ok, _path} = GitMirror.ensure_mirror("acme/app", url)
+
+      %{sha3: sha3, sub_sha: sub_sha, sha1: sha1}
+    end
+
+    test "changed_files (first sync / ls-tree) excludes the gitlink path", %{sha3: sha3} do
+      assert {:ok, files} = GitMirror.changed_files("acme/app", nil, sha3)
+      assert "sublib" not in files
+      assert Enum.sort(files) == ["LICENSE", "app.py"]
+    end
+
+    test "changed_files (diff) excludes the gitlink path", %{sha1: sha1, sha3: sha3} do
+      assert {:ok, files} = GitMirror.changed_files("acme/app", sha1, sha3)
+      assert "sublib" not in files
+      assert "LICENSE" in files
+    end
+
+    test "changed_entries excludes the gitlink path but keeps real files", %{
+      sha1: sha1,
+      sha3: sha3
+    } do
+      assert {:ok, entries} = GitMirror.changed_entries("acme/app", sha1, sha3)
+      paths = Enum.map(entries, &elem(&1, 1))
+      assert "sublib" not in paths
+      # Non-rename/copy/delete statuses (including a plain "A") collapse to
+      # :modified here — unchanged from the pre-existing --name-status behavior;
+      # RepoSync treats :modified and :added identically (both "present").
+      assert {:modified, "LICENSE"} in entries
+    end
+  end
+
+  describe "empty repos" do
+    test "head_sha on a brand-new repo with no commits returns :empty_repo" do
+      empty_src =
+        Path.join(System.tmp_dir!(), "gm-empty-src-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(empty_src)
+      on_exit(fn -> File.rm_rf(empty_src) end)
+      git!(empty_src, ["init", "-q"])
+
+      {:ok, _} = GitMirror.ensure_mirror("acme/empty", "file://" <> empty_src)
+
+      assert {:error, :empty_repo} = GitMirror.head_sha("acme/empty")
+    end
+
+    test "head_sha on a non-empty repo with a bad custom ref is a plain git error, not :empty_repo" do
+      assert {:error, {:git, _code, _msg}} = GitMirror.head_sha("acme/app", "nope-no-such-ref")
+    end
+  end
+
   describe "grep output budgets" do
     setup do
       on_exit(fn ->

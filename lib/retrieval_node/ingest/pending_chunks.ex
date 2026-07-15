@@ -16,19 +16,33 @@ defmodule RetrievalNode.Ingest.PendingChunks do
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.PendingChunk
 
+  # A single `insert_all` is capped by Postgres's 65,535-bind-parameter wire
+  # protocol limit; each row here binds ~12 params, so one statement tops out
+  # around ~5,400 rows. 2,000 rows/batch (~24k params) stays comfortably under
+  # that ceiling with room to spare for future columns. Config-overridable (like
+  # GitMirror's timeout knobs) purely so tests can exercise the multi-batch path
+  # without actually constructing 2,000+ rows.
+  @insert_batch_size 2_000
+
   @doc """
-  Bulk-insert freshly-discovered raw rows in a single `insert_all` (one round-trip,
-  atomic). Rows come from the internal `*Sync` clients; NOT NULL constraints at the
-  DB enforce required fields (a malformed row raises → the Oban job retries).
+  Bulk-insert freshly-discovered raw rows, batched under Postgres's 65,535-bind-
+  parameter limit (one `insert_all` per `#{@insert_batch_size}`-row batch), all
+  inside one transaction so the whole set stays atomic — a failure in any batch
+  rolls back everything already inserted this call. Rows come from the internal
+  `*Sync` clients; NOT NULL constraints at the DB enforce required fields (a
+  malformed row raises → the transaction rolls back → the Oban job retries).
 
   A row whose `raw_content` is binary (`Chunking.binary_content?/1`) is dropped
   here, before it ever reaches the `text` column — Postgres rejects invalid UTF-8
   outright (error 22021), which would otherwise crash the whole insert (and the
   calling `*Sync` job) over a single bad file. This is the single choke point all
   `*Sync` workers insert through, so the guard applies uniformly without each
-  worker re-implementing it. Returns `{:ok, ids}` for the rows actually inserted
-  (skipped rows have no id — callers enqueue `ChunkFiles` per returned id, so a
-  skipped row correctly gets no chunking job).
+  worker re-implementing it, and runs against the FULL row set before batching (a
+  batch boundary never splits a file away from its own guard check). Returns
+  `{:ok, ids}` for the rows actually inserted, in the same order as `rows` (minus
+  skips) — callers enqueue `ChunkFiles` per returned id, so a skipped row
+  correctly gets no chunking job, and callers that zip ids back against input rows
+  can rely on the ordering.
   """
   @spec insert_raw_all([map()]) :: {:ok, [integer()]}
   def insert_raw_all(rows) do
@@ -39,9 +53,21 @@ defmodule RetrievalNode.Ingest.PendingChunks do
 
     entries = Enum.map(kept, &entry(&1, now))
 
-    {_count, rows} = Repo.insert_all(PendingChunk, entries, returning: [:id])
-    {:ok, Enum.map(rows, & &1.id)}
+    Repo.transaction(fn -> insert_batches(entries) end)
   end
+
+  defp insert_batches(entries) do
+    entries
+    |> Enum.chunk_every(insert_batch_size())
+    |> Enum.map(fn batch ->
+      {_count, rows} = Repo.insert_all(PendingChunk, batch, returning: [:id])
+      Enum.map(rows, & &1.id)
+    end)
+    |> List.flatten()
+  end
+
+  defp insert_batch_size,
+    do: Application.get_env(:retrieval_node, :insert_raw_batch_size, @insert_batch_size)
 
   defp binary?(attrs), do: Chunking.binary_content?(Map.get(attrs, :raw_content) || "")
 
