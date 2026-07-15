@@ -28,6 +28,11 @@ defmodule RetrievalNode.Chunking.GrammarsTest do
       assert "heex" in required
       assert "eex" in required
     end
+
+    test "has no duplicates" do
+      required = Grammars.required()
+      assert Enum.uniq(required) == required
+    end
   end
 
   describe "missing/0 and all_cached?/0 (NIF-free via :grammar_pack_mod)" do

@@ -116,4 +116,4 @@ else
   echo "  Release directory: $release_dir"
   echo "  (expected tarball not found at $tarball — check the :tar release step in mix.exs)"
 fi
-echo "  Next: scripts/deploy.sh <path-to-tarball-or-release-dir>"
+echo "  Next: scripts/deploy.sh <path-to-release-tarball>"

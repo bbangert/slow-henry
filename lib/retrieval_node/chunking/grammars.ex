@@ -33,7 +33,7 @@ defmodule RetrievalNode.Chunking.Grammars do
 
   @doc "Languages that must be present in the local grammar cache."
   @spec required() :: [String.t()]
-  def required, do: TreeSitterImpl.allowed_languages() ++ @extra_languages
+  def required, do: Enum.uniq(TreeSitterImpl.allowed_languages() ++ @extra_languages)
 
   @doc "Required languages not currently present in the local grammar cache."
   @spec missing() :: [String.t()]

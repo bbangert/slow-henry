@@ -63,6 +63,11 @@ defmodule Mix.Tasks.Rn.Seed do
 
   @switches [git_url: :string, repo: :string, status: :boolean]
 
+  # run/1 ends in System.halt/1 (boot/0's ensure_all_started boots the full
+  # supervision tree, which would otherwise keep the VM alive after seeding
+  # finishes), so it genuinely never returns — the spec tells dialyzer that's
+  # intentional.
+  @spec run([binary()]) :: no_return()
   @impl Mix.Task
   def run(args) do
     {opts, _args, _invalid} = OptionParser.parse(args, strict: @switches)
@@ -74,6 +79,15 @@ defmodule Mix.Tasks.Rn.Seed do
     else
       seed(opts)
     end
+
+    # boot/0 brings up the *entire* supervision tree (Endpoint, Oban, the
+    # embedding Serving/Warmer sub-tree, ...) since Oban.insert/1 needs a
+    # running Oban instance to resolve its config — none of which has a
+    # reason to keep running once sources are seeded/status is printed.
+    # Without an explicit halt, `mix rn.seed` would hang after printing (a
+    # script/CI invocation would need to be killed rather than exiting on
+    # its own).
+    System.halt(0)
   end
 
   # --- boot ---
@@ -86,6 +100,8 @@ defmodule Mix.Tasks.Rn.Seed do
   # process's own queues raced to claim a job and then the task exited mid
   # `git clone --mirror`, it would leave a corrupt bare mirror behind.
   defp boot do
+    Mix.Task.run("app.config")
+
     Application.put_env(:retrieval_node, :embedding_serving_start, false)
 
     oban_config = Application.get_env(:retrieval_node, Oban, [])
@@ -96,7 +112,7 @@ defmodule Mix.Tasks.Rn.Seed do
       Keyword.merge(oban_config, queues: [], plugins: [])
     )
 
-    Mix.Task.run("app.start")
+    {:ok, _} = Application.ensure_all_started(:retrieval_node)
   end
 
   # --- seed ---

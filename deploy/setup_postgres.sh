@@ -17,7 +17,7 @@ die() {
   exit 1
 }
 
-[ "$(id -u)" = "0" ] || die "run as root (sudo scripts/setup_postgres.sh)"
+[ "$(id -u)" = "0" ] || die "run as root (sudo $0)"
 
 pg_major="${PG_MAJOR:-18}"
 db_name="${RETRIEVAL_NODE_DB:-retrieval_node_prod}"
