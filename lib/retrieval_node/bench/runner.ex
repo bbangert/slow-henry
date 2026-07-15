@@ -277,7 +277,8 @@ defmodule RetrievalNode.Bench.Runner do
   defp synthetic_passage(i),
     do: String.duplicate(@probe_sentence, @probe_repeats) <> "passage-#{i}"
 
-  defp bytes_to_mb(nil), do: nil
+  # No nil clause: callers only ever pass :erlang.memory/1 values (integers).
+  # kb_to_mb below handles nil because /proc reads can legitimately fail.
   defp bytes_to_mb(bytes), do: bytes / (1024 * 1024)
 
   defp kb_to_mb(nil), do: nil

@@ -52,6 +52,10 @@ defmodule Mix.Tasks.Rn.Bench do
 
   alias RetrievalNode.Bench.Runner
 
+  # run/1 ends in System.halt/1 (ensure_all_started boots the full supervision
+  # tree, which would otherwise keep the VM alive after the report prints), so
+  # it genuinely never returns — the spec tells dialyzer that's intentional.
+  @spec run([binary()]) :: no_return()
   @impl Mix.Task
   def run(args) do
     Mix.Task.run("app.config")
