@@ -50,30 +50,37 @@ defmodule RetrievalNode.MCP.Tools.Grep do
   # pattern surfaces) and once the aggregate cap is reached (so a repo-less grep
   # can't keep buffering). Per-repo lists are prepended (O(1)) with a running count
   # — no `length/1` per repo, no `acc ++ matches` — and flattened once at the end.
-  # `truncated?` is true iff we halted at the cap (conservative: on the exactly-cap
-  # boundary it may over-report, never under-report).
+  # `truncated?` is true iff we halted at the cap, or GitMirror.grep/3 itself
+  # truncated a repo's own output (conservative: on the exactly-cap boundary it may
+  # over-report, never under-report).
   defp grep_all(slugs, pattern) do
     slugs
-    |> Enum.reduce_while({[], 0}, &grep_reduce(&1, pattern, &2))
+    |> Enum.reduce_while({[], 0, false}, &grep_reduce(&1, pattern, &2))
     |> case do
       {:error, reason} -> {:error, reason}
-      {:capped, chunks} -> {:ok, flatten_take(chunks), true}
-      {chunks, _count} -> {:ok, flatten_take(chunks), false}
+      {:capped, chunks, _truncated?} -> {:ok, flatten_take(chunks), true}
+      {chunks, _count, truncated?} -> {:ok, flatten_take(chunks), truncated?}
     end
   end
 
-  defp grep_reduce(slug, pattern, {chunks, count}) do
+  defp grep_reduce(slug, pattern, {chunks, count, truncated?}) do
     case GitMirror.grep(slug, pattern) do
-      {:ok, matches} -> accumulate(matches, chunks, count)
-      {:error, reason} -> {:halt, {:error, reason}}
+      {:ok, matches, repo_truncated?} ->
+        accumulate(matches, chunks, count, truncated? or repo_truncated?)
+
+      {:error, reason} ->
+        {:halt, {:error, reason}}
     end
   end
 
   # Prepend this repo's matches (O(1)) and halt once the aggregate cap is reached.
-  defp accumulate(matches, chunks, count) do
+  defp accumulate(matches, chunks, count, truncated?) do
     count = count + length(matches)
     chunks = [matches | chunks]
-    if count >= @max_matches, do: {:halt, {:capped, chunks}}, else: {:cont, {chunks, count}}
+
+    if count >= @max_matches,
+      do: {:halt, {:capped, chunks, truncated?}},
+      else: {:cont, {chunks, count, truncated?}}
   end
 
   defp flatten_take(chunks),

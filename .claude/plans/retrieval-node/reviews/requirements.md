@@ -1,46 +1,24 @@
-## Requirements Coverage (from .claude/plans/retrieval-node/plan.md — Phases 0-2)
-
-### Canonical reconciliation decisions
-
-| # | Decision | Status | Evidence |
-|---|----------|--------|----------|
-| 1 | Namespaces: `RetrievalNode.Retrieval.*` for schemas | MET | `lib/retrieval_node/retrieval/{source,chunk,sync_state,secret_finding}.ex` all `defmodule RetrievalNode.Retrieval.*` |
-| 2 | `chunk_key` + `[:source_id, :chunk_key]` as ON CONFLICT/unique target | MET | migration `20260714120003_create_chunks.exs` `unique_index(:chunks, [:source_id, :chunk_key])`; schema `chunk.ex` `unique_constraint([:source_id, :chunk_key], name: :chunks_source_id_chunk_key_index)` |
-| 3 | `vector(384)` everywhere incl. `pending_chunks` | MET | `create_chunks.exs` `add :embedding, :vector, size: 384`; `create_pending_chunks.exs` `add :embedding, :vector, size: 384` |
-| 4 | `pending_chunks` staging table adopted | MET | `priv/repo/migrations/20260714120007_create_pending_chunks.exs` defines full staging table w/ status/scrub_mode/chunk_quality |
-| 6 | pgvector Postgres extension ≥0.5.0 verified | PARTIAL | Plan claims "0.8.5 installed" (manual/psql verification, not asserted in code); no runtime/migration guard exists in the diff checking `pg_extension.extversion` — acceptable per plan wording but unverifiable from code alone |
-
-### Phase 0 — Scaffold & dependencies
+## Requirements Coverage (from Plan file .claude/plans/retrieval-node/plan.md, Phases 8-9)
 
 | # | Requirement | Status | Evidence |
 |---|-------------|--------|----------|
-| 1 | Generate API-only Phoenix app | MET | `mix.exs` app `:retrieval_node`, no html/live deps required for MCP |
-| 2 | Add deps: anubis_mcp, oban, pgvector 0.4.0, bumblebee, nx, exla, tree_sitter_language_pack, req, sourceror, credo, sobelow | PARTIAL | `mix.exs:57` declares `{:pgvector, "~> 0.3"}` but plan/`mix.lock:33` show `0.4.0` resolved — `~> 0.3` should exclude `0.4.x`; requirement string does not match the claimed/locked version. All other deps present in `mix.exs`. |
-| 3 | Register pgvector Postgrex type via `postgrex_types.ex`, wired in config, plus `EctoTypes.TsVector` | MET | `lib/retrieval_node/postgrex_types.ex` (`Pgvector.extensions() ++ Ecto.Adapters.Postgres.extensions()`); `config/config.exs` `types: RetrievalNode.PostgrexTypes`; `lib/retrieval_node/ecto_types/ts_vector.ex` |
-| 4 | Verify vector extension ≥0.5.0 | UNCLEAR | No code assertion found (`grep extversion` empty); relies on manual psql check per plan note — cannot verify from diff alone |
-| 5 | config.exs chunking_impl/embedding_impl swappable keys; test.exs override to Heuristic | MET | `config/config.exs` sets both keys; `config/test.exs` `chunking_impl: RetrievalNode.Chunking.HeuristicImpl` |
-| 6 | Verify: compile --warnings-as-errors PASS, format --check-formatted PASS | MET | ran locally: both exit 0 |
+| 1 | Application supervision tree order: Repo→PubSub→Finch→{Task.Sup,ChunkTaskSupervisor}→Embedding.Serving→Oban→Endpoint, `:one_for_one`, no distribution | MET | `lib/retrieval_node/application.ex:12-39` — exact order (Telemetry/DNSCluster are standard Phoenix boilerplate, not a deviation); `rel/env.sh.eex:10` sets `RELEASE_DISTRIBUTION=none` |
+| 2 | Embedding sub-tree `rest_for_one`, gated by `:embedding_serving_start` (false in test) | MET | `lib/retrieval_node/application.ex:52-59` (gate); `lib/retrieval_node/embedding/supervisor.ex` (Serving+Warmer sub-tree) |
+| 3 | arm64 build pipeline: on-device compile, ELF gate (tree-sitter .so, EXLA .so, beam.smp), glibc≥2.31, grammar prefetch, release overlay | MET | `scripts/build_arm64.sh:24-42` (arch+glibc guards), `:66-104` (three-artifact ELF gate: tree_sitter_language_pack .so, exla .so, beam.smp), `:89-94` (prefetch + overlay staging) |
+| 4 | Grammar prefetch Mix task for elixir/heex/eex + 8 other langs, exit-nonzero on missing | MET | `lib/mix/tasks/rn.grammars.prefetch.ex:5,30` (`Mix.raise` on missing grammar) |
+| 5 | systemd unit: Type=exec, atomic symlink, Restart=on-failure RestartSec=2 StartLimitBurst=10/300s, EnvironmentFile | MET | `deploy/retrieval_node.service` — `StartLimitIntervalSec=300`/`StartLimitBurst=10` correctly in `[Unit]` (design doc's `[Service]` placement fixed), `Restart=on-failure`/`RestartSec=2` in `[Service]`, `EnvironmentFile=-/etc/retrieval_node/env`; `scripts/deploy.sh` handles unpack/symlink/restart/poll |
+| 6 | /healthz 4 gates: grammar-cache, EXLA backend, Nx.Serving warmed, DB reachable; ready only when all pass; config-disabled subsystems skip | MET | `lib/retrieval_node_web/controllers/health_controller.ex:37-45` (all 4 gates wired), `:57-58` (`ready?` fails on any `:error`, `:skipped` passes) |
+| 7 | Harden git grep memory: stream via Port with byte/match budget, early close, NUL-safe | MET | `lib/retrieval_node/ingest/git_mirror.ex:179-329` — raw `Port` receive loop, `@default_grep_max_bytes`/`@default_grep_max_matches`, early `Port.close`, 3-tuple `{:ok, matches, truncated?}` return consumed by `lib/retrieval_node/mcp/tools/grep.ex:35-77` |
+| 8 | `Embedding.Serving.ready?/0` reset on serving restart, re-warm via rest_for_one | MET | `lib/retrieval_node/embedding/serving.ex:125` (`reset_ready/0`); `lib/retrieval_node/embedding/warmer.ex:24` (calls `reset_ready` in `init`, re-warms via `handle_continue`) |
+| 9 | Postgres via apt (PGDG arm64) + pgvector; git-mirrors dir; nightly pg_dump to NVMe | MET | `deploy/setup_postgres.sh`, `deploy/backup_postgres.sh` + `retrieval_node-backup.service`/`.timer` present; `runtime.exs` prod config for `:git_mirror_root` |
+| 10 | Dev x86-64 deltas: skip ELF gate, `mix phx.server` not release, default grammar path | MET | `scripts/build_arm64.sh:26-31` hard-fails on non-aarch64 (dev never enters this path); `deploy/README.md` documents dev flow |
+| 11 | Verify: arm64 build ELF gate passes; deploy /healthz green; x86 dev boots via `mix phx.server` | MET (arm64 leg DEFERRED-MANUAL) | x86 leg claimed verified (4 gates green boot); arm64 build+deploy deliverables (`scripts/build_arm64.sh`, `scripts/deploy.sh`) exist and are wired to the ELF gate/healthz poll, but no arm64 hardware exists in this container — deferral is explicit and documented, not silently skipped |
+| 12 | Seed thin corpus: 1 git repo, resolved Jira issues, 1 Drive folder | PARTIAL (git leg MET; Jira/Drive DEFERRED-MANUAL) | `lib/mix/tasks/rn.seed.ex` — idempotent upsert on `[:source_type, :identifier]`, self-registers this repo via `file://` mirror (git leg exercised); Jira/Drive env-var mapping implemented (`:24-40`) but not run since credentials are absent — correctly deferred |
+| 13 | Live-corpus fixes: binary staging guard, `output_pool: :mean_pooling` + dim guards, `Ecto.Enum.mappings` replacing `to_existing_atom` | MET | `lib/retrieval_node/chunking.ex:52-53` (`binary_content?/1`) wired at `lib/retrieval_node/ingest/pending_chunks.ex:46`; `lib/retrieval_node/embedding/serving.ex:64` (`output_pool: :mean_pooling`) + `nx_serving_impl.ex:70-85` (matryoshka shape/dim guards, raise on missing pooling); `lib/retrieval_node/ingest/workers/upsert_chunks.ex:82-93` (`Ecto.Enum.mappings/2` replacing unsafe `String.to_existing_atom`) |
+| 14 | Benchmark harness: 50-100 labeled queries, nDCG@10≥0.55, p99≤300ms, throughput≥10 passages/s, RAM peak≤1.5GB, Matryoshka 384-vs-768 delta <2% | PARTIAL | `mix rn.bench` + `lib/retrieval_node/bench/{metrics,runner}.ex` implement all required metrics and PASS/FAIL/SKIPPED reporting; `priv/bench/queries.jsonl` has only 15 queries — below the stated 50-100 target (explicitly flagged in the plan's own DONE note as the "target set" remaining, not fabricated); 384-vs-768 delta implemented only as a truncation-stability proxy that always SKIPs (corpus stores `vector(384)` only), so the real cross-dimension delta is not measured |
+| 15 | Definition of done: all 4 MCP tools answer over thin corpus via LAN; 1 incremental-sync round proven per source; secrets scrubbing runs on git path; benchmark harness exists | PARTIAL (git leg MET; Jira/Drive DEFERRED-MANUAL; live LAN proof UNCLEAR from code) | MCP tool code present and wired (`lib/retrieval_node/mcp/tools/grep.ex` + list_repos/get_file/semantic_search referenced), `lib/retrieval_node/ingest/scrubber.ex` present; DONE note cites live session capture (`mcp_*.raw` in scratchpad, outside diff scope) as proof of LAN behavior — cannot independently verify from a static code diff; incremental-sync round proven only for the git source, Jira/Drive incremental rounds explicitly pending real credentials (Req.Test-covered in suite per note, not live) |
+| 16 | Verify: `mix compile --warnings-as-errors`, `mix format --check-formatted`, `mix credo --strict`, `mix test`, `mix sobelow` | MET | `.sobelow-conf` present with documented, scoped `Config.HTTPS` ignore and rationale (LAN-only v1, TLS deferred to tunnel fast-follow); `test/**` contains 14 changed test files; tooling/config artifacts are consistent with the DONE note's claimed green run, though this review did not itself re-execute the full suite |
 
-### Phase 1 — Data layer
+**Summary**: 11 MET · 4 PARTIAL · 0 UNMET · 1 UNCLEAR
 
-| # | Requirement | Status | Evidence |
-|---|-------------|--------|----------|
-| 1 | Migration EnableExtensions (vector, pg_trgm) | MET | `20260714120001_enable_extensions.exs` |
-| 2 | Migration CreateSources w/ unique `[:source_type, :identifier]` | MET | `20260714120002_create_sources.exs` |
-| 3 | Migration CreateChunks: tsv generated column, embedding vector(384), unique [source_id, chunk_key], btree indexes | MET | `20260714120003_create_chunks.exs` — raw `execute` for `tsv ... STORED`, `vector, size: 384`, unique+btree indexes present |
-| 4 | Migration CreateChunkSearchIndexes: disable_ddl_transaction/migration_lock, maintenance_work_mem, HNSW+GIN CONCURRENTLY | MET | `20260714120004_create_chunk_search_indexes.exs` matches all specifics (m=16, ef_construction=64) |
-| 5 | Migration CreateSyncStates 1:1, cursor jsonb, status | MET | `20260714120005_create_sync_states.exs` |
-| 6 | Migration CreateSecretFindings append-only, match_hash only, chunk_id ON DELETE SET NULL | MET | `20260714120006_create_secret_findings.exs` `on_delete: :nilify_all`; schema has no raw-secret field |
-| 7 | Migration CreatePendingChunks bigserial, embedding vector(384) | MET | `20260714120007_create_pending_chunks.exs` (no `binary_id` primary_key override → default bigserial) |
-| 8 | Schemas Source/Chunk/SyncState/SecretFinding w/ tsv `writable: :never, load_in_query: false` workaround | MET | `chunk.ex` field `:tsv` exactly uses that workaround |
-| 9 | Verify: ecto.create/migrate on PG18/5433, HNSW+GIN confirmed | MET | `config/dev.exs`/`test.exs` point at port 5433; `mix test` ran migrations successfully in this session |
-
-### Phase 2 — Search context (RRF query)
-
-| # | Requirement | Status | Evidence |
-|---|-------------|--------|----------|
-| 1 | `HybridQuery.search/1` raw SQL, shared candidates CTE, vector+FTS CTEs, RRF fusion, pool 200/top_k 20, back-links only, Decimal→float | MET | `lib/retrieval_node/search/hybrid_query.ex` — `@candidate_pool 200`, `@default_top_k 20`, `candidates` CTE feeds both `vector_search`/`fts_search`, `to_float/1` handles Decimal |
-| 2 | `Search.hybrid_search/2` public API embeds via `Embedding.embed/1`, assembles back-link hits, `:embedding` opt bypass | MET | `lib/retrieval_node/search.ex` `Keyword.get_lazy(opts, :embedding, fn -> Embedding.embed(...) end)`; `Embedding` dispatcher stub in `lib/retrieval_node/embedding.ex` |
-| 3 | Verify: 3 tests pass (RRF ordering, filter isolation, back-link projection), credo/format clean | MET | `test/retrieval_node/search/hybrid_query_test.exs` — ran locally, `3 passed`; `mix format --check-formatted` exit 0 |
-
-**Summary**: 12 MET · 2 PARTIAL · 0 UNMET · 2 UNCLEAR
+Requirements Coverage: 11 MET, 4 PARTIAL, 0 UNMET, 1 UNCLEAR (source: plan file Phases 8–9)

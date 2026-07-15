@@ -42,6 +42,17 @@ defmodule RetrievalNode.Chunking do
   @spec chunk(String.t(), language) :: {:ok, [chunk]} | {:error, atom() | {atom(), term()}}
   def chunk(source, language), do: impl().chunk(source, language)
 
+  @doc """
+  True if `content` is binary rather than text: contains a NUL byte, or isn't
+  valid UTF-8. Shared by the chunking pre-flight guard (`TreeSitterImpl`) and
+  the ingest staging seam (`Ingest.PendingChunks`) — staging must catch strictly
+  MORE than the chunking guard alone, since a Postgres `text` column rejects any
+  invalid UTF-8 outright (error 22021), not just embedded NULs.
+  """
+  @spec binary_content?(String.t()) :: boolean()
+  def binary_content?(content) when is_binary(content),
+    do: String.contains?(content, <<0>>) or not String.valid?(content)
+
   @spec allowed_languages() :: [language]
   def allowed_languages, do: impl().allowed_languages()
 

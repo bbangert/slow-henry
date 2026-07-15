@@ -231,6 +231,11 @@ defmodule RetrievalNode.Ingest.Scrubber do
     end
   end
 
+  # sobelow: `source`/`report`/`dir` are self-generated random names inside a
+  # private 0700 temp dir this module creates (private_tmp_dir!/0), never
+  # caller input; System.cmd is argument-list-only with a find_executable
+  # guard on `path` — see reviews/p5-security.md.
+  # sobelow_skip ["Traversal.FileModule", "CI.System"]
   defp run_gitleaks(path, content) do
     dir = private_tmp_dir!()
     source = Path.join(dir, "content")
@@ -273,6 +278,10 @@ defmodule RetrievalNode.Ingest.Scrubber do
   # A private (0700) temp directory with an unguessable name, created exclusively
   # (mkdir! fails if the path exists → no symlink pre-plant). The 0700 dir protects
   # the secret-bearing files inside regardless of their own mode.
+  # sobelow: `dir` is a random unguessable name generated in this function
+  # (never caller input); mkdir!/chmod! create it exclusively as 0700 — see
+  # reviews/p5-security.md.
+  # sobelow_skip ["Traversal.FileModule"]
   defp private_tmp_dir! do
     name = "rn-scrub-" <> Base.url_encode64(:crypto.strong_rand_bytes(9), padding: false)
     dir = Path.join(System.tmp_dir!(), name)

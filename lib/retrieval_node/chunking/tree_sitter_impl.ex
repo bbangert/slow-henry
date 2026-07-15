@@ -112,7 +112,7 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   defp check_size(_), do: :ok
 
   defp check_binary_content(bin),
-    do: if(String.contains?(bin, <<0>>), do: {:error, :binary_content}, else: :ok)
+    do: if(RetrievalNode.Chunking.binary_content?(bin), do: {:error, :binary_content}, else: :ok)
 
   defp check_language_allowlist(lang),
     do: if(lang in @allowed_languages, do: :ok, else: {:error, :unsupported_language})

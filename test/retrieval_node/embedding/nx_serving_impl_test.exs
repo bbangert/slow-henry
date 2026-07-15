@@ -51,6 +51,27 @@ defmodule RetrievalNode.Embedding.NxServingImplTest do
       # so the epsilon floor prevented the divide-by-zero NaN.
       assert Enum.all?(result, &(&1 == 0.0))
     end
+
+    test "raises on an unpooled rank-2 (sequence x hidden) tensor instead of silently flattening it" do
+      # This is the exact shape a serving missing `output_pool: :mean_pooling`
+      # emits: sequence_length x hidden_size per-token hidden states, never
+      # pooled to a single sentence embedding. Flattening it silently would
+      # produce a 196,608-float "vector" that corrupts every downstream
+      # pgvector write instead of failing where the bug actually is.
+      tensor = Nx.broadcast(0.1, {512, 768})
+
+      assert_raise RuntimeError, ~r/output_pool: :mean_pooling/, fn ->
+        NxServingImpl.matryoshka(tensor)
+      end
+    end
+
+    test "raises on a pooled vector shorter than the target dimensionality" do
+      tensor = Nx.broadcast(0.1, {100})
+
+      assert_raise RuntimeError, ~r/at least 384 dims/, fn ->
+        NxServingImpl.matryoshka(tensor)
+      end
+    end
   end
 
   # Loads the real model + EXLA and embeds through the serving. Excluded by

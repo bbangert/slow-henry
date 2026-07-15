@@ -11,7 +11,25 @@ defmodule RetrievalNode.MixProject do
       aliases: aliases(),
       deps: deps(),
       dialyzer: dialyzer(),
+      releases: releases(),
       listeners: [Phoenix.CodeReloader]
+    ]
+  end
+
+  # Self-hosted arm64 release (see scripts/build_arm64.sh, deploy/README.md).
+  # v1 has no Erlang distribution / peer nodes, so no :cookie is configured
+  # here — rel/env.sh.eex sets RELEASE_DISTRIBUTION=none instead.
+  defp releases do
+    [
+      retrieval_node: [
+        include_executables_for: [:unix],
+        # rel/overlays (always included by default) carries rel/overlays/grammar-cache,
+        # the prefetched tree-sitter grammar cache staged by scripts/build_arm64.sh
+        # before this step runs, so it ships inside the tarball.
+        overlays: ["rel/overlays"],
+        # Emit _build/prod/retrieval_node-<vsn>.tar.gz for scripts/deploy.sh to unpack.
+        steps: [:assemble, :tar]
+      ]
     ]
   end
 
@@ -70,6 +88,10 @@ defmodule RetrievalNode.MixProject do
       {:exla, "~> 0.9"},
       {:tree_sitter_language_pack, "~> 1.12"},
       {:req, "~> 0.5"},
+      # Explicit dep: we start Finch ourselves in the supervision tree (shared
+      # Jira/Drive HTTP pool) rather than relying on it being started implicitly
+      # as a transitive dep of req/anubis_mcp.
+      {:finch, "~> 0.23"},
       {:sourceror, "~> 1.0"},
 
       # Tooling used by per-phase verification (mix credo/sobelow) and CI (dialyzer)

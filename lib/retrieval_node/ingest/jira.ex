@@ -109,7 +109,11 @@ defmodule RetrievalNode.Ingest.Jira do
       auth: {:basic, "#{cfg[:email]}:#{cfg[:api_token]}"},
       # We handle 429 ourselves ({:snooze, _}); disable Req's own retry so it
       # doesn't block for ~a minute backing off before returning.
-      retry: false
+      retry: false,
+      # Real requests share the app-wide Finch pool started in the supervision
+      # tree. Listed before the req_options() merge so a test override (a
+      # Req.Test plug) wins — Req.Test doesn't use Finch at all.
+      finch: RetrievalNode.Finch
     ]
     |> Keyword.merge(req_options())
     |> Req.new()

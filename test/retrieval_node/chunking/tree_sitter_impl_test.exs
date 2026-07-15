@@ -1,5 +1,10 @@
 defmodule RetrievalNode.Chunking.TreeSitterImplTest do
-  use ExUnit.Case, async: true
+  # The "guarded/1 without the supervisor running" describe below terminates
+  # and restarts the real, application-owned RetrievalNode.ChunkTaskSupervisor
+  # — a global supervision-tree mutation that would race any other async test
+  # relying on that supervisor being up. async: false for the whole module
+  # rather than splitting it out, to keep this file simple.
+  use ExUnit.Case, async: false
 
   alias RetrievalNode.Chunking.TreeSitterImpl, as: TSI
 
@@ -28,10 +33,8 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
     # which the Task.Supervisor logs; capture it to keep test output clean.
     @describetag capture_log: true
 
-    setup do
-      start_supervised!({Task.Supervisor, name: RetrievalNode.ChunkTaskSupervisor})
-      :ok
-    end
+    # RetrievalNode.ChunkTaskSupervisor is started by the application tree
+    # (lib/retrieval_node/application.ex) — no test-local start needed.
 
     test "passes through an {:ok, chunks} result" do
       assert {:ok, [:a, :b]} = TSI.guarded(fn -> {:ok, [:a, :b]} end)
@@ -63,10 +66,8 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
   describe "real AST chunking" do
     @describetag :integration
 
-    setup do
-      start_supervised!({Task.Supervisor, name: RetrievalNode.ChunkTaskSupervisor})
-      :ok
-    end
+    # RetrievalNode.ChunkTaskSupervisor is started by the application tree
+    # (lib/retrieval_node/application.ex) — no test-local start needed.
 
     test "chunks python at function/method boundaries with scoped breadcrumbs" do
       src = "def top():\n    return 1\n\nclass Bar:\n    def m(self):\n        return 2\n"
@@ -96,9 +97,24 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
     end
   end
 
-  # No supervisor started here — verifies guarded/1 fails closed rather than
-  # crashing the caller when RetrievalNode.ChunkTaskSupervisor is absent.
+  # The application tree owns RetrievalNode.ChunkTaskSupervisor, so this test
+  # deliberately terminates that child for its duration (restoring it via
+  # on_exit) to verify guarded/1 fails closed rather than crashing the caller
+  # when the supervisor is absent. This is exactly why the module is
+  # async: false — any concurrently running test that hit `guarded/1` while
+  # the supervisor was torn down would fail closed for an unrelated reason.
   describe "guarded/1 without the supervisor running" do
+    setup do
+      :ok =
+        Supervisor.terminate_child(RetrievalNode.Supervisor, RetrievalNode.ChunkTaskSupervisor)
+
+      on_exit(fn ->
+        Supervisor.restart_child(RetrievalNode.Supervisor, RetrievalNode.ChunkTaskSupervisor)
+      end)
+
+      :ok
+    end
+
     test "returns {:error, :chunk_supervisor_down} instead of crashing" do
       refute Process.whereis(RetrievalNode.ChunkTaskSupervisor)
       assert {:error, :chunk_supervisor_down} = TSI.guarded(fn -> {:ok, []} end)

@@ -55,8 +55,20 @@ if config_env() == :prod do
 
   config :retrieval_node, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
 
+  # Bare git mirrors used for repo ingestion (see
+  # lib/retrieval_node/ingest/git_mirror.ex). Defaults to the disk layout
+  # created by deploy/setup_postgres.sh; override via GIT_MIRROR_ROOT if a
+  # host uses a different mount for this.
+  config :retrieval_node,
+         :git_mirror_root,
+         System.get_env("GIT_MIRROR_ROOT") || "/var/lib/retrieval_node/git-mirrors"
+
   config :retrieval_node, RetrievalNodeWeb.Endpoint,
-    url: [host: host, port: 443, scheme: "https"],
+    # v1 serves plain HTTP on the LAN (see Config.HTTPS's documented
+    # LAN-only decision) — TLS termination via a tunnel is a fast-follow
+    # once auth lands, so this stays "http" until that ships instead of
+    # advertising a scheme/port the endpoint doesn't actually speak.
+    url: [host: host, port: port, scheme: "http"],
     http: [
       # Enable IPv6 and bind on all interfaces.
       # Set it to  {0, 0, 0, 0, 0, 0, 0, 1} for local network only access.

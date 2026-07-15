@@ -1,5 +1,6 @@
 defmodule RetrievalNode.Ingest.PipelineTest do
-  # async: false — starts a (manual-mode) Oban instance and shares the SQL sandbox.
+  # async: false — shares the SQL sandbox with the (manual-mode) Oban instance
+  # that the application tree starts.
   use RetrievalNode.DataCase, async: false
   use Oban.Testing, repo: RetrievalNode.Repo
 
@@ -11,7 +12,6 @@ defmodule RetrievalNode.Ingest.PipelineTest do
   @aws_key "AKIA1234567890ABCDEF"
 
   setup do
-    start_supervised!({Oban, Application.fetch_env!(:retrieval_node, Oban)})
     source = Repo.insert!(%Source{source_type: :git_repo, name: "app", identifier: "acme/app"})
     %{source: source}
   end

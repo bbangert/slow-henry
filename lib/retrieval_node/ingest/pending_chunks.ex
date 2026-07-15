@@ -10,7 +10,9 @@ defmodule RetrievalNode.Ingest.PendingChunks do
   """
 
   import Ecto.Query
+  require Logger
 
+  alias RetrievalNode.Chunking
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.PendingChunk
 
@@ -18,35 +20,54 @@ defmodule RetrievalNode.Ingest.PendingChunks do
   Bulk-insert freshly-discovered raw rows in a single `insert_all` (one round-trip,
   atomic). Rows come from the internal `*Sync` clients; NOT NULL constraints at the
   DB enforce required fields (a malformed row raises → the Oban job retries).
-  Returns `{:ok, ids}` (the inserted ids, so callers can enqueue a `ChunkFiles`
-  job per row).
+
+  A row whose `raw_content` is binary (`Chunking.binary_content?/1`) is dropped
+  here, before it ever reaches the `text` column — Postgres rejects invalid UTF-8
+  outright (error 22021), which would otherwise crash the whole insert (and the
+  calling `*Sync` job) over a single bad file. This is the single choke point all
+  `*Sync` workers insert through, so the guard applies uniformly without each
+  worker re-implementing it. Returns `{:ok, ids}` for the rows actually inserted
+  (skipped rows have no id — callers enqueue `ChunkFiles` per returned id, so a
+  skipped row correctly gets no chunking job).
   """
   @spec insert_raw_all([map()]) :: {:ok, [integer()]}
   def insert_raw_all(rows) do
     now = DateTime.utc_now()
+    {skipped, kept} = Enum.split_with(rows, &binary?/1)
 
-    entries =
-      Enum.map(rows, fn attrs ->
-        # Map.get (not dot access) so a missing key becomes nil → a consistent DB
-        # NOT NULL failure, rather than a KeyError before we ever reach the DB.
-        %{
-          source: Map.get(attrs, :source),
-          source_id: Map.get(attrs, :source_id),
-          source_type: Map.get(attrs, :source_type),
-          repo: Map.get(attrs, :repo),
-          lang: Map.get(attrs, :lang),
-          natural_key: Map.get(attrs, :natural_key),
-          content_hash: Map.get(attrs, :content_hash),
-          raw_content: Map.get(attrs, :raw_content),
-          metadata: Map.get(attrs, :metadata, %{}),
-          status: "raw",
-          inserted_at: now,
-          updated_at: now
-        }
-      end)
+    Enum.each(skipped, &log_skip/1)
+
+    entries = Enum.map(kept, &entry(&1, now))
 
     {_count, rows} = Repo.insert_all(PendingChunk, entries, returning: [:id])
     {:ok, Enum.map(rows, & &1.id)}
+  end
+
+  defp binary?(attrs), do: Chunking.binary_content?(Map.get(attrs, :raw_content) || "")
+
+  defp log_skip(attrs) do
+    Logger.info(
+      "skipping binary content, not staged: natural_key=#{inspect(Map.get(attrs, :natural_key))}"
+    )
+  end
+
+  defp entry(attrs, now) do
+    # Map.get (not dot access) so a missing key becomes nil → a consistent DB
+    # NOT NULL failure, rather than a KeyError before we ever reach the DB.
+    %{
+      source: Map.get(attrs, :source),
+      source_id: Map.get(attrs, :source_id),
+      source_type: Map.get(attrs, :source_type),
+      repo: Map.get(attrs, :repo),
+      lang: Map.get(attrs, :lang),
+      natural_key: Map.get(attrs, :natural_key),
+      content_hash: Map.get(attrs, :content_hash),
+      raw_content: Map.get(attrs, :raw_content),
+      metadata: Map.get(attrs, :metadata, %{}),
+      status: "raw",
+      inserted_at: now,
+      updated_at: now
+    }
   end
 
   @doc "Insert a single raw row, returning the persisted record."

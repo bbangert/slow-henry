@@ -1,5 +1,6 @@
 defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
-  # async: false — starts Oban (manual) + mutates :git_mirror_root; real git.
+  # async: false — mutates :git_mirror_root; shares the SQL sandbox with the
+  # (manual-mode) Oban instance the application tree starts; real git.
   use RetrievalNode.DataCase, async: false
   use Oban.Testing, repo: RetrievalNode.Repo
 
@@ -8,8 +9,6 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
   alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source, SyncState}
 
   setup do
-    start_supervised!({Oban, Application.fetch_env!(:retrieval_node, Oban)})
-
     root = Path.join(System.tmp_dir!(), "reposync-#{System.unique_integer([:positive])}")
     prev = Application.get_env(:retrieval_node, :git_mirror_root)
     Application.put_env(:retrieval_node, :git_mirror_root, Path.join(root, "mirrors"))
@@ -125,6 +124,35 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     raw = Repo.one!(from p in PendingChunk, where: p.status == "raw")
     assert raw.natural_key == "repo:#{ctx.source.id}:mod.py"
     assert raw.raw_content =~ "return 42"
+    assert_enqueued(worker: ChunkFiles)
+  end
+
+  test "a repo with a binary file skips it — text file still staged, job still completes", ctx do
+    # Reproduces the real bug: a tracked binary (e.g. favicon.ico) must not crash
+    # the whole sync job by way of an invalid-UTF-8 insert into the text column.
+    File.write!(Path.join(ctx.src, "favicon.ico"), <<0, 255, 216, 0>>)
+    commit(ctx.src, [{"app.py", "def a(): pass\n"}])
+
+    assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+    raws = Repo.all(from p in PendingChunk, where: p.status == "raw")
+    assert Enum.map(raws, & &1.natural_key) == ["repo:#{ctx.source.id}:app.py"]
+    assert_enqueued(worker: ChunkFiles)
+
+    # watermark still advances past the binary file — it isn't retried forever
+    head = String.trim(git!(ctx.src, ["rev-parse", "HEAD"]))
+    state = Repo.get_by!(SyncState, source_id: ctx.source.id)
+    assert state.cursor["last_sha"] == head
+  end
+
+  test "a repo with invalid-UTF-8-but-no-NUL content skips that file too", ctx do
+    File.write!(Path.join(ctx.src, "mystery.bin"), <<255, 254>> <> "not valid utf8")
+    commit(ctx.src, [{"app.py", "def a(): pass\n"}])
+
+    assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+    raws = Repo.all(from p in PendingChunk, where: p.status == "raw")
+    assert Enum.map(raws, & &1.natural_key) == ["repo:#{ctx.source.id}:app.py"]
     assert_enqueued(worker: ChunkFiles)
   end
 end

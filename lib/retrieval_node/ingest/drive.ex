@@ -115,7 +115,11 @@ defmodule RetrievalNode.Ingest.Drive do
       base_url: cfg[:base_url] || "https://www.googleapis.com",
       auth: {:bearer, cfg[:access_token] || ""},
       # We handle 429 ourselves ({:snooze, _}); disable Req's own retry.
-      retry: false
+      retry: false,
+      # Real requests share the app-wide Finch pool started in the supervision
+      # tree. Listed before the req_options() merge so a test override (a
+      # Req.Test plug) wins — Req.Test doesn't use Finch at all.
+      finch: RetrievalNode.Finch
     ]
     |> Keyword.merge(req_options())
     |> Req.new()

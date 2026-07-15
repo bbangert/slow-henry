@@ -39,6 +39,39 @@ defmodule RetrievalNode.Ingest.PendingChunksTest do
     assert Repo.aggregate(PendingChunk, :count, :id) == 0
   end
 
+  test "insert_raw_all skips a row whose raw_content has a NUL byte (never reaches Postgres)" do
+    good = raw_attrs()
+
+    binary =
+      raw_attrs(%{natural_key: "repo:acme/app:favicon.ico", raw_content: <<0, 255, 216, 0>>})
+
+    assert {:ok, ids} = PendingChunks.insert_raw_all([good, binary])
+
+    assert length(ids) == 1
+    assert Repo.aggregate(PendingChunk, :count, :id) == 1
+    assert Repo.one!(PendingChunk).natural_key == good.natural_key
+  end
+
+  test "insert_raw_all skips invalid-UTF-8 content even without a NUL byte" do
+    good = raw_attrs()
+
+    invalid =
+      raw_attrs(%{natural_key: "repo:acme/app:mystery.bin", raw_content: <<255, 254>> <> "text"})
+
+    assert {:ok, ids} = PendingChunks.insert_raw_all([good, invalid])
+
+    assert length(ids) == 1
+    assert Repo.aggregate(PendingChunk, :count, :id) == 1
+    assert Repo.one!(PendingChunk).natural_key == good.natural_key
+  end
+
+  test "insert_raw_all skipping every row is a no-op insert, not an error" do
+    binary = raw_attrs(%{raw_content: <<0, 1, 2>>})
+
+    assert {:ok, []} = PendingChunks.insert_raw_all([binary])
+    assert Repo.aggregate(PendingChunk, :count, :id) == 0
+  end
+
   test "write_chunks splits a raw row into N chunk rows sharing natural_key/content_hash" do
     {:ok, raw} = PendingChunks.insert_raw(raw_attrs())
 

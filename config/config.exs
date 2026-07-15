@@ -58,6 +58,13 @@ config :retrieval_node, RetrievalNode.Embedding.Serving,
   sequence_length: 512,
   batch_timeout_ms: 50
 
+# EXLA as the global Nx default backend — without this, any tensor op NOT
+# routed through the serving's own `defn_options: [compiler: EXLA]` (e.g. the
+# Matryoshka truncation math in NxServingImpl) would silently run on
+# Nx.BinaryBackend, 10-100x slower on the arm64 deploy target. `/healthz`'s
+# `nx_backend` gate asserts this stayed set (design-build.md §4 step 2).
+config :nx, default_backend: EXLA.Backend
+
 # Configures the endpoint
 config :retrieval_node, RetrievalNodeWeb.Endpoint,
   url: [host: "localhost"],
