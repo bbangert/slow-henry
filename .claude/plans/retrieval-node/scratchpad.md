@@ -2,6 +2,13 @@
 
 Companion to `plan.md`. Records why things are the way they are, and paths NOT taken.
 
+## [2026-07-15] MERGED — PR #8 → `main` @ `2a1986c`. Plan fully shipped.
+
+Phases 8+9 merged after a 5-agent internal review (all findings fixed) plus
+three Copilot rounds (13 fixed, 1 declined). Final: 182 tests, credo/dialyzer/
+format/sobelow clean. The section below records the pre-merge completion state;
+the "Manual residuals" list is now the only outstanding work.
+
 ## [2026-07-15] PLAN COMPLETE — Phases 8+9 done, all 63 tasks checked
 
 All gates green: 175 tests (+2 real-model `:integration`), credo --strict, format,
