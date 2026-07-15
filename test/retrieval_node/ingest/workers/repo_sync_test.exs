@@ -155,4 +155,65 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     assert Enum.map(raws, & &1.natural_key) == ["repo:#{ctx.source.id}:app.py"]
     assert_enqueued(worker: ChunkFiles)
   end
+
+  test "a repo with a submodule syncs the real files and skips the gitlink entirely", ctx do
+    sub = Path.join(System.tmp_dir!(), "reposync-sub-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(sub)
+    on_exit(fn -> File.rm_rf(sub) end)
+    git!(sub, ["init", "-q"])
+    git!(sub, ["config", "user.email", "t@t"])
+    git!(sub, ["config", "user.name", "t"])
+    File.write!(Path.join(sub, "f.txt"), "hi\n")
+    git!(sub, ["add", "."])
+    git!(sub, ["commit", "-qm", "sub"])
+    sub_sha = String.trim(git!(sub, ["rev-parse", "HEAD"]))
+
+    commit(ctx.src, [{"app.py", "def a(): pass\n"}])
+    git!(ctx.src, ["update-index", "--add", "--cacheinfo", "160000,#{sub_sha},sublib"])
+    git!(ctx.src, ["commit", "-qm", "add submodule"])
+
+    assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+    raws = Repo.all(from p in PendingChunk, where: p.status == "raw")
+    assert Enum.map(raws, & &1.natural_key) == ["repo:#{ctx.source.id}:app.py"]
+    assert_enqueued(worker: ChunkFiles)
+
+    # no staged row (and no ChunkFiles job) for the gitlink path
+    refute Repo.get_by(PendingChunk, natural_key: "repo:#{ctx.source.id}:sublib")
+
+    # job completed (didn't retry-forever the way a job-fatal submodule would),
+    # and the watermark advanced past the submodule commit
+    head = String.trim(git!(ctx.src, ["rev-parse", "HEAD"]))
+    state = Repo.get_by!(SyncState, source_id: ctx.source.id)
+    assert state.cursor["last_sha"] == head
+  end
+
+  test "an empty repo (no commits) completes as a no-op — no rows, no watermark", ctx do
+    # ctx.src was git-init'd by setup but nothing was ever committed to it.
+    assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+    assert Repo.aggregate(from(p in PendingChunk), :count, :id) == 0
+    refute_enqueued(worker: ChunkFiles)
+
+    state = Repo.get_by!(SyncState, source_id: ctx.source.id)
+    assert state.cursor == %{}
+    assert is_nil(Map.get(state.cursor, "last_sha"))
+  end
+
+  test "a repo that starts empty and later gains commits syncs normally on the next tick", ctx do
+    assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+    state = Repo.get_by!(SyncState, source_id: ctx.source.id)
+    assert state.cursor == %{}
+
+    commit(ctx.src, [{"a.py", "def a(): pass\n"}])
+
+    assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+    raws = Repo.all(from p in PendingChunk, where: p.status == "raw")
+    assert Enum.map(raws, & &1.natural_key) == ["repo:#{ctx.source.id}:a.py"]
+
+    head = String.trim(git!(ctx.src, ["rev-parse", "HEAD"]))
+    state = Repo.get_by!(SyncState, source_id: ctx.source.id)
+    assert state.cursor["last_sha"] == head
+  end
 end

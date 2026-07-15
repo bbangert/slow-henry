@@ -30,6 +30,7 @@ defmodule RetrievalNode.Ingest.GitMirror do
           | :invalid_url
           | :file_too_large
           | :git_timeout
+          | :empty_repo
           | {:git, integer(), String.t()}
 
   # A ref/sha that cannot be mistaken for a git option: alphanumeric start, then
@@ -86,48 +87,79 @@ defmodule RetrievalNode.Ingest.GitMirror do
     end
   end
 
-  @doc "Resolve a ref (default HEAD) to its commit sha."
+  @doc """
+  Resolve a ref (default HEAD) to its commit sha. A brand-new repo with no
+  commits yet has no `HEAD` to resolve — `rev-parse --verify HEAD` exits 128 on
+  that unborn-branch state, which is a normal, deterministic outcome (not a git
+  failure) so it's classified separately as `{:error, :empty_repo}` rather than
+  the raw `{:git, 128, _}` tuple, letting callers no-op instead of retrying
+  forever. Only checked for the default `ref == "HEAD"` case — an explicit,
+  unresolvable custom ref against a non-empty repo is still a plain git error.
+  """
   @spec head_sha(repo, String.t()) :: {:ok, String.t()} | {:error, reason}
   def head_sha(slug, ref \\ "HEAD") do
     with {:ok, ref} <- safe_ref(ref),
-         {:ok, path} <- mirror_path(slug),
-         # `--verify` makes rev-parse emit only the resolved sha (plain rev-parse
-         # echoes the --end-of-options token itself).
-         {:ok, out} <- git(["--git-dir", path, "rev-parse", "--verify", "--end-of-options", ref]) do
-      {:ok, String.trim(out)}
+         {:ok, path} <- mirror_path(slug) do
+      # `--verify` makes rev-parse emit only the resolved sha (plain rev-parse
+      # echoes the --end-of-options token itself).
+      case git(["--git-dir", path, "rev-parse", "--verify", "--end-of-options", ref]) do
+        {:ok, out} -> {:ok, String.trim(out)}
+        {:error, {:git, _code, _msg} = reason} -> unresolvable_head(path, ref, reason)
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  defp unresolvable_head(path, "HEAD", reason) do
+    if empty_repo?(path), do: {:error, :empty_repo}, else: {:error, reason}
+  end
+
+  defp unresolvable_head(_path, _ref, reason), do: {:error, reason}
+
+  # Robust "is this repo empty" probe: `--count --all` over every ref (not just
+  # HEAD) is 0 only when the object DB genuinely has no commits reachable from
+  # anywhere — a repo with commits on some other branch but a detached/missing
+  # HEAD is a different (still-erroring) situation, not this one.
+  defp empty_repo?(path) do
+    case git(["--git-dir", path, "rev-list", "--count", "--all"]) do
+      {:ok, out} -> String.trim(out) == "0"
+      _ -> false
     end
   end
 
   @doc """
   Files changed between two shas. With `old_sha == nil` (first sync) returns every
-  file at `new_sha` (`ls-tree`); otherwise the `diff --name-only` between them.
+  file at `new_sha` (`ls-tree`); otherwise the `diff --raw` between them.
+
+  Both variants are **blob-only**: a gitlink entry (a submodule reference, mode
+  `160000`) points at a commit object in a different repo entirely, not a blob in
+  this one — `show/3` has nothing to read there (`git show HEAD:<path>` exits
+  non-zero). `ls-tree`'s type column and `diff --raw`'s mode columns are what let
+  us tell a gitlink from a real file (`--name-only`/`--name-status` alone can't),
+  so submodules are filtered out here, before any caller ever tries to fetch one.
   """
   @spec changed_files(repo, String.t() | nil, String.t()) ::
           {:ok, [String.t()]} | {:error, reason}
   def changed_files(slug, nil, new_sha) do
     with {:ok, new_sha} <- safe_ref(new_sha),
          {:ok, path} <- mirror_path(slug),
-         {:ok, out} <-
-           git(["--git-dir", path, "ls-tree", "-r", "--name-only", "--end-of-options", new_sha]) do
-      {:ok, lines(out)}
+         {:ok, out} <- git(["--git-dir", path, "ls-tree", "-r", "--end-of-options", new_sha]) do
+      {:ok, parse_ls_tree(lines(out))}
     end
   end
 
   def changed_files(slug, old_sha, new_sha) do
-    with {:ok, old_sha} <- safe_ref(old_sha),
-         {:ok, new_sha} <- safe_ref(new_sha),
-         {:ok, path} <- mirror_path(slug),
-         {:ok, out} <-
-           git(["--git-dir", path, "diff", "--name-only", "--end-of-options", old_sha, new_sha]) do
-      {:ok, lines(out)}
+    with {:ok, entries} <- diff_raw_entries(slug, old_sha, new_sha) do
+      {:ok, Enum.map(entries, &entry_path/1)}
     end
   end
 
   @doc """
   Like `changed_files/3` but tags each path with its change status so callers can
   tell a **true deletion** from a still-present file. First sync (`old_sha == nil`)
-  is every file as `:added`; otherwise `diff --name-status` (a rename `R` becomes
-  `:deleted` old + `:added` new, a copy `C` becomes `:added` new).
+  is every file as `:added`; otherwise `diff --raw` (a rename `R` becomes
+  `:deleted` old + `:added` new, a copy `C` becomes `:added` new). Gitlink
+  (submodule) entries are filtered out — see `changed_files/3`.
   """
   @spec changed_entries(repo, String.t() | nil, String.t()) ::
           {:ok, [{:added | :modified | :deleted, String.t()}]} | {:error, reason}
@@ -138,27 +170,83 @@ defmodule RetrievalNode.Ingest.GitMirror do
   end
 
   def changed_entries(slug, old_sha, new_sha) do
+    with {:ok, entries} <- diff_raw_entries(slug, old_sha, new_sha) do
+      {:ok, Enum.flat_map(entries, &entry_statuses/1)}
+    end
+  end
+
+  defp diff_raw_entries(slug, old_sha, new_sha) do
     with {:ok, old_sha} <- safe_ref(old_sha),
          {:ok, new_sha} <- safe_ref(new_sha),
          {:ok, path} <- mirror_path(slug),
          {:ok, out} <-
-           git(["--git-dir", path, "diff", "--name-status", "--end-of-options", old_sha, new_sha]) do
-      {:ok, parse_name_status(lines(out))}
+           git(["--git-dir", path, "diff", "--raw", "--end-of-options", old_sha, new_sha]) do
+      {:ok, parse_diff_raw(lines(out))}
     end
   end
 
-  # Each --name-status line is `<STATUS>\t<path>` (rename/copy: `<STATUS>\t<old>\t<new>`).
-  defp parse_name_status(lines) do
+  # ls-tree (no --name-only) line: `<mode> <type> <sha>\t<path>`. `-r` already
+  # recurses into subtrees, so the only types seen are `blob` (a real file) and
+  # `commit` (a gitlink/submodule) — never `tree`.
+  defp parse_ls_tree(lines) do
+    Enum.flat_map(lines, &ls_tree_line/1)
+  end
+
+  defp ls_tree_line(line) do
+    case String.split(line, "\t") do
+      [meta, path] -> ls_tree_entry(meta, path)
+      _ -> []
+    end
+  end
+
+  defp ls_tree_entry(meta, path) do
+    case String.split(meta, " ", trim: true) do
+      [_mode, "blob", _sha] -> [path]
+      _ -> []
+    end
+  end
+
+  # --raw line: `:<old_mode> <new_mode> <old_sha> <new_sha> <status>[score]\t<path>`
+  # (rename/copy: a second `\t<new_path>` column). Entries where either mode is a
+  # gitlink (160000) are dropped outright — on either side of a rename/copy too,
+  # since a "submodule renamed to submodule" is still nothing `show/3` can read.
+  defp parse_diff_raw(lines) do
     Enum.flat_map(lines, fn line ->
       case String.split(line, "\t") do
-        ["D", path] -> [{:deleted, path}]
-        [<<"R", _::binary>>, old, new] -> [{:deleted, old}, {:added, new}]
-        [<<"C", _::binary>>, _old, new] -> [{:added, new}]
-        [_status, path] -> [{:modified, path}]
+        [meta, path] -> raw_entry(meta, path, path)
+        [meta, old_path, new_path] -> raw_entry(meta, old_path, new_path)
         _ -> []
       end
     end)
   end
+
+  defp raw_entry(meta, old_path, new_path) do
+    case meta |> String.trim_leading(":") |> String.split(" ", trim: true) do
+      [old_mode, new_mode, _old_sha, _new_sha, status] ->
+        if old_mode == "160000" or new_mode == "160000" do
+          []
+        else
+          [{status, old_path, new_path}]
+        end
+
+      _ ->
+        []
+    end
+  end
+
+  # D has no "new" side to point at; every other status (A/M/R/C) reports the
+  # current (new) path — matching plain `diff --name-only`'s behavior for renames
+  # (only the new path is listed).
+  defp entry_path({"D", old_path, _new_path}), do: old_path
+  defp entry_path({_status, _old_path, new_path}), do: new_path
+
+  defp entry_statuses({"D", old_path, _new_path}), do: [{:deleted, old_path}]
+
+  defp entry_statuses({<<"R", _::binary>>, old_path, new_path}),
+    do: [{:deleted, old_path}, {:added, new_path}]
+
+  defp entry_statuses({<<"C", _::binary>>, _old_path, new_path}), do: [{:added, new_path}]
+  defp entry_statuses({_status, _old_path, new_path}), do: [{:modified, new_path}]
 
   @doc "Return a file's exact bytes at `ref` (default HEAD). The sole full-content path."
   @spec show(repo, String.t(), String.t()) :: {:ok, String.t()} | {:error, reason}

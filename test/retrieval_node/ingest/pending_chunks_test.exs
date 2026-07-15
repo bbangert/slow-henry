@@ -72,6 +72,58 @@ defmodule RetrievalNode.Ingest.PendingChunksTest do
     assert Repo.aggregate(PendingChunk, :count, :id) == 0
   end
 
+  test "insert_raw_all batches >2,000 rows at the real default batch size, preserving id order" do
+    # Regression for the Postgres 65,535-bind-parameter ceiling (issue #9): a
+    # single insert_all over ~12 params/row tops out around ~5,400 rows. 2,500
+    # rows forces the real default batch size (2,000) to split into two actual
+    # `insert_all` round-trips — no config override needed to hit that path.
+    rows = for i <- 1..2_500, do: raw_attrs(%{natural_key: "repo:acme/app:file#{i}.ex"})
+
+    assert {:ok, ids} = PendingChunks.insert_raw_all(rows)
+    assert length(ids) == 2_500
+    assert Repo.aggregate(PendingChunk, :count, :id) == 2_500
+
+    # ids must come back in the same order as the input rows — batch
+    # concatenation must not reorder or interleave.
+    natural_key_by_id = Repo.all(PendingChunk) |> Map.new(&{&1.id, &1.natural_key})
+
+    assert Enum.map(ids, &natural_key_by_id[&1]) ==
+             Enum.map(1..2_500, &"repo:acme/app:file#{&1}.ex")
+  end
+
+  test "insert_raw_all's binary-content guard still applies across a batch boundary" do
+    prev = Application.get_env(:retrieval_node, :insert_raw_batch_size)
+    Application.put_env(:retrieval_node, :insert_raw_batch_size, 3)
+
+    on_exit(fn ->
+      case prev do
+        nil -> Application.delete_env(:retrieval_node, :insert_raw_batch_size)
+        val -> Application.put_env(:retrieval_node, :insert_raw_batch_size, val)
+      end
+    end)
+
+    # 8 rows over a batch size of 3 spans three batches; the binary row sits in
+    # the middle one, so the guard (which runs on the FULL set before chunking)
+    # must still catch it rather than only checking within-batch.
+    rows =
+      for i <- 1..8 do
+        if i == 5 do
+          raw_attrs(%{natural_key: "repo:acme/app:bin#{i}.ico", raw_content: <<0, 1, 2>>})
+        else
+          raw_attrs(%{natural_key: "repo:acme/app:file#{i}.ex"})
+        end
+      end
+
+    assert {:ok, ids} = PendingChunks.insert_raw_all(rows)
+    assert length(ids) == 7
+    assert Repo.aggregate(PendingChunk, :count, :id) == 7
+    refute Repo.get_by(PendingChunk, natural_key: "repo:acme/app:bin5.ico")
+
+    natural_key_by_id = Repo.all(PendingChunk) |> Map.new(&{&1.id, &1.natural_key})
+    expected = for i <- 1..8, i != 5, do: "repo:acme/app:file#{i}.ex"
+    assert Enum.map(ids, &natural_key_by_id[&1]) == expected
+  end
+
   test "write_chunks splits a raw row into N chunk rows sharing natural_key/content_hash" do
     {:ok, raw} = PendingChunks.insert_raw(raw_attrs())
 
