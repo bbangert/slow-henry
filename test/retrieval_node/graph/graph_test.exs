@@ -175,7 +175,7 @@ defmodule RetrievalNode.GraphTest do
           assert :ok = perform_job(UpsertChunks, %{"pending_chunk_ids" => ids})
         end)
 
-      assert log =~ "oversized graph symbol"
+      assert log =~ "graph symbol"
 
       names = Repo.all(from e in Entity, select: e.qualified_name)
       assert "a" in names
@@ -211,10 +211,67 @@ defmodule RetrievalNode.GraphTest do
           assert {:ok, _counts} = Graph.upsert_from_staged(Repo, [staged_row], %{})
         end)
 
-      assert log =~ "oversized graph symbol"
+      assert log =~ "graph symbol"
 
       names = Repo.all(from e in Entity, select: e.qualified_name)
       assert Enum.sort(names) == ["a", "b"]
+    end
+
+    test "a non-list entities container, a nil references container, a missing kind, and a non-binary kind are all dropped without raising; valid siblings persist",
+         %{source: source} do
+      import ExUnit.CaptureLog
+
+      # Row 1 — container-shape drops: "entities" present but not a list,
+      # "references" present but nil. Both containers are treated as empty
+      # (counted as one dropped container each) instead of raising on
+      # Enum.filter/length.
+      container_row = %{
+        source_id: source.id,
+        lang: "python",
+        chunk_key: "shape-chunk-container",
+        natural_key: "nk-shape-container",
+        metadata: %{"path" => "container.py"},
+        graph: %{
+          "entities" => "not-a-list",
+          "references" => nil
+        }
+      }
+
+      # Row 2 — element kind-shape drops: an entity missing "kind" entirely,
+      # and a reference whose "kind" is a non-binary (123). Both survive the
+      # name check but must still be dropped by the kind gate, not raise
+      # downstream in kind_atom/3 (KeyError/FunctionClauseError).
+      kind_row = %{
+        source_id: source.id,
+        lang: "python",
+        chunk_key: "shape-chunk-kind",
+        natural_key: "nk-shape-kind",
+        metadata: %{"path" => "kind.py"},
+        graph: %{
+          "entities" => [
+            %{"qualified_name" => "valid_entity", "kind" => "function"},
+            %{"qualified_name" => "no_kind_entity"}
+          ],
+          "references" => [
+            %{"name" => "valid_ref", "kind" => "call", "from" => "valid_entity"},
+            %{"name" => "bad_kind_ref", "kind" => 123, "from" => "valid_entity"}
+          ]
+        }
+      }
+
+      log =
+        capture_log(fn ->
+          assert {:ok, _counts} =
+                   Graph.upsert_from_staged(Repo, [container_row, kind_row], %{})
+        end)
+
+      assert log =~ "graph symbol"
+
+      names = Repo.all(from e in Entity, select: e.qualified_name)
+      assert "valid_entity" in names
+      assert "valid_ref" in names
+      refute "no_kind_entity" in names
+      refute "bad_kind_ref" in names
     end
   end
 
@@ -424,19 +481,8 @@ defmodule RetrievalNode.GraphTest do
   end
 
   describe "language-scoped entity binding" do
-    test "a same-named entity in another language is never bound to by a python file's mentions/edges",
+    test "a same-named entity in another language is never bound to by a python file's re-resolved mentions, even when it was inserted later (physically after) the python entity",
          %{source: source} do
-      js_entity =
-        Repo.insert!(%Entity{
-          source_id: source.id,
-          language: "javascript",
-          qualified_name: "setup",
-          kind: :function
-        })
-
-      js_chunk = seed_chunk(source, "existing.js", "js-chunk-key")
-      js_mention = seed_mention(js_entity, js_chunk, :definition)
-
       force_chunk_with_graph(
         {:ok,
          %{
@@ -455,23 +501,78 @@ defmodule RetrievalNode.GraphTest do
          }}
       )
 
+      # 1) Run the pipeline for a python file that both defines and calls
+      # "setup" — creates the python entity plus its definition + call
+      # mentions, on chunk_key sha256("repo:acme/app:app.py|0|a").
       run_pipeline(seed_raw(source, "def a():\n    setup()\n"))
 
       python_setup =
         Repo.get_by!(Entity, source_id: source.id, language: "python", qualified_name: "setup")
 
-      assert python_setup.id != js_entity.id
+      # 2) Insert the JS "setup" entity directly, AFTER the python one, so it
+      # has the later (higher) physical insertion order. This is the crux of
+      # the regression: the pre-fix resolve_entity_ids/4 filtered its
+      # select-back only on source_id + qualified_name (no language), then
+      # did Map.new/1 (last-wins) over whatever row order Postgres returned
+      # for an unordered `SELECT ... WHERE qualified_name IN (...)`. For a
+      # freshly-populated, never-updated table, a sequential scan
+      # overwhelmingly returns rows in insertion (heap) order — python first,
+      # js second here — so the pre-fix last-wins map would deterministically
+      # pick the JS row. That's the best determinism a black-box test can
+      # offer against an unordered SELECT: it's a strong probabilistic
+      # argument from Postgres's actual scan behavior on a small, freshly
+      # written table, not a guarantee enforced by the SQL standard.
+      js_entity =
+        Repo.insert!(%Entity{
+          source_id: source.id,
+          language: "javascript",
+          qualified_name: "setup",
+          kind: :function
+        })
 
-      # the python file's mentions bind to the new python entity, not the js one
-      python_mentions =
-        Repo.all(from m in EntityMention, where: m.entity_id == ^python_setup.id)
+      # 3) Re-resolve "setup" for the SAME chunk from step 1, without
+      # re-declaring the python entity — a staged row carrying only a NEW
+      # reference (no "entities"), targeting the real chunk id via
+      # chunk_ids_by_key, called directly against Graph.upsert_from_staged/3
+      # (the same function UpsertChunks calls). This re-triggers
+      # resolve_entity_ids/4 for "setup" with both rows now in the table,
+      # WITHOUT upserting/touching the python row again: collect_definitions
+      # is empty here, and the reference-only entity upsert for "setup" hits
+      # on_conflict: :nothing against the pre-existing python row, leaving
+      # its physical position exactly as step 1 left it (deliberately —
+      # re-running the full pipeline instead would re-upsert the python
+      # entity with on_conflict: {:replace, ...}, physically repositioning
+      # its row tuple after the just-inserted js row and accidentally making
+      # even the pre-fix seq-scan order favor python again, masking the bug).
+      [chunk] = Repo.all(from c in Chunk, where: c.source_id == ^source.id)
 
-      assert python_mentions != []
+      reresolve_row = %{
+        source_id: source.id,
+        lang: "python",
+        chunk_key: "reresolve-setup-chunk-key",
+        natural_key: "nk-reresolve-setup",
+        metadata: %{"path" => "app.py"},
+        graph: %{
+          "entities" => [],
+          "references" => [%{"name" => "setup", "kind" => "call", "from" => "a"}]
+        }
+      }
 
-      # the js entity's own mention is completely untouched
-      assert Repo.all(from m in EntityMention, where: m.entity_id == ^js_entity.id) == [
-               js_mention
-             ]
+      assert {:ok, _counts} =
+               Graph.upsert_from_staged(Repo, [reresolve_row], %{
+                 "reresolve-setup-chunk-key" => chunk.id
+               })
+
+      chunk_mentions = Repo.all(from m in EntityMention, where: m.chunk_id == ^chunk.id)
+
+      assert chunk_mentions != []
+
+      # every re-resolved mention of "setup" on this chunk binds to the
+      # python entity —
+      assert Enum.all?(chunk_mentions, &(&1.entity_id == python_setup.id))
+
+      # — and the js entity, inserted later, has zero mentions.
+      assert Repo.all(from m in EntityMention, where: m.entity_id == ^js_entity.id) == []
     end
   end
 

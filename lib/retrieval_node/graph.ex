@@ -458,30 +458,45 @@ defmodule RetrievalNode.Graph do
   # the whole UpsertChunks job, losing every chunk in the file. Dropped with a
   # warning rather than raised: junk symbols must never take real chunks down.
   #
-  # Shape, not just size, is validated here: a non-map element or a
-  # missing/non-binary name would otherwise reach collect_definitions'/
-  # collect_reference_entities' Map.fetch!("qualified_name"/"name") calls
-  # below and raise there instead — rolling back the same Multi this
-  # sanitizer exists to protect. Every element surviving sanitize_graph/1 is
-  # guaranteed to be a map with a binary name field within @max_symbol_bytes,
-  # which is what makes those later Map.fetch! calls safe by construction.
+  # Shape, not just size, is validated here — at two levels:
+  #
+  #   1. Container: `"entities"`/`"references"` themselves must be lists.
+  #      `graph` is jsonb, so nothing upstream of this function guarantees
+  #      that — a present-but-non-list value (`null`, a string, an object)
+  #      would otherwise reach `Enum.filter/2`/`length/1` below and raise.
+  #   2. Element: a non-map element, or a missing/non-binary name or kind,
+  #      would otherwise reach collect_definitions'/collect_reference_entities'
+  #      `Map.fetch!("qualified_name"/"name"/"kind")` calls and raise there
+  #      instead — rolling back the same Multi this sanitizer exists to
+  #      protect.
+  #
+  # Both raise inside the same Multi transaction, so both are dropped with a
+  # warning instead: junk symbols (or a malformed container) must never take
+  # real chunks down. A non-list container's contents can't be individually
+  # counted (there's nothing to iterate), so it's counted as a single dropped
+  # container in the warning below. Every element surviving sanitize_graph/1
+  # is guaranteed to be a map with a binary name field (under `key`) AND a
+  # binary "kind" field, both within/subject to @max_symbol_bytes for the
+  # name — which is what makes those later Map.fetch! calls safe by
+  # construction (an unknown-but-binary kind still raises downstream in
+  # kind_atom/3 / ref_entity_kind/1 / etc. — deliberately, per r2).
   @max_symbol_bytes 256
 
   defp sanitize_graph(%{graph: graph} = row) when graph == %{} or is_nil(graph), do: row
 
   defp sanitize_graph(row) do
-    entities = Map.get(row.graph, "entities", [])
-    references = Map.get(row.graph, "references", [])
+    {kept_entities, entities_dropped} =
+      row.graph |> Map.get("entities", []) |> filter_symbols("qualified_name")
 
-    kept_entities = Enum.filter(entities, &valid_symbol?(&1, "qualified_name"))
-    kept_references = Enum.filter(references, &valid_symbol?(&1, "name"))
+    {kept_references, references_dropped} =
+      row.graph |> Map.get("references", []) |> filter_symbols("name")
 
-    dropped =
-      length(entities) - length(kept_entities) + (length(references) - length(kept_references))
+    dropped = entities_dropped + references_dropped
 
     if dropped > 0 do
       Logger.warning(
-        "dropping #{dropped} oversized graph symbol(s) (> #{@max_symbol_bytes} bytes) " <>
+        "dropping #{dropped} invalid or oversized graph symbol(s) " <>
+          "(non-list container, malformed shape, or > #{@max_symbol_bytes} bytes) " <>
           "from natural_key=#{inspect(row.natural_key)}"
       )
     end
@@ -496,14 +511,38 @@ defmodule RetrievalNode.Graph do
     %{row | graph: sanitized}
   end
 
+  # Normalizes a raw "entities"/"references" value before filtering: a
+  # non-list value (nil, a string, a map — anything a jsonb column doesn't
+  # constrain out) is treated as empty and its (uncountable) contents counted
+  # as exactly one dropped container, rather than reaching `Enum.filter/2` or
+  # `length/1` on a non-list and raising.
+  defp filter_symbols(value, key) do
+    case as_list(value) do
+      :invalid ->
+        {[], 1}
+
+      list ->
+        kept = Enum.filter(list, &valid_symbol?(&1, key))
+        {kept, length(list) - length(kept)}
+    end
+  end
+
+  defp as_list(list) when is_list(list), do: list
+  defp as_list(_), do: :invalid
+
   # An element survives only if it's a map carrying a binary name (under
-  # `key`) no longer than @max_symbol_bytes — a non-map element, a missing
-  # key, or a non-binary value (e.g. a `nil` qualified_name) is dropped as
-  # malformed here instead of raising on `byte_size/1` or a downstream
-  # `Map.fetch!`.
+  # `key`) no longer than @max_symbol_bytes AND a binary "kind" — a non-map
+  # element, a missing key, or a non-binary value (e.g. a `nil`
+  # qualified_name, or a `kind` that isn't a string) is dropped as malformed
+  # here instead of raising on `byte_size/1` or a downstream `Map.fetch!`/
+  # `kind_atom/3` FunctionClauseError. An unknown-but-binary kind still
+  # raises downstream, deliberately (per r2) — this gate only enforces shape.
   defp valid_symbol?(el, key) when is_map(el) do
-    case Map.get(el, key) do
-      name when is_binary(name) -> byte_size(name) <= @max_symbol_bytes
+    with name when is_binary(name) <- Map.get(el, key),
+         true <- byte_size(name) <= @max_symbol_bytes,
+         kind when is_binary(kind) <- Map.get(el, "kind") do
+      true
+    else
       _ -> false
     end
   end
