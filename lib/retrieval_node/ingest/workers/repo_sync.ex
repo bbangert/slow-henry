@@ -22,6 +22,17 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
       (mirror missing, timeout) is a different reason and still propagates.
 
   `unique` on `source_id` collapses overlapping cron/webhook triggers for one repo.
+
+  The watermark advance itself (`advance_watermark/2`) is an optimistic write:
+  it only takes effect if the `sync_states` row's `cursor` is still exactly
+  what this job read at `perform/1` start. If `Ingest.force_full_resync_git_sources/0`
+  clears the cursor (or another sync races in) while this job is mid-flight,
+  the `UPDATE` matches zero rows, a warning is logged, and the watermark is
+  deliberately left as-is — this job's staged work (`ChunkFiles`/`UpsertChunks`)
+  already happened and is idempotent, but writing the cursor computed from a
+  stale read would silently re-establish "synced to HEAD" over a cursor that
+  was just cleared for a full re-sync. Not advancing is the safe direction:
+  the next cron tick re-syncs from whatever the DB's current cursor actually is.
   """
   use Oban.Worker,
     queue: :sync,
@@ -176,14 +187,31 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
     end
   end
 
-  defp advance_watermark(sync_state, new_sha) do
-    sync_state
-    |> SyncState.changeset(%{
-      cursor: Map.put(sync_state.cursor || %{}, "last_sha", new_sha),
-      status: :idle,
-      last_synced_at: DateTime.utc_now()
-    })
-    |> Repo.update!()
+  # Public (not `defp`) and @doc false purely so RepoSyncTest can exercise the
+  # concurrent-clear race directly — not part of this worker's job-behaviour API.
+  @doc false
+  def advance_watermark(sync_state, new_sha) do
+    new_cursor = Map.put(sync_state.cursor || %{}, "last_sha", new_sha)
+
+    # Optimistic concurrency check — see the moduledoc's watermark paragraph:
+    # only advance if the row's cursor still matches what was read at the
+    # start of this job.
+    {count, _} =
+      Repo.update_all(
+        from(s in SyncState,
+          where: s.id == ^sync_state.id and s.cursor == ^(sync_state.cursor || %{})
+        ),
+        set: [cursor: new_cursor, status: :idle, last_synced_at: DateTime.utc_now()]
+      )
+
+    if count == 0 do
+      Logger.warning(
+        "sync_state cursor changed mid-sync (concurrent clear/backfill?) — " <>
+          "not advancing watermark; next sync re-discovers from the newer cursor"
+      )
+    end
+
+    :ok
   end
 
   defp get_or_create_sync_state(source_id) do

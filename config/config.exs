@@ -17,13 +17,15 @@ config :retrieval_node,
 config :retrieval_node, RetrievalNode.Repo, types: RetrievalNode.PostgrexTypes
 
 # Swappable subsystem implementations (behaviours defined in later phases).
-# Selected at runtime via Application.get_env/2 so the two changeable seams —
-# chunking (tree-sitter NIF vs pure-Elixir heuristic) and embedding (in-process
-# Nx.Serving vs llama.cpp sidecar) — can be swapped per environment without
-# touching call sites. `:test` overrides `chunking_impl` to keep tests NIF-free.
+# Selected at runtime via Application.get_env/2 so the changeable seams —
+# chunking (tree-sitter NIF vs pure-Elixir heuristic), embedding (in-process
+# Nx.Serving vs llama.cpp sidecar), and reranking (in-process cross-encoder
+# Nx.Serving) — can be swapped per environment without touching call sites.
+# `:test` overrides all three to keep the suite NIF-free and model-free.
 config :retrieval_node,
   chunking_impl: RetrievalNode.Chunking.TreeSitterImpl,
-  embedding_impl: RetrievalNode.Embedding.NxServingImpl
+  embedding_impl: RetrievalNode.Embedding.NxServingImpl,
+  reranking_impl: RetrievalNode.Reranking.NxServingImpl
 
 # Oban ingest pipeline. Queue concurrencies (design-oban §2): sync I/O-bound;
 # chunk CPU+NIF (bounded so it doesn't monopolize dirty schedulers); embed=1
@@ -44,7 +46,9 @@ config :retrieval_node, Oban,
      crontab: [
        {"*/15 * * * *", RetrievalNode.Ingest.Workers.SyncScheduler, args: %{"kind" => "git"}},
        {"0 * * * *", RetrievalNode.Ingest.Workers.SyncScheduler, args: %{"kind" => "jira"}},
-       {"*/30 * * * *", RetrievalNode.Ingest.Workers.SyncScheduler, args: %{"kind" => "drive"}}
+       {"*/30 * * * *", RetrievalNode.Ingest.Workers.SyncScheduler, args: %{"kind" => "drive"}},
+       # Daily, off-peak: reaps entities orphaned by path-based chunk deletion (see GraphGc moduledoc)
+       {"30 4 * * *", RetrievalNode.Ingest.Workers.GraphGc}
      ]}
   ]
 
@@ -67,6 +71,40 @@ config :retrieval_node, RetrievalNode.Embedding.Serving,
   batch_size: 16,
   sequence_length: [128, 256, 512],
   batch_timeout_ms: 50
+
+# Reranking serving (Bumblebee/Nx.Serving cross-encoder over
+# cross-encoder/ms-marco-MiniLM-L-6-v2). Used only at query time, to rerank a
+# handful of top-K retrieval candidates against the query — `compile` forces
+# a JIT pass at init (batch_size 16, enough headroom for a typical top-K
+# batch in one `batched_run/2` call).
+#
+# `sequence_length` buckets for the same reason as the embedding serving:
+# most `{query, passage}` pairs are far shorter than the largest bucket, so
+# bucketing lets short pairs compute at 256 instead of always paying for 512.
+#
+# `batch_timeout_ms` is 10ms (much tighter than the embedding serving's 50ms)
+# because rerank calls arrive as one already-batched `batched_run/2` of ~50
+# pairs from a single query — there's no stream of small concurrent calls to
+# wait around and coalesce, and this path is on the latency-sensitive query
+# request, not a background indexing job.
+config :retrieval_node, RetrievalNode.Reranking.Serving,
+  model: "cross-encoder/ms-marco-MiniLM-L-6-v2",
+  batch_size: 16,
+  sequence_length: [256, 512],
+  batch_timeout_ms: 10
+
+# Query-time reranking defaults OFF until the Phase-1.4 eval gate (MRR/Hit@k +
+# p95 ≤ 300ms on the real corpus) proves it wins over plain RRF. `rerank_candidates`
+# (the RRF candidate pool size fed into the cross-encoder) is 50 — roughly the
+# reranker's practical latency budget in one `batched_run/2` call at batch_size 16
+# (see the Reranking.Serving `batch_timeout_ms` comment above).
+config :retrieval_node, rerank_default: false, rerank_candidates: 50
+
+# Graph (entity-mention) leg of the hybrid RRF query — see HybridQuery
+# moduledoc. Ships off by default until the Phase-3.3 EXPLAIN + latency
+# validation on the real corpus passes; `graph_leg_weight` keeps the
+# as-yet-unproven leg from outvoting the tuned vector/FTS pair once enabled.
+config :retrieval_node, graph_leg_default: false, graph_leg_weight: 0.5
 
 # EXLA as the global Nx default backend — without this, any tensor op NOT
 # routed through the serving's own `defn_options: [compiler: EXLA]` (e.g. the

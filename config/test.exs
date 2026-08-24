@@ -46,6 +46,15 @@ config :retrieval_node, embedding_impl: RetrievalNode.Embedding.StubImpl
 # model and JIT-compile it. StubImpl (above) stands in for RetrievalNode.Embedding.
 config :retrieval_node, embedding_serving_start: false
 
+# Model-free reranking so query-time reranking code is testable without
+# downloading the cross-encoder model or compiling EXLA.
+config :retrieval_node, reranking_impl: RetrievalNode.Reranking.StubImpl
+
+# Never start the real Nx.Serving sub-tree in test — it would load the
+# ~91 MB model and JIT-compile it. StubImpl (above) stands in for
+# RetrievalNode.Reranking.
+config :retrieval_node, reranking_serving_start: false
+
 # Print only warnings and errors during test
 config :logger, level: :warning
 

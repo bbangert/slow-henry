@@ -10,7 +10,7 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
   heuristic chunker on a parse timeout/crash (final attempt) or an unsupported
   language, but *skips* (`{:cancel}`, after reaping) oversized/binary content. The
   raw row is deleted once its chunk rows are written. Idempotent: a retry after the
-  raw row is gone is a no-op. `finalize/4` runs write-chunks → enqueue → reap in one
+  raw row is gone is a no-op. `finalize/6` runs write-chunks → enqueue → reap in one
   transaction, so a crash never redoes that work under a fresh id set.
   """
   use Oban.Worker,
@@ -30,10 +30,10 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
 
   @source_types %{"git" => :git_repo, "jira" => :jira_project, "drive" => :drive_folder}
 
-  # finalize/4 threads an %Ecto.Multi{} (opaque) through Oban.insert/3 to enqueue
+  # finalize/6 threads an %Ecto.Multi{} (opaque) through Oban.insert/3 to enqueue
   # EmbedBatch inside the write+reap transaction — correct at runtime, but dialyzer
   # sees the opaque Multi crossing into Oban. Silence just that call.
-  @dialyzer {:no_opaque, finalize: 4}
+  @dialyzer {:no_opaque, finalize: 6}
 
   @impl Oban.Worker
   def timeout(_job), do: :timer.seconds(45)
@@ -63,9 +63,9 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
   end
 
   defp chunk_and_enqueue(row, content, opts, attempt, max) do
-    case Chunking.chunk(content, row.lang || "") do
-      {:ok, chunks} ->
-        finalize(row, chunks, "ok", opts)
+    case Chunking.chunk_with_graph(content, row.lang || "") do
+      {:ok, %{chunks: chunks, entities: entities, references: references}} ->
+        finalize(row, chunks, "ok", opts, entities, references)
 
       {:error, :unsupported_language} ->
         heuristic_fallback(row, content, "heuristic_fallback", opts)
@@ -84,22 +84,28 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
 
   defp heuristic_fallback(row, content, parse_status, opts) do
     {:ok, chunks} = HeuristicImpl.chunk(content, row.lang || "")
-    finalize(row, chunks, parse_status, Keyword.put(opts, :chunk_quality, "heuristic_fallback"))
+    quality_opts = Keyword.put(opts, :chunk_quality, "heuristic_fallback")
+    # The heuristic chunker has no AST to walk — no entities/references to attach.
+    finalize(row, chunks, parse_status, quality_opts, [], [])
   end
 
   # No chunks (e.g. whitespace-only file) — nothing to embed; just reap the raw row.
-  defp finalize(row, [], _parse_status, _opts) do
+  defp finalize(row, [], _parse_status, _opts, _entities, _references) do
     reap(row)
     :ok
   end
 
-  defp finalize(row, chunks, parse_status, opts) do
+  defp finalize(row, chunks, parse_status, opts, entities, references) do
     quality = opts[:chunk_quality] || "tree_sitter"
+    graphs = attach_graphs(chunks, entities, references)
 
     attrs =
-      chunks
+      [chunks, graphs]
+      |> Enum.zip()
       |> Enum.with_index()
-      |> Enum.map(fn {chunk, index} -> chunk_attrs(row, chunk, index, parse_status) end)
+      |> Enum.map(fn {{chunk, graph}, index} ->
+        chunk_attrs(row, chunk, index, parse_status, graph)
+      end)
 
     # write chunks → enqueue EmbedBatch → reap raw, atomically. A crash in this
     # window rolls all three back, so the retry (raw row still present) redoes the
@@ -125,13 +131,14 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
     end
   end
 
-  defp chunk_attrs(row, chunk, index, parse_status) do
+  defp chunk_attrs(row, chunk, index, parse_status, graph) do
     %{
       chunk_index: index,
       chunk_content: chunk.text,
       chunk_key: chunk_key(row, chunk, index),
       context_breadcrumb: Breadcrumb.build(file_prefix(row), chunk.breadcrumb),
-      parse_status: parse_status
+      parse_status: parse_status,
+      graph: graph
     }
   end
 
@@ -143,6 +150,45 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
   end
 
   defp file_prefix(row), do: Map.get(row.metadata || %{}, "path") || row.natural_key
+
+  # Assigns each entity/reference to the chunk whose start_line..end_line contains
+  # its line; items matching no chunk (typically a top-level import sitting
+  # between two defs) attach to the FIRST chunk of the file rather than being
+  # dropped — imports are file-level signal and losing them would gut the
+  # imports leg of the graph. Chunks with no graph items get %{} (the staging
+  # column default), cheaper than an empty-list map repeated over 380k prose
+  # chunks that have no graph data at all.
+  defp attach_graphs(chunks, entities, references) do
+    entities_by_chunk =
+      Enum.group_by(entities, &chunk_index_for(&1.line, chunks), &entity_attrs/1)
+
+    references_by_chunk =
+      Enum.group_by(references, &chunk_index_for(&1.line, chunks), &reference_attrs/1)
+
+    chunks
+    |> Enum.with_index()
+    |> Enum.map(fn {_chunk, index} ->
+      graph_attrs(Map.get(entities_by_chunk, index, []), Map.get(references_by_chunk, index, []))
+    end)
+  end
+
+  defp graph_attrs([], []), do: %{}
+
+  defp graph_attrs(entities, references),
+    do: %{"entities" => entities, "references" => references}
+
+  defp chunk_index_for(line, chunks) do
+    case Enum.find_index(chunks, &(line >= &1.start_line and line <= &1.end_line)) do
+      nil -> 0
+      index -> index
+    end
+  end
+
+  defp entity_attrs(entity),
+    do: %{"qualified_name" => entity.qualified_name, "kind" => to_string(entity.kind)}
+
+  defp reference_attrs(ref),
+    do: %{"name" => ref.name, "kind" => to_string(ref.kind), "from" => ref.from}
 
   defp record_audit(_row, []), do: :ok
 

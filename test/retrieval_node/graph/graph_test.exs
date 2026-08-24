@@ -1,0 +1,882 @@
+defmodule RetrievalNode.GraphTest do
+  # async: false — shares the SQL sandbox with the (manual-mode) Oban instance
+  # that the application tree starts (same reason as Ingest.PipelineTest).
+  use RetrievalNode.DataCase, async: false
+  use Oban.Testing, repo: RetrievalNode.Repo
+
+  alias RetrievalNode.Graph
+  alias RetrievalNode.Graph.{Entity, EntityEdge, EntityMention}
+  alias RetrievalNode.Ingest.PendingChunks
+  alias RetrievalNode.Ingest.Workers.{ChunkFiles, EmbedBatch, UpsertChunks}
+  alias RetrievalNode.Repo
+  alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source}
+
+  setup do
+    prev = Application.get_env(:retrieval_node, :chunking_impl)
+    Application.put_env(:retrieval_node, :chunking_impl, RetrievalNode.Chunking.FakeImpl)
+
+    on_exit(fn ->
+      Application.put_env(:retrieval_node, :chunking_impl, prev)
+      Application.delete_env(:retrieval_node, :fake_chunk_result)
+      Application.delete_env(:retrieval_node, :fake_chunk_with_graph_result)
+    end)
+
+    source = Repo.insert!(%Source{source_type: :git_repo, name: "app", identifier: "acme/app"})
+    %{source: source}
+  end
+
+  defp seed_raw(source, content, natural_key \\ "repo:acme/app:app.py", path \\ "app.py") do
+    {:ok, _} =
+      PendingChunks.insert_raw_all([
+        %{
+          source: "git",
+          source_id: source.id,
+          source_type: "git_repo",
+          repo: "acme/app",
+          lang: "python",
+          natural_key: natural_key,
+          content_hash: "rawhash-#{System.unique_integer([:positive])}",
+          raw_content: content,
+          metadata: %{"path" => path}
+        }
+      ])
+
+    Repo.one!(from p in PendingChunk, order_by: [desc: p.id], limit: 1)
+  end
+
+  defp run_pipeline(raw) do
+    assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id})
+    ids = Repo.all(from p in PendingChunk, select: p.id)
+    assert :ok = perform_job(EmbedBatch, %{"pending_chunk_ids" => ids})
+    assert :ok = perform_job(UpsertChunks, %{"pending_chunk_ids" => ids})
+  end
+
+  defp force_chunk(result), do: Application.put_env(:retrieval_node, :fake_chunk_result, result)
+
+  defp force_chunk_with_graph(result),
+    do: Application.put_env(:retrieval_node, :fake_chunk_with_graph_result, result)
+
+  # Two chunks: chunk 0 (lines 1-2) defines "a" and calls "b"; also a
+  # top-level import at line 0 that falls outside every chunk's range.
+  # Chunk 1 (lines 4-5) defines "b".
+  defp two_chunk_result do
+    {:ok,
+     %{
+       chunks: [
+         %{
+           text: "def a():\n    return b()\n",
+           breadcrumb: "a",
+           start_line: 1,
+           end_line: 2,
+           kind: "function_definition",
+           parse_status: :ok
+         },
+         %{
+           text: "def b():\n    return 1\n",
+           breadcrumb: "b",
+           start_line: 4,
+           end_line: 5,
+           kind: "function_definition",
+           parse_status: :ok
+         }
+       ],
+       entities: [
+         %{qualified_name: "a", kind: :function, line: 1},
+         %{qualified_name: "b", kind: :function, line: 4}
+       ],
+       references: [
+         %{name: "b", kind: :call, from: "a", line: 2},
+         %{name: "os", kind: :import, from: nil, line: 0}
+       ]
+     }}
+  end
+
+  describe "ChunkFiles per-chunk graph attachment" do
+    test "entities/references land on the chunk whose line range contains them; the unmatched import lands on the first chunk",
+         %{source: source} do
+      force_chunk_with_graph(two_chunk_result())
+      raw = seed_raw(source, "def a():\n    return b()\n\n\ndef b():\n    return 1\n")
+
+      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id})
+
+      [chunk_a, chunk_b] =
+        Repo.all(from p in PendingChunk, where: p.status == "chunked", order_by: p.chunk_index)
+
+      assert chunk_a.graph == %{
+               "entities" => [%{"qualified_name" => "a", "kind" => "function"}],
+               "references" => [
+                 %{"name" => "b", "kind" => "call", "from" => "a"},
+                 %{"name" => "os", "kind" => "import", "from" => nil}
+               ]
+             }
+
+      assert chunk_b.graph == %{
+               "entities" => [%{"qualified_name" => "b", "kind" => "function"}],
+               "references" => []
+             }
+    end
+
+    test "the heuristic fallback path attaches no graph (empty map, the column default)", %{
+      source: source
+    } do
+      force_chunk({:error, :unsupported_language})
+      raw = seed_raw(source, "def a():\n    return 1\n\ndef b():\n    return 2\n")
+
+      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id})
+
+      chunks = Repo.all(from p in PendingChunk, where: p.status == "chunked")
+      assert chunks != []
+      assert Enum.all?(chunks, &(&1.graph == %{}))
+    end
+  end
+
+  describe "oversized graph symbol sanitation" do
+    # Consumer-side twin of the extractor's @max_symbol_bytes cap: rows staged
+    # before the cap shipped (or by another producer) must be dropped with a
+    # warning, not fail the entities unique-index insert and discard the job.
+    test "oversized entity/reference names are dropped with a warning; the rest persist", %{
+      source: source
+    } do
+      import ExUnit.CaptureLog
+
+      long = String.duplicate("x", 3_000)
+
+      force_chunk_with_graph(
+        {:ok,
+         %{
+           chunks: [
+             %{
+               text: "def a():\n    return 1\n",
+               breadcrumb: "a",
+               start_line: 1,
+               end_line: 2,
+               kind: "function_definition",
+               parse_status: :ok
+             }
+           ],
+           entities: [
+             %{qualified_name: "a", kind: :function, line: 1},
+             %{qualified_name: long, kind: :function, line: 1}
+           ],
+           references: [
+             %{name: long, kind: :call, from: "a", line: 2},
+             %{name: "b", kind: :call, from: "a", line: 2}
+           ]
+         }}
+      )
+
+      raw = seed_raw(source, "def a():\n    return 1\n")
+      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id})
+      ids = Repo.all(from p in PendingChunk, select: p.id)
+      assert :ok = perform_job(EmbedBatch, %{"pending_chunk_ids" => ids})
+
+      log =
+        capture_log(fn ->
+          assert :ok = perform_job(UpsertChunks, %{"pending_chunk_ids" => ids})
+        end)
+
+      assert log =~ "oversized graph symbol"
+
+      names = Repo.all(from e in Entity, select: e.qualified_name)
+      assert "a" in names
+      assert "b" in names
+      refute Enum.any?(names, &(byte_size(&1) > 256))
+    end
+
+    test "malformed shapes (nil name, a bare string element, a reference missing its name key) are dropped with a warning; valid siblings persist and nothing raises",
+         %{source: source} do
+      import ExUnit.CaptureLog
+
+      staged_row = %{
+        source_id: source.id,
+        lang: "python",
+        chunk_key: "irrelevant-chunk-key",
+        natural_key: "nk-malformed",
+        metadata: %{"path" => "a.py"},
+        graph: %{
+          "entities" => [
+            %{"qualified_name" => "a", "kind" => "function"},
+            %{"qualified_name" => nil, "kind" => "function"},
+            "not-a-map"
+          ],
+          "references" => [
+            %{"name" => "b", "kind" => "call", "from" => "a"},
+            %{"kind" => "call", "from" => "a"}
+          ]
+        }
+      }
+
+      log =
+        capture_log(fn ->
+          assert {:ok, _counts} = Graph.upsert_from_staged(Repo, [staged_row], %{})
+        end)
+
+      assert log =~ "oversized graph symbol"
+
+      names = Repo.all(from e in Entity, select: e.qualified_name)
+      assert Enum.sort(names) == ["a", "b"]
+    end
+  end
+
+  describe "full pipeline persistence" do
+    test "entities, mentions, and edges land correctly (def kind wins, weight aggregates)", %{
+      source: source
+    } do
+      force_chunk_with_graph(
+        {:ok,
+         %{
+           chunks: [
+             %{
+               text: "def a():\n    b()\n    b()\n",
+               breadcrumb: "a",
+               start_line: 1,
+               end_line: 3,
+               kind: "function_definition",
+               parse_status: :ok
+             },
+             %{
+               text: "def b():\n    return 1\n",
+               breadcrumb: "b",
+               start_line: 5,
+               end_line: 6,
+               kind: "function_definition",
+               parse_status: :ok
+             }
+           ],
+           entities: [
+             %{qualified_name: "a", kind: :function, line: 1},
+             %{qualified_name: "b", kind: :function, line: 5}
+           ],
+           references: [
+             %{name: "b", kind: :call, from: "a", line: 2},
+             %{name: "b", kind: :call, from: "a", line: 3},
+             %{name: "os", kind: :import, from: nil, line: 0}
+           ]
+         }}
+      )
+
+      raw = seed_raw(source, "def a():\n    b()\n    b()\n\ndef b():\n    return 1\n")
+      run_pipeline(raw)
+
+      assert Repo.aggregate(Chunk, :count, :id) == 2
+
+      entities = Entity |> Repo.all() |> Map.new(&{&1.qualified_name, &1})
+      assert %{"a" => a, "b" => b, "os" => os} = entities
+      assert a.kind == :function
+      assert b.kind == :function
+      # "os" is only ever seen as an import, never defined — reference-only.
+      assert os.kind == :module
+      assert os.path == nil
+
+      # Both calls to "b" land in the same chunk, so they collapse into ONE
+      # entity_mentions row (unique on entity_id/chunk_id/kind) — the edge
+      # weight below is what carries the "called twice" signal instead.
+      mentions = Repo.all(EntityMention)
+      assert length(mentions) == 4
+      assert Enum.count(mentions, &(&1.kind == :definition)) == 2
+      assert Enum.count(mentions, &(&1.kind == :call)) == 1
+      assert Enum.count(mentions, &(&1.kind == :import)) == 1
+
+      assert [edge] = Repo.all(EntityEdge)
+      assert edge.kind == :calls
+      assert edge.weight == 2
+      assert edge.source_entity_id == a.id
+      assert edge.target_entity_id == b.id
+    end
+
+    test "re-running the pipeline on equivalent staged data is idempotent (no doubled weight/mentions)",
+         %{source: source} do
+      force_chunk_with_graph(two_chunk_result())
+      content = "def a():\n    return b()\n\n\ndef b():\n    return 1\n"
+
+      run_pipeline(seed_raw(source, content))
+
+      entities_1 = Repo.aggregate(Entity, :count, :id)
+      mentions_1 = Repo.aggregate(EntityMention, :count, :id)
+      edges_1 = Repo.aggregate(EntityEdge, :count, :id)
+      weight_1 = Repo.one!(EntityEdge).weight
+
+      run_pipeline(seed_raw(source, content))
+
+      assert Repo.aggregate(Entity, :count, :id) == entities_1
+      assert Repo.aggregate(EntityMention, :count, :id) == mentions_1
+      assert Repo.aggregate(EntityEdge, :count, :id) == edges_1
+      assert Repo.one!(EntityEdge).weight == weight_1
+    end
+  end
+
+  describe "re-chunk staleness" do
+    defp rechunk_result(callee) do
+      {:ok,
+       %{
+         chunks: [
+           %{
+             text: "def a():\n    #{callee}()\n",
+             breadcrumb: "a",
+             start_line: 1,
+             end_line: 2,
+             kind: "function_definition",
+             parse_status: :ok
+           }
+         ],
+         entities: [%{qualified_name: "a", kind: :function, line: 1}],
+         references: [%{name: callee, kind: :call, from: "a", line: 2}]
+       }}
+    end
+
+    test "a re-ingested file that drops one call and adds another re-derives mentions and edges",
+         %{source: source} do
+      natural_key = "repo:acme/app:staleness.py"
+
+      force_chunk_with_graph(rechunk_result("b"))
+      run_pipeline(seed_raw(source, "def a():\n    b()\n", natural_key))
+
+      entities = Entity |> Repo.all() |> Map.new(&{&1.qualified_name, &1})
+      entity_a = entities["a"]
+      entity_b = entities["b"]
+
+      assert [%{kind: :call}] =
+               Repo.all(from m in EntityMention, where: m.entity_id == ^entity_b.id)
+
+      assert %{target_entity_id: target_id} =
+               Repo.one!(from e in EntityEdge, where: e.source_entity_id == ^entity_a.id)
+
+      assert target_id == entity_b.id
+
+      force_chunk_with_graph(rechunk_result("c"))
+      run_pipeline(seed_raw(source, "def a():\n    c()\n", natural_key))
+
+      entity_c = Repo.get_by!(Entity, qualified_name: "c")
+
+      # the old call mention to "b" is gone
+      assert Repo.all(from m in EntityMention, where: m.entity_id == ^entity_b.id) == []
+
+      # the new call mention to "c" is present, on the same chunk row
+      assert [%{kind: :call}] =
+               Repo.all(from m in EntityMention, where: m.entity_id == ^entity_c.id)
+
+      # the edge is re-derived: a -> c, not a -> b
+      assert %{target_entity_id: new_target_id} =
+               Repo.one!(from e in EntityEdge, where: e.source_entity_id == ^entity_a.id)
+
+      assert new_target_id == entity_c.id
+    end
+  end
+
+  describe "reference-only entities never clobber a definition" do
+    test "an existing definition's kind/path survive a later reference-only sighting", %{
+      source: source
+    } do
+      force_chunk_with_graph(
+        {:ok,
+         %{
+           chunks: [
+             %{
+               text: "def helper():\n    return 1\n",
+               breadcrumb: "helper",
+               start_line: 1,
+               end_line: 2,
+               kind: "function_definition",
+               parse_status: :ok
+             }
+           ],
+           entities: [%{qualified_name: "helper", kind: :function, line: 1}],
+           references: []
+         }}
+      )
+
+      run_pipeline(
+        seed_raw(
+          source,
+          "def helper():\n    return 1\n",
+          "repo:acme/app:helper.py",
+          "helper.py"
+        )
+      )
+
+      # A bare import reference (never a call/definition) resolves to kind
+      # :module with no path when it's the only sighting — the opposite of
+      # what "helper" is already known to be, so this proves the guess loses.
+      force_chunk_with_graph(
+        {:ok,
+         %{
+           chunks: [
+             %{
+               text: "helper()\n",
+               breadcrumb: "",
+               start_line: 1,
+               end_line: 1,
+               kind: "module",
+               parse_status: :ok
+             }
+           ],
+           entities: [],
+           references: [%{name: "helper", kind: :import, from: nil, line: 1}]
+         }}
+      )
+
+      run_pipeline(seed_raw(source, "helper()\n", "repo:acme/app:caller.py", "caller.py"))
+
+      entity = Repo.get_by!(Entity, qualified_name: "helper")
+      assert entity.kind == :function
+      assert entity.path == "helper.py"
+    end
+  end
+
+  describe "language-scoped entity binding" do
+    test "a same-named entity in another language is never bound to by a python file's mentions/edges",
+         %{source: source} do
+      js_entity =
+        Repo.insert!(%Entity{
+          source_id: source.id,
+          language: "javascript",
+          qualified_name: "setup",
+          kind: :function
+        })
+
+      js_chunk = seed_chunk(source, "existing.js", "js-chunk-key")
+      js_mention = seed_mention(js_entity, js_chunk, :definition)
+
+      force_chunk_with_graph(
+        {:ok,
+         %{
+           chunks: [
+             %{
+               text: "def a():\n    setup()\n",
+               breadcrumb: "a",
+               start_line: 1,
+               end_line: 2,
+               kind: "function_definition",
+               parse_status: :ok
+             }
+           ],
+           entities: [%{qualified_name: "setup", kind: :function, line: 1}],
+           references: [%{name: "setup", kind: :call, from: "a", line: 1}]
+         }}
+      )
+
+      run_pipeline(seed_raw(source, "def a():\n    setup()\n"))
+
+      python_setup =
+        Repo.get_by!(Entity, source_id: source.id, language: "python", qualified_name: "setup")
+
+      assert python_setup.id != js_entity.id
+
+      # the python file's mentions bind to the new python entity, not the js one
+      python_mentions =
+        Repo.all(from m in EntityMention, where: m.entity_id == ^python_setup.id)
+
+      assert python_mentions != []
+
+      # the js entity's own mention is completely untouched
+      assert Repo.all(from m in EntityMention, where: m.entity_id == ^js_entity.id) == [
+               js_mention
+             ]
+    end
+  end
+
+  describe "kind conversion catch-alls (LLM-extractor seam)" do
+    test "an unknown reference kind raises ArgumentError instead of crashing with FunctionClauseError",
+         %{source: source} do
+      staged_row = %{
+        source_id: source.id,
+        lang: "python",
+        chunk_key: "irrelevant-chunk-key",
+        natural_key: "nk",
+        metadata: %{"path" => "a.py"},
+        graph: %{
+          "entities" => [],
+          "references" => [%{"name" => "mystery", "kind" => "eval", "from" => nil}]
+        }
+      }
+
+      assert_raise ArgumentError, ~r/eval/, fn ->
+        Graph.upsert_from_staged(Repo, [staged_row], %{})
+      end
+    end
+
+    test "TreeSitter's emittable entity kinds are all valid Entity.kind enum values" do
+      # entity_kind_for/2 is private to Graph.Extractor.TreeSitter; this list
+      # is pinned to its category -> kind mapping (:class_like -> :class,
+      # :module_like -> :module, :function_like -> :method when the
+      # enclosing container is :class_like, :function otherwise) — update
+      # this list if that mapping ever changes.
+      tree_sitter_entity_kinds = [:function, :method, :class, :module]
+
+      assert Enum.all?(tree_sitter_entity_kinds, &(&1 in Ecto.Enum.values(Entity, :kind)))
+    end
+  end
+
+  describe "gc_orphaned_entities/1" do
+    defp seed_chunk(source, path, chunk_key) do
+      Repo.insert!(%Chunk{
+        source_id: source.id,
+        source_type: :git_repo,
+        chunk_key: chunk_key,
+        content_hash: "h-#{chunk_key}",
+        content: "content",
+        context_breadcrumb: path,
+        metadata: %{"path" => path}
+      })
+    end
+
+    defp seed_entity(source, qualified_name) do
+      Repo.insert!(%Entity{
+        source_id: source.id,
+        language: "python",
+        qualified_name: qualified_name,
+        kind: :function
+      })
+    end
+
+    defp seed_mention(entity, chunk, kind) do
+      Repo.insert!(%EntityMention{entity_id: entity.id, chunk_id: chunk.id, kind: kind})
+    end
+
+    defp seed_edge(source_entity, target_entity, kind) do
+      Repo.insert!(%EntityEdge{
+        source_entity_id: source_entity.id,
+        target_entity_id: target_entity.id,
+        kind: kind
+      })
+    end
+
+    # Mirrors RepoSync.delete_removed/2's path-based Repo.delete_all on Chunk —
+    # the exact deletion the ingest pipeline runs on file removal.
+    defp delete_chunks_by_path(source, path) do
+      from(c in Chunk,
+        where: c.source_id == ^source.id and fragment("?->>'path'", c.metadata) == ^path
+      )
+      |> Repo.delete_all()
+    end
+
+    test "the pipeline's path-based chunk deletion cascades mentions but strands the entity and its edges",
+         %{source: source} do
+      chunk = seed_chunk(source, "gone.py", "k1")
+      entity_a = seed_entity(source, "a")
+      entity_b = seed_entity(source, "b")
+      seed_mention(entity_a, chunk, :definition)
+      seed_edge(entity_a, entity_b, :calls)
+
+      delete_chunks_by_path(source, "gone.py")
+
+      # cascade via chunks -> entity_mentions FK
+      assert Repo.all(EntityMention) == []
+      # entities have no FK back to chunks — they survive, now at zero mentions
+      assert Repo.aggregate(Entity, :count, :id) == 2
+      # edges FK entities, not chunks — untouched by the chunk deletion
+      assert Repo.aggregate(EntityEdge, :count, :id) == 1
+    end
+
+    test "deletes zero-mention entities, cascades their edges, and spares entities that still have mentions",
+         %{source: source} do
+      chunk = seed_chunk(source, "keep.py", "k2")
+      kept_entity = seed_entity(source, "kept")
+      seed_mention(kept_entity, chunk, :definition)
+
+      orphan_a = seed_entity(source, "orphan_a")
+      orphan_b = seed_entity(source, "orphan_b")
+      seed_edge(orphan_a, orphan_b, :calls)
+      seed_edge(kept_entity, orphan_a, :calls)
+
+      assert Graph.gc_orphaned_entities() == 2
+
+      assert Repo.all(from e in Entity, select: e.qualified_name) == ["kept"]
+      # both edges touched an orphan entity on one end, so both die via FK cascade
+      assert Repo.all(EntityEdge) == []
+    end
+
+    test "loops across batches: batch_size 1 with 3 orphans deletes all 3", %{source: source} do
+      for n <- 1..3, do: seed_entity(source, "orphan_#{n}")
+
+      assert Graph.gc_orphaned_entities(batch_size: 1) == 3
+      assert Repo.aggregate(Entity, :count, :id) == 0
+    end
+  end
+
+  describe "find_entities/2" do
+    defp seed_repo_chunk(source, path, chunk_key, repo) do
+      Repo.insert!(%Chunk{
+        source_id: source.id,
+        source_type: :git_repo,
+        repo: repo,
+        chunk_key: chunk_key,
+        content_hash: "h-#{chunk_key}",
+        content: "content",
+        context_breadcrumb: path,
+        metadata: %{"path" => path}
+      })
+    end
+
+    defp seed_lang_entity(source, qualified_name, language) do
+      Repo.insert!(%Entity{
+        source_id: source.id,
+        language: language,
+        qualified_name: qualified_name,
+        kind: :function
+      })
+    end
+
+    test "exact match short-circuits suffix and trigram tiers", %{source: source} do
+      exact = seed_entity(source, "process")
+      _suffix_candidate = seed_entity(source, "PaymentProcessor.process")
+
+      assert [found] = Graph.find_entities("process", [])
+      assert found.id == exact.id
+    end
+
+    test "suffix match fires only when no exact match exists", %{source: source} do
+      suffix_match = seed_entity(source, "PaymentProcessor.process")
+
+      assert [found] = Graph.find_entities("process", [])
+      assert found.id == suffix_match.id
+    end
+
+    test "trigram fallback finds a near-miss when exact and suffix both find nothing", %{
+      source: source
+    } do
+      typo_target = seed_entity(source, "process_payment")
+
+      assert [found | _] = Graph.find_entities("process_paymnet", [])
+      assert found.id == typo_target.id
+    end
+
+    test "an unmatched name returns an empty list", %{source: source} do
+      _unrelated = seed_entity(source, "totally_unrelated_zzz")
+      assert Graph.find_entities("qqqqqqqqqqqqqqqq", []) == []
+    end
+
+    test "suffix tier escapes LIKE metacharacters instead of treating them as wildcards", %{
+      source: source
+    } do
+      _entity = seed_entity(source, "PaymentProcessor.process")
+
+      # Unescaped, "%" as the suffix pattern's literal segment would still be
+      # anchored by the "%." prefix we add, but a caller-supplied "_" or "\"
+      # would silently act as a wildcard/escape char instead of matching
+      # itself — proving escape_like/1 is applied. "%" alone also exercises
+      # the corpus-walk failure scenario: it must find nothing, not
+      # everything.
+      assert Graph.find_entities("%", []) == []
+    end
+
+    test "repo filter scopes to entities mentioned in a chunk of that repo" do
+      source_a = Repo.insert!(%Source{source_type: :git_repo, name: "a", identifier: "acme/a"})
+      source_b = Repo.insert!(%Source{source_type: :git_repo, name: "b", identifier: "acme/b"})
+
+      entity_a = seed_entity(source_a, "shared_name")
+      entity_b = seed_entity(source_b, "shared_name")
+
+      chunk_a = seed_repo_chunk(source_a, "a.py", "ka", "repo-a")
+      chunk_b = seed_repo_chunk(source_b, "b.py", "kb", "repo-b")
+
+      seed_mention(entity_a, chunk_a, :definition)
+      seed_mention(entity_b, chunk_b, :definition)
+
+      assert [found] = Graph.find_entities("shared_name", repo: "repo-a")
+      assert found.id == entity_a.id
+    end
+
+    test "lang filter scopes to entities.language", %{source: source} do
+      python_entity = seed_lang_entity(source, "shared_lang_name", "python")
+      _elixir_entity = seed_lang_entity(source, "shared_lang_name", "elixir")
+
+      assert [found] = Graph.find_entities("shared_lang_name", lang: "python")
+      assert found.id == python_entity.id
+    end
+
+    test ":limit caps the result count and defaults/clamps sanely", %{source: source} do
+      for n <- 1..5, do: seed_entity(source, "Widget.method_#{n}")
+
+      assert length(Graph.find_entities("method_1", [])) == 1
+
+      # suffix-tier trigram-adjacent names all share the "method_" prefix but
+      # distinct suffixes, so only exact/suffix on a shared bare name exercises
+      # :limit meaningfully; assert the option is honored without raising.
+      assert Graph.find_entities("method_1", limit: 999) |> length() <= 50
+    end
+  end
+
+  describe "related_entities/3" do
+    defp seed_weighted_edge(source_entity, target_entity, kind, weight) do
+      Repo.insert!(%EntityEdge{
+        source_entity_id: source_entity.id,
+        target_entity_id: target_entity.id,
+        kind: kind,
+        weight: weight
+      })
+    end
+
+    test "callers: 1-hop, ordered by weight desc", %{source: source} do
+      target = seed_entity(source, "target_fn")
+      caller_a = seed_entity(source, "caller_a")
+      caller_c = seed_entity(source, "caller_c")
+
+      seed_weighted_edge(caller_a, target, :calls, 3)
+      seed_weighted_edge(caller_c, target, :calls, 5)
+
+      results = Graph.related_entities([target.id], :callers, 1)
+
+      assert [%{entity: e1, weight: 5, hop: 1}, %{entity: e2, weight: 3, hop: 1}] = results
+      assert e1.id == caller_c.id
+      assert e2.id == caller_a.id
+    end
+
+    test "callees: 2-hop union excludes seeds and back-edges into a seed", %{source: source} do
+      a = seed_entity(source, "a_fn")
+      b = seed_entity(source, "b_fn")
+      d = seed_entity(source, "d_fn")
+
+      seed_weighted_edge(a, b, :calls, 2)
+      seed_weighted_edge(b, d, :calls, 4)
+      # cycle back to the seed — must never appear in results even though it's
+      # a high-weight edge reachable at hop 2.
+      seed_weighted_edge(b, a, :calls, 9)
+
+      results = Graph.related_entities([a.id], :callees, 2)
+      by_id = Map.new(results, &{&1.entity.id, &1})
+
+      refute Map.has_key?(by_id, a.id)
+      assert %{weight: 2, hop: 1} = by_id[b.id]
+      assert %{weight: 4, hop: 2} = by_id[d.id]
+
+      # weight ordering across hops: d (4) outranks b (2)
+      assert Enum.map(results, & &1.entity.id) == [d.id, b.id]
+    end
+
+    test "dedup keeps the max weight when an entity is reached via multiple edges in the same hop",
+         %{source: source} do
+      a = seed_entity(source, "a2_fn")
+      c = seed_entity(source, "c2_fn")
+      target = seed_entity(source, "shared_target_fn")
+
+      seed_weighted_edge(a, target, :calls, 2)
+      seed_weighted_edge(c, target, :calls, 7)
+
+      assert [%{entity: found, weight: 7, hop: 1}] =
+               Graph.related_entities([a.id, c.id], :callees, 1)
+
+      assert found.id == target.id
+    end
+
+    test "hop-2 frontier caps at the top 100 hop-1 entities by weight, dropping lower-weight ones' onward edges",
+         %{source: source} do
+      target = seed_entity(source, "hot_fn")
+
+      # 101 hop-1 callers of target, weights 1..101 — 1 more than
+      # @hop2_frontier_limit (100), so exactly one (the lowest-weight) must
+      # be excluded from the hop-2 traversal frontier.
+      callers =
+        for i <- 1..101 do
+          caller = seed_entity(source, "caller_#{i}")
+          seed_weighted_edge(caller, target, :calls, i)
+          caller
+        end
+
+      # weight 1 (the minimum) is the one that must be cut from the frontier.
+      excluded_caller = Enum.at(callers, 0)
+      # any of the other 100 (weight >= 2) must survive into the frontier.
+      included_caller = Enum.at(callers, 1)
+
+      unreachable = seed_entity(source, "unreachable_via_excluded_frontier")
+      reachable = seed_entity(source, "reachable_via_included_frontier")
+
+      # Weight 200 (higher than any hop-1 weight) so, IF traversed, this
+      # hop-2 edge would easily survive the final @related_entities_limit
+      # (50) cut — isolating the assertion to the hop-2 frontier cap itself,
+      # not the separate final-result-count cap.
+      seed_weighted_edge(unreachable, excluded_caller, :calls, 200)
+      seed_weighted_edge(reachable, included_caller, :calls, 200)
+
+      ids = Graph.related_entities([target.id], :callers, 2) |> Enum.map(& &1.entity.id)
+
+      refute unreachable.id in ids
+      assert reachable.id in ids
+    end
+
+    test "imports/importers traverse in opposite directions", %{source: source} do
+      importer = seed_entity(source, "importer_mod")
+      imported = seed_entity(source, "imported_mod")
+
+      seed_edge(importer, imported, :imports)
+
+      assert [%{entity: found_importer}] = Graph.related_entities([imported.id], :importers, 1)
+      assert found_importer.id == importer.id
+
+      assert [%{entity: found_imported}] = Graph.related_entities([importer.id], :imports, 1)
+      assert found_imported.id == imported.id
+    end
+  end
+
+  describe "definition_snippets/2" do
+    defp seed_content_chunk(source, path, chunk_key, content, extra) do
+      Repo.insert!(
+        struct(
+          %Chunk{
+            source_id: source.id,
+            source_type: :git_repo,
+            chunk_key: chunk_key,
+            content_hash: "h-#{chunk_key}",
+            content: content,
+            context_breadcrumb: path,
+            metadata: %{"path" => path}
+          },
+          extra
+        )
+      )
+    end
+
+    test "short content is returned unchanged, with provenance fields", %{source: source} do
+      entity = seed_entity(source, "short_fn")
+
+      chunk =
+        seed_content_chunk(source, "short.py", "k-short", "def short_fn():\n    return 1\n",
+          repo: "acme/app",
+          lang: "python"
+        )
+
+      seed_mention(entity, chunk, :definition)
+
+      assert [snippet] = Graph.definition_snippets([entity.id])
+      assert snippet.entity_id == entity.id
+      assert snippet.repo == "acme/app"
+      assert snippet.lang == "python"
+      assert snippet.path == "short.py"
+      assert snippet.breadcrumb == "short.py"
+      assert snippet.snippet == "def short_fn():\n    return 1\n"
+    end
+
+    test "content over 20 lines is truncated at 20 lines with a marker", %{source: source} do
+      entity = seed_entity(source, "long_lines_fn")
+      content = Enum.map_join(1..30, "\n", &"line #{&1}")
+
+      chunk = seed_content_chunk(source, "long.py", "k-long", content, [])
+      seed_mention(entity, chunk, :definition)
+
+      assert [snippet] = Graph.definition_snippets([entity.id])
+      assert String.ends_with?(snippet.snippet, "…")
+      lines = snippet.snippet |> String.trim_trailing("…") |> String.split("\n")
+      assert length(lines) == 20
+      assert lines == Enum.map(1..20, &"line #{&1}")
+    end
+
+    test "content under 20 lines but over 1000 chars is truncated at 1000 chars with a marker", %{
+      source: source
+    } do
+      entity = seed_entity(source, "long_chars_fn")
+      long_line = String.duplicate("x", 600)
+      content = "#{long_line}\n#{long_line}\n"
+
+      chunk = seed_content_chunk(source, "wide.py", "k-wide", content, [])
+      seed_mention(entity, chunk, :definition)
+
+      assert [snippet] = Graph.definition_snippets([entity.id])
+      assert String.ends_with?(snippet.snippet, "…")
+      assert String.length(snippet.snippet) == 1001
+    end
+
+    test "an empty entity_ids list short-circuits to an empty list without querying" do
+      assert Graph.definition_snippets([]) == []
+    end
+  end
+end

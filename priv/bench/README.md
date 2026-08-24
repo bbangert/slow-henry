@@ -9,12 +9,14 @@ for the protocol this implements).
 
 **50-100 labeled queries** is the target set size per the benchmark protocol
 (15 code-based, 15 Jira/issue, 20 Docs, roughly). `queries.jsonl` currently
-ships **15 starter queries**, all code-based and all pointed at this repo's
-own source (`slow-henry` is the seed corpus for Phase 9's thin-corpus
-validation — one git repo, no Jira/Drive sources are ingested yet). Extend it
-once Jira/Drive sources exist in the seed corpus; correct measurement
-(the harness runs and reports honestly) matters more than the query count for
-this task — the numbers get tuned later.
+ships **24 queries**: the original 15 code-based starter queries pointed at
+this repo's own source (`slow-henry`, one git repo, no Jira/Drive sources are
+ingested yet), plus 9 more added for the plan 1.4 reranker eval pointed at the
+real dev corpus's other seeded repos (`core` — Home Assistant core,
+`esphome`, `hass-nabucasa`, `supervisor`). Extend it once Jira/Drive sources
+exist in the seed corpus; correct measurement (the harness runs and reports
+honestly) matters more than the query count for this task — the numbers get
+tuned later.
 
 ## Format
 

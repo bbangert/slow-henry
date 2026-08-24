@@ -53,6 +53,43 @@ defmodule RetrievalNode.Bench.Metrics do
   end
 
   @doc """
+  Mean Reciprocal Rank: `1.0 / rank` of the first relevant id in `ranked_ids`
+  (1-indexed), or `0.0` if no relevant id appears anywhere in `ranked_ids`.
+
+  Same convention as `ndcg_at_k/3`: `relevant_ids` is a `MapSet`, and an empty
+  `relevant_ids` scores `0.0` rather than raising (callers exclude unresolved
+  queries from the aggregate themselves, same as `Bench.Runner` does for
+  nDCG).
+  """
+  @spec mrr([term()], MapSet.t()) :: float()
+  def mrr(ranked_ids, relevant_ids) when is_list(ranked_ids) do
+    if MapSet.size(relevant_ids) == 0 do
+      0.0
+    else
+      ranked_ids
+      |> Enum.with_index(1)
+      |> Enum.find(fn {id, _rank} -> MapSet.member?(relevant_ids, id) end)
+      |> case do
+        {_id, rank} -> 1.0 / rank
+        nil -> 0.0
+      end
+    end
+  end
+
+  @doc """
+  Whether any of the leading `k` ids in `ranked_ids` is relevant — a boolean
+  "did we get a hit within the top k" check, as opposed to `ndcg_at_k/3`'s
+  graded score. Same `MapSet`/empty-`relevant_ids` convention as `mrr/2` and
+  `ndcg_at_k/3`: an empty `relevant_ids` is `false` (nothing to hit).
+  """
+  @spec hit_at_k([term()], MapSet.t(), pos_integer()) :: boolean()
+  def hit_at_k(ranked_ids, relevant_ids, k) when is_list(ranked_ids) and is_integer(k) do
+    ranked_ids
+    |> Enum.take(k)
+    |> Enum.any?(&MapSet.member?(relevant_ids, &1))
+  end
+
+  @doc """
   Percentile of `values` via the nearest-rank method: sort ascending, then
   `rank = ceil(p/100 * n)` (clamped to `[1, n]`), value = the element at that
   1-indexed rank. Simple, deterministic, no interpolation — adequate for a

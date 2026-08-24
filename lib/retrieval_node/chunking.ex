@@ -20,7 +20,16 @@ defmodule RetrievalNode.Chunking do
   worker (`Ingest.Workers.ChunkFiles`, Phase 6). That worker only ever calls
   `chunk/2`, never the NIF directly, so promoting to the peer-node isolation
   escape hatch later is a config change plus one module, not a call-site rewrite.
+
+  Graph extraction (`chunk_with_graph/2`) is tree-sitter-only: it is an
+  **optional** callback, implemented only by `TreeSitterImpl` (single parse,
+  two consumers — the same tree yields both chunks and graph rows). The
+  heuristic fallback path has no AST to walk, so it indexes chunks but
+  contributes no entities/references; the dispatcher below wraps its
+  `chunk/2` result accordingly rather than erroring.
   """
+
+  alias RetrievalNode.Graph.Extractor
 
   @type language :: String.t()
   @type chunk :: %{
@@ -39,8 +48,50 @@ defmodule RetrievalNode.Chunking do
   @doc "The languages this implementation can chunk (tree-sitter allowlist)."
   @callback allowed_languages() :: [language]
 
+  @doc """
+  Like `chunk/2`, but also returns graph entities/references extracted from
+  the same parse. Optional — only `TreeSitterImpl` implements it.
+  """
+  @callback chunk_with_graph(source :: String.t(), language :: language) ::
+              {:ok,
+               %{
+                 chunks: [chunk],
+                 entities: [Extractor.entity()],
+                 references: [Extractor.ref()]
+               }}
+              | {:error, atom() | {atom(), term()}}
+
+  @optional_callbacks chunk_with_graph: 2
+
   @spec chunk(String.t(), language) :: {:ok, [chunk]} | {:error, atom() | {atom(), term()}}
   def chunk(source, language), do: impl().chunk(source, language)
+
+  @doc """
+  Dispatch to `impl().chunk_with_graph/2` when the configured impl exports it;
+  otherwise fall back to `chunk/2` and wrap the result with empty graph lists.
+  Errors pass through unchanged either way.
+  """
+  @spec chunk_with_graph(String.t(), language) ::
+          {:ok, %{chunks: [chunk], entities: [Extractor.entity()], references: [Extractor.ref()]}}
+          | {:error, atom() | {atom(), term()}}
+  def chunk_with_graph(source, language) do
+    impl = impl()
+
+    # Code.ensure_loaded?/1 (not just function_exported?/3) is required here:
+    # function_exported?/3 answers false for a module that hasn't been loaded
+    # yet, even when the function genuinely exists in its compiled form — a
+    # fresh boot would otherwise silently drop graph data for the first file
+    # this runs against (TreeSitterImpl isn't loaded until some caller touches
+    # it), then "start working" once the module happens to get loaded.
+    if Code.ensure_loaded?(impl) and function_exported?(impl, :chunk_with_graph, 2) do
+      impl.chunk_with_graph(source, language)
+    else
+      case impl.chunk(source, language) do
+        {:ok, chunks} -> {:ok, %{chunks: chunks, entities: [], references: []}}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
 
   @doc """
   True if `content` is binary rather than text: contains a NUL byte, or isn't

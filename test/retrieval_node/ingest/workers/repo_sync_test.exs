@@ -4,6 +4,8 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
   use RetrievalNode.DataCase, async: false
   use Oban.Testing, repo: RetrievalNode.Repo
 
+  import ExUnit.CaptureLog
+
   alias RetrievalNode.Ingest.Workers.{ChunkFiles, RepoSync}
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source, SyncState}
@@ -215,5 +217,49 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     head = String.trim(git!(ctx.src, ["rev-parse", "HEAD"]))
     state = Repo.get_by!(SyncState, source_id: ctx.source.id)
     assert state.cursor["last_sha"] == head
+  end
+
+  describe "advance_watermark/2 optimistic write" do
+    test "advances when the DB row's cursor still matches what was read at job start", ctx do
+      state =
+        Repo.insert!(%SyncState{
+          source_id: ctx.source.id,
+          cursor: %{"last_sha" => "old-sha"},
+          status: :syncing
+        })
+
+      assert :ok = RepoSync.advance_watermark(state, "new-sha")
+
+      updated = Repo.get_by!(SyncState, source_id: ctx.source.id)
+      assert updated.cursor == %{"last_sha" => "new-sha"}
+      assert updated.status == :idle
+    end
+
+    test "does NOT advance when the DB row's cursor changed since it was read (concurrent clear/backfill)",
+         ctx do
+      state =
+        Repo.insert!(%SyncState{
+          source_id: ctx.source.id,
+          cursor: %{"last_sha" => "old-sha"},
+          status: :syncing
+        })
+
+      # Simulate Ingest.force_full_resync_git_sources/0's clear_sync_cursor!/1
+      # racing in after `state` was read (at perform/1 start) but before
+      # advance_watermark runs.
+      state |> SyncState.changeset(%{cursor: %{}}) |> Repo.update!()
+
+      log =
+        capture_log(fn ->
+          assert :ok = RepoSync.advance_watermark(state, "new-sha")
+        end)
+
+      assert log =~ "not advancing watermark"
+
+      # cursor stays at the CONCURRENTLY-CLEARED value — the stale `state`
+      # struct's computed new_sha must never overwrite it.
+      updated = Repo.get_by!(SyncState, source_id: ctx.source.id)
+      assert updated.cursor == %{}
+    end
   end
 end

@@ -97,6 +97,56 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
     end
   end
 
+  # Real tree-sitter parsing loads the NIF; excluded by default (see above).
+  # Run with `mix test --include integration`.
+  describe "chunk_with_graph/2 (single parse, two consumers)" do
+    @describetag :integration
+
+    test "returns the same chunks as chunk/2 on the same source, plus non-empty graph lists" do
+      src =
+        "class Bar:\n    def m(self):\n        return helper()\n\ndef helper():\n    return 1\n"
+
+      {:ok, chunks} = TSI.chunk(src, "python")
+
+      {:ok, %{chunks: graph_chunks, entities: entities, references: references}} =
+        TSI.chunk_with_graph(src, "python")
+
+      assert graph_chunks == chunks
+      assert entities != []
+      assert references != []
+
+      assert Enum.any?(entities, &(&1.qualified_name == "Bar.m" and &1.kind == :method))
+      assert Enum.any?(entities, &(&1.qualified_name == "helper" and &1.kind == :function))
+
+      assert Enum.any?(
+               references,
+               &(&1.kind == :call and &1.name == "helper" and &1.from == "Bar.m")
+             )
+    end
+
+    test "propagates pre-flight guard errors same as chunk/2" do
+      assert {:error, :unsupported_language} = TSI.chunk_with_graph("x = 1", "cobol")
+      assert {:error, :binary_content} = TSI.chunk_with_graph("ok\x00bad", "python")
+    end
+
+    test "dispatched through Chunking.chunk_with_graph/2 when TreeSitterImpl is configured" do
+      prev = Application.get_env(:retrieval_node, :chunking_impl)
+      Application.put_env(:retrieval_node, :chunking_impl, TSI)
+
+      on_exit(fn ->
+        if prev, do: Application.put_env(:retrieval_node, :chunking_impl, prev)
+      end)
+
+      src = "def top():\n    return 1\n"
+
+      assert {:ok, %{chunks: chunks, entities: entities, references: []}} =
+               RetrievalNode.Chunking.chunk_with_graph(src, "python")
+
+      assert Enum.any?(chunks, &(&1.breadcrumb == "top"))
+      assert Enum.any?(entities, &(&1.qualified_name == "top" and &1.kind == :function))
+    end
+  end
+
   # The application tree owns RetrievalNode.ChunkTaskSupervisor, so this test
   # deliberately terminates that child for its duration (restoring it via
   # on_exit) to verify guarded/1 fails closed rather than crashing the caller

@@ -113,6 +113,13 @@ jobs:
       # The `test` alias runs ecto.create + ecto.migrate before the suite; the
       # migrate step exercises the extension/HNSW setup against real pgvector.
       - run: mix test --warnings-as-errors
+      # test/test_helper.exs excludes :integration by default (real
+      # tree-sitter parsing via a NIF — slow, and needs grammars on disk).
+      # Prefetch the grammars, then run just those suites with :integration
+      # included (the `test` alias reruns ecto.create/migrate here too —
+      # harmless, both are idempotent).
+      - run: mix rn.grammars.prefetch
+      - run: mix test --warnings-as-errors --include integration test/retrieval_node/graph/extractor test/retrieval_node/chunking
 
   dialyzer:
     name: Dialyzer

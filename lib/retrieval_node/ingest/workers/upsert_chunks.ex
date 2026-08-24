@@ -7,6 +7,11 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
   webhook/cron overlap, a re-sync) replaces the row rather than duplicating it.
   The insert + staging cleanup run in one transaction so a crash never leaves the
   chunk written but the staging row lingering (or vice-versa).
+
+  Also persists the code-knowledge-graph rows staged on each row's `graph`
+  jsonb column (`RetrievalNode.Graph.upsert_from_staged/3`), inside the same
+  transaction — the chunk insert's `returning: [:id, :chunk_key]` gives Graph
+  the (possibly ON CONFLICT-preserved) chunk ids it needs to link mentions.
   """
   use Oban.Worker,
     queue: :upsert,
@@ -17,6 +22,7 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
       states: [:available, :scheduled, :executing, :retryable, :suspended]
     ]
 
+  alias RetrievalNode.Graph
   alias RetrievalNode.Ingest.PendingChunks
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.Chunk
@@ -47,11 +53,15 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"pending_chunk_ids" => ids}}) do
-    entries = ids |> PendingChunks.fetch_many!() |> Enum.map(&to_chunk_entry/1)
+    staged_rows = PendingChunks.fetch_many!(ids)
+    entries = Enum.map(staged_rows, &to_chunk_entry/1)
     now = DateTime.utc_now()
 
     Ecto.Multi.new()
     |> Ecto.Multi.run(:chunks, fn repo, _ -> {:ok, insert_batches(repo, entries, now)} end)
+    |> Ecto.Multi.run(:graph, fn repo, %{chunks: chunk_ids_by_key} ->
+      Graph.upsert_from_staged(repo, staged_rows, chunk_ids_by_key)
+    end)
     |> Ecto.Multi.run(:cleanup, fn repo, _ ->
       {:ok, repo.delete_all(PendingChunks.by_ids(ids))}
     end)
@@ -62,15 +72,22 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
     end
   end
 
+  # Batched insert accumulates chunk_key => id across every batch (ON
+  # CONFLICT UPDATE still returns rows) — Graph needs this map to link
+  # entity_mentions to the chunk rows just written.
   defp insert_batches(repo, entries, now) do
     entries
     |> Enum.chunk_every(insert_batch_size())
-    |> Enum.each(fn batch ->
-      repo.insert_all(Chunk, batch,
-        placeholders: %{now: now},
-        on_conflict: {:replace, @replace_on_conflict},
-        conflict_target: [:source_id, :chunk_key]
-      )
+    |> Enum.reduce(%{}, fn batch, acc ->
+      {_count, rows} =
+        repo.insert_all(Chunk, batch,
+          placeholders: %{now: now},
+          on_conflict: {:replace, @replace_on_conflict},
+          conflict_target: [:source_id, :chunk_key],
+          returning: [:id, :chunk_key]
+        )
+
+      Enum.reduce(rows, acc, fn row, acc -> Map.put(acc, row.chunk_key, row.id) end)
     end)
   end
 

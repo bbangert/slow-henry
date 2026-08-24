@@ -43,6 +43,9 @@ defmodule RetrievalNode.Retrieval.PendingChunk do
     field :parse_status, :string, default: "ok"
     field :secrets_status, :string, default: "clean"
     field :embedding, Pgvector.Ecto.Vector
+    # Staging-only carrier for per-chunk graph entities/references (see the
+    # migration that added this column) — never copied into permanent chunks.
+    field :graph, :map, default: %{}
 
     timestamps(type: :utc_datetime_usec)
   end
@@ -66,7 +69,8 @@ defmodule RetrievalNode.Retrieval.PendingChunk do
     :secrets_status,
     :scrub_mode,
     :chunk_quality,
-    :embedding
+    :embedding,
+    :graph
   ]
 
   @doc "Changeset for a freshly-discovered raw row (`*Sync` workers)."

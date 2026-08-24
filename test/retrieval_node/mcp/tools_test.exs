@@ -5,8 +5,9 @@ defmodule RetrievalNode.MCP.ToolsTest do
   alias Anubis.Server.Frame
   alias Anubis.Server.Response
   alias RetrievalNode.Embedding
+  alias RetrievalNode.Graph.{Entity, EntityEdge, EntityMention}
   alias RetrievalNode.Ingest.GitMirror
-  alias RetrievalNode.MCP.Tools.{GetFile, Grep, ListRepos, SemanticSearch}
+  alias RetrievalNode.MCP.Tools.{GetFile, Grep, ListRepos, RelatedCode, SemanticSearch}
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.{Chunk, Source}
 
@@ -185,6 +186,206 @@ defmodule RetrievalNode.MCP.ToolsTest do
       # backfill nearest-neighbours from outside the filtered candidate set).
       %{"results" => none} = ok(SemanticSearch, %{query: "flurbo", repo: "no-such-repo"})
       assert none == []
+    end
+
+    test "rerank: true carries fused_score alongside score; omitted does not" do
+      source =
+        Repo.insert!(%Source{source_type: :git_repo, name: "acme/rr", identifier: "file:///rr"})
+
+      insert_chunk(source, :git_repo, "authentication and login handling",
+        repo: "acme/rr",
+        lang: "python",
+        breadcrumb: "acme/rr › auth.py › login"
+      )
+
+      %{"results" => [hit | _]} = ok(SemanticSearch, %{query: "authentication", rerank: true})
+      assert Map.has_key?(hit, "fused_score")
+      assert is_float(hit["fused_score"])
+
+      %{"results" => [hit | _]} = ok(SemanticSearch, %{query: "authentication"})
+      refute Map.has_key?(hit, "fused_score")
+    end
+
+    test "graph: true surfaces a chunk reachable only via an entity mention; omitted does not" do
+      source =
+        Repo.insert!(%Source{source_type: :git_repo, name: "acme/graph", identifier: "file:///g"})
+
+      entity =
+        Repo.insert!(%Entity{
+          source_id: source.id,
+          language: "python",
+          qualified_name: "PaymentProcessor.process_payment",
+          kind: :function
+        })
+
+      # No embedding and content unrelated to the query — reachable, if at
+      # all, only through the entity leg (mirrors HybridQueryTest's
+      # graph-leg seeding trick).
+      graph_only_chunk =
+        Repo.insert!(%Chunk{
+          source_id: source.id,
+          source_type: :git_repo,
+          repo: "acme/graph",
+          chunk_key: "k-graph-#{System.unique_integer([:positive])}",
+          content_hash: "h-graph-#{System.unique_integer([:positive])}",
+          content: "totally unrelated filler about zebras",
+          context_breadcrumb: "bc",
+          metadata: %{},
+          embedding: nil
+        })
+
+      Repo.insert!(%EntityMention{
+        entity_id: entity.id,
+        chunk_id: graph_only_chunk.id,
+        kind: :definition
+      })
+
+      %{"results" => without_graph} = ok(SemanticSearch, %{query: "payment processing"})
+      refute graph_only_chunk.id in Enum.map(without_graph, & &1["chunk_id"])
+
+      %{"results" => with_graph} =
+        ok(SemanticSearch, %{query: "payment processing", graph: true})
+
+      assert graph_only_chunk.id in Enum.map(with_graph, & &1["chunk_id"])
+    end
+  end
+
+  describe "related_code" do
+    defp graph_entity(source, qualified_name, opts \\ []) do
+      Repo.insert!(%Entity{
+        source_id: source.id,
+        language: Keyword.get(opts, :lang, "python"),
+        qualified_name: qualified_name,
+        kind: :function
+      })
+    end
+
+    defp graph_chunk(source, path, repo) do
+      Repo.insert!(%Chunk{
+        source_id: source.id,
+        source_type: :git_repo,
+        repo: repo,
+        chunk_key: "k-#{System.unique_integer([:positive])}",
+        content_hash: "h-#{System.unique_integer([:positive])}",
+        content: "def #{path}():\n    return 1\n",
+        context_breadcrumb: path,
+        metadata: %{"path" => path}
+      })
+    end
+
+    defp graph_mention(entity, chunk, kind),
+      do: Repo.insert!(%EntityMention{entity_id: entity.id, chunk_id: chunk.id, kind: kind})
+
+    defp graph_edge(source_entity, target_entity, kind, weight) do
+      Repo.insert!(%EntityEdge{
+        source_entity_id: source_entity.id,
+        target_entity_id: target_entity.id,
+        kind: kind,
+        weight: weight
+      })
+    end
+
+    test "definitions happy path returns the entity and its definition snippet" do
+      source = Repo.insert!(%Source{source_type: :git_repo, name: "d", identifier: "file:///d"})
+      entity = graph_entity(source, "PaymentProcessor.process")
+      chunk = graph_chunk(source, "process.py", "acme/d")
+      graph_mention(entity, chunk, :definition)
+
+      assert %{"entities" => [found], "definitions" => [snippet]} =
+               ok(RelatedCode, %{entity: "process"})
+
+      assert found["qualified_name"] == "PaymentProcessor.process"
+      assert found["kind"] == "function"
+      assert snippet["repo"] == "acme/d"
+      assert snippet["path"] == "process.py"
+    end
+
+    test "callers with hops=2 returns transitive callers tagged with the right hop" do
+      source = Repo.insert!(%Source{source_type: :git_repo, name: "c", identifier: "file:///c"})
+      target = graph_entity(source, "target_fn")
+      caller1 = graph_entity(source, "caller1_fn")
+      caller2 = graph_entity(source, "caller2_fn")
+
+      graph_edge(caller1, target, :calls, 3)
+      graph_edge(caller2, caller1, :calls, 7)
+
+      assert %{"entities" => entities} =
+               ok(RelatedCode, %{entity: "target_fn", relation: "callers", hops: 2})
+
+      by_name = Map.new(entities, &{&1["qualified_name"], &1})
+      assert %{"weight" => 3, "hop" => 1} = by_name["caller1_fn"]
+      assert %{"weight" => 7, "hop" => 2} = by_name["caller2_fn"]
+    end
+
+    test "an invalid relation is rejected with a listing of valid values" do
+      assert err(RelatedCode, %{entity: "x", relation: "bogus"}) =~ "unknown relation"
+    end
+
+    test "invalid hops values (0 and 3) are rejected with an error" do
+      for hops <- [0, 3] do
+        assert err(RelatedCode, %{entity: "x", hops: hops}) =~ "invalid hops"
+      end
+    end
+
+    test "an unmatched entity is a valid empty result, not an error" do
+      assert %{"entities" => [], "note" => note} =
+               ok(RelatedCode, %{entity: "NoSuchEntityAtAllZzz"})
+
+      assert note =~ "no entity matched"
+    end
+
+    test "an oversized entity name is rejected before it ever reaches a query" do
+      too_long = String.duplicate("a", 257)
+      assert err(RelatedCode, %{entity: too_long}) =~ "too long"
+    end
+
+    test "entity: \"%\" does not walk the corpus — LIKE metacharacters are escaped" do
+      source =
+        Repo.insert!(%Source{source_type: :git_repo, name: "esc", identifier: "file:///esc"})
+
+      _entity = graph_entity(source, "PaymentProcessor.process")
+
+      assert %{"entities" => [], "note" => note} = ok(RelatedCode, %{entity: "%"})
+      assert note =~ "no entity matched"
+    end
+
+    test "repo filter scopes resolution to entities mentioned in that repo" do
+      source_a = Repo.insert!(%Source{source_type: :git_repo, name: "ra", identifier: "acme/ra"})
+      source_b = Repo.insert!(%Source{source_type: :git_repo, name: "rb", identifier: "acme/rb"})
+
+      entity_a = graph_entity(source_a, "shared_fn")
+      entity_b = graph_entity(source_b, "shared_fn")
+
+      chunk_a = graph_chunk(source_a, "a.py", "repo-a")
+      chunk_b = graph_chunk(source_b, "b.py", "repo-b")
+
+      graph_mention(entity_a, chunk_a, :definition)
+      graph_mention(entity_b, chunk_b, :definition)
+
+      assert %{"entities" => [found], "definitions" => [snippet]} =
+               ok(RelatedCode, %{entity: "shared_fn", repo: "repo-a"})
+
+      assert found["qualified_name"] == "shared_fn"
+      assert snippet["repo"] == "repo-a"
+    end
+
+    test "lang filter scopes resolution to entities of that language" do
+      source = Repo.insert!(%Source{source_type: :git_repo, name: "lg", identifier: "acme/lg"})
+
+      python_entity = graph_entity(source, "shared_lang_fn", lang: "python")
+      js_entity = graph_entity(source, "shared_lang_fn", lang: "javascript")
+
+      python_chunk = graph_chunk(source, "a.py", "acme/lg")
+      js_chunk = graph_chunk(source, "a.js", "acme/lg")
+
+      graph_mention(python_entity, python_chunk, :definition)
+      graph_mention(js_entity, js_chunk, :definition)
+
+      assert %{"entities" => [found]} =
+               ok(RelatedCode, %{entity: "shared_lang_fn", lang: "javascript"})
+
+      assert found["qualified_name"] == "shared_lang_fn"
+      assert found["language"] == "javascript"
     end
   end
 

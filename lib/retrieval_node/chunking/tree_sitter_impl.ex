@@ -20,6 +20,7 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
 
   @behaviour RetrievalNode.Chunking
 
+  alias RetrievalNode.Graph.Extractor
   alias TreeSitterLanguagePack, as: TS
 
   @max_bytes Application.compile_env(:retrieval_node, [:chunking, :max_bytes], 2_000_000)
@@ -65,7 +66,22 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   end
 
   @doc """
-  Run `fun` (a 0-arity function returning `{:ok, chunks} | {:error, reason}`) in a
+  Like `chunk/2`, plus entities/references extracted from the SAME parse (one
+  parse, two consumers — see `RetrievalNode.Graph.Extractor.TreeSitter`'s
+  moduledoc). Same pre-flight guards and `guarded/1` Task isolation as
+  `chunk/2`; only plain maps (never NIF node refs) cross back out of the task.
+  """
+  @impl true
+  def chunk_with_graph(source, language) when is_binary(source) do
+    with :ok <- check_language_allowlist(language),
+         :ok <- check_size(source),
+         :ok <- check_binary_content(source) do
+      guarded(fn -> parse_to_chunks_and_graph(source, language) end)
+    end
+  end
+
+  @doc """
+  Run `fun` (a 0-arity function returning `{:ok, result} | {:error, reason}`) in a
   supervised, timeout-bounded, crash-isolated Task.
 
   `async_nolink` is the essential detail: an abnormal task exit does NOT propagate
@@ -74,8 +90,8 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   the Oban job process). Exposed (not private) so the guard behaviour is testable
   without the NIF.
   """
-  @spec guarded((-> {:ok, [map()]} | {:error, term()})) ::
-          {:ok, [map()]}
+  @spec guarded((-> {:ok, term()} | {:error, term()})) ::
+          {:ok, term()}
           | {:error, :chunk_timeout | :chunk_supervisor_down | {:chunk_crashed, term()} | term()}
   def guarded(fun) when is_function(fun, 0) do
     with {:ok, task} <- start_task(fun) do
@@ -118,6 +134,24 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
     do: if(lang in @allowed_languages, do: :ok, else: {:error, :unsupported_language})
 
   defp parse_to_chunks(source, language) do
+    with {:ok, root} <- parse_root(source, language) do
+      {:ok, extract(root, source, language, [])}
+    end
+  end
+
+  # Same parse as parse_to_chunks/2, walked twice: once for chunk boundaries
+  # (extract/4, unchanged), once for the full-tree graph walk
+  # (Graph.Extractor.TreeSitter). Only plain maps leave this function — `root`
+  # (a NIF node ref) never escapes the guarded Task.
+  defp parse_to_chunks_and_graph(source, language) do
+    with {:ok, root} <- parse_root(source, language),
+         {:ok, graph} <- Extractor.TreeSitter.extract({root, source}, language, []) do
+      chunks = extract(root, source, language, [])
+      {:ok, %{chunks: chunks, entities: graph.entities, references: graph.references}}
+    end
+  end
+
+  defp parse_root(source, language) do
     parser = TS.parser_new()
 
     case TS.parser_set_language(parser, language) do
@@ -127,7 +161,7 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
           |> TS.parser_parse(source)
           |> TS.tree_root_node()
 
-        {:ok, extract(root, source, language, [])}
+        {:ok, root}
 
       {:error, reason} ->
         {:error, {:language_load, reason}}

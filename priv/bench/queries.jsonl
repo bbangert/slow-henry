@@ -13,3 +13,12 @@
 {"query": "how is the RRF candidate pool size configured differently for tests versus prod", "relevant": [{"repo": "slow-henry", "path_prefix": "lib/retrieval_node/search/hybrid_query.ex"}], "note": "@candidate_pool via Application.compile_env :rrf_candidate_pool"}
 {"query": "how does the health check endpoint report embedding readiness", "relevant": [{"repo": "slow-henry", "path_prefix": "lib/retrieval_node_web/controllers/health_controller.ex"}], "note": "/healthz controller"}
 {"query": "where does the embedding warmer fire warmup after boot without blocking startup", "relevant": [{"repo": "slow-henry", "path_prefix": "lib/retrieval_node/embedding/warmer.ex"}], "note": "Warmer GenServer handle_continue"}
+{"query": "how are config entries set up unloaded and reloaded", "relevant": [{"repo": "core", "path_prefix": "homeassistant/config_entries.py"}], "note": "HA core ConfigEntries manager"}
+{"query": "where is the entity registry stored and how are entities registered", "relevant": [{"repo": "core", "path_prefix": "homeassistant/helpers/entity_registry.py"}], "note": "HA core entity registry"}
+{"query": "how do state change event listeners track entity state updates", "relevant": [{"repo": "core", "path_prefix": "homeassistant/helpers/event.py"}], "note": "async_track_state_change and friends"}
+{"query": "how does the recorder purge old history from the database", "relevant": [{"repo": "core", "path_prefix": "homeassistant/components/recorder/purge.py"}], "note": "recorder purge task"}
+{"query": "zwave thermostat climate target temperature and hvac mode handling", "relevant": [{"repo": "core", "path_prefix": "homeassistant/components/zwave_js/climate.py"}], "note": "zwave_js climate platform"}
+{"query": "how does the wifi component scan and connect to access points", "relevant": [{"repo": "esphome", "path_prefix": "esphome/components/wifi/"}], "note": "esphome wifi component"}
+{"query": "over the air firmware update component implementation", "relevant": [{"repo": "esphome", "path_prefix": "esphome/components/ota/"}], "note": "esphome OTA component"}
+{"query": "how does the remote UI cloud connection establish the snitun tunnel", "relevant": [{"repo": "hass-nabucasa", "path_prefix": "hass_nabucasa/remote.py"}], "note": "RemoteUI in hass-nabucasa"}
+{"query": "how are docker containers for addons created and started", "relevant": [{"repo": "supervisor", "path_prefix": "supervisor/docker/"}], "note": "supervisor docker layer"}

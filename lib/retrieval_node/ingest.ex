@@ -9,8 +9,10 @@ defmodule RetrievalNode.Ingest do
   """
   import Ecto.Query
 
+  alias RetrievalNode.Graph.{Entity, EntityEdge, EntityMention}
+  alias RetrievalNode.Ingest.Workers.RepoSync
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.Source
+  alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source, SyncState}
 
   @type repo_entry :: %{
           repo: String.t(),
@@ -62,4 +64,104 @@ defmodule RetrievalNode.Ingest do
 
   defp entry(%Source{} = s),
     do: %{repo: s.name, source_type: to_string(s.source_type), default_ref: nil}
+
+  @doc """
+  Forces a full re-sync of every active git source by clearing its sync
+  watermark (`sync_states.cursor`'s `"last_sha"`) and enqueueing a fresh
+  `RepoSync` job. `RepoSync` with no `last_sha` diffs against nothing and
+  stages every file in the repo (see its moduledoc); the existing
+  `chunk_key`/`content_hash` idempotency in `ChunkFiles`/`UpsertChunks` makes
+  the re-run a replace of each chunk, not a duplicate — this is how newly
+  added graph extraction (entities/mentions/edges) backfills onto a corpus
+  that was already ingested before that pipeline stage existed.
+
+  Only *active* git sources are touched (`policy: :deny` sources are included
+  deliberately — `RepoSync` has no policy gate, only `Ingest.list_repos/0`'s
+  MCP-facing catalog does); inactive sources and non-git sources are left
+  alone entirely.
+
+  `RepoSync` declares a 15-minute `unique` window on `source_id` — if a
+  cron-driven `SyncScheduler` tick already queued/started a `RepoSync` for a
+  source in that window, `Oban.insert/1` here collapses onto it instead of
+  adding a second job. That's fine: the cursor was already cleared before the
+  insert, so whichever job actually runs (this one or the cron one it
+  deduped onto) does the full re-stage regardless of which caller's args won.
+  """
+  @spec force_full_resync_git_sources() :: {:ok, non_neg_integer()} | {:error, term()}
+  def force_full_resync_git_sources do
+    Source
+    |> where([s], s.source_type == :git_repo and s.active == true)
+    |> Repo.all()
+    |> Enum.reduce_while({:ok, 0}, fn source, {:ok, count} ->
+      clear_sync_cursor!(source.id)
+
+      case Oban.insert(RepoSync.new(%{"source_id" => source.id})) do
+        {:ok, _job} -> {:cont, {:ok, count + 1}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp clear_sync_cursor!(source_id) do
+    case Repo.get_by(SyncState, source_id: source_id) do
+      nil -> Repo.insert!(%SyncState{source_id: source_id, cursor: %{}, status: :idle})
+      state -> state |> SyncState.changeset(%{cursor: %{}}) |> Repo.update!()
+    end
+  end
+
+  @doc """
+  Read-only snapshot of backfill progress: `pending_chunks` counts by stage
+  status, `oban_jobs` in-flight counts by queue and state, and corpus-wide
+  `graph` totals (entities/entity_mentions/entity_edges plus the chunk count
+  they're derived from). Used by `mix rn.graph.backfill --status` to monitor
+  a resync started elsewhere (the dev server's Oban queues) without touching
+  any state itself.
+  """
+  @spec backfill_status() :: %{
+          pending_chunks: %{String.t() => non_neg_integer()},
+          oban_jobs: %{String.t() => %{String.t() => non_neg_integer()}},
+          graph: %{
+            entities: non_neg_integer(),
+            entity_mentions: non_neg_integer(),
+            entity_edges: non_neg_integer(),
+            chunks: non_neg_integer()
+          }
+        }
+  def backfill_status do
+    %{
+      pending_chunks: pending_chunk_counts_by_status(),
+      oban_jobs: oban_job_counts_by_queue_and_state(),
+      graph: graph_totals()
+    }
+  end
+
+  defp pending_chunk_counts_by_status do
+    PendingChunk
+    |> group_by([p], p.status)
+    |> select([p], {p.status, count(p.id)})
+    |> Repo.all()
+    |> Map.new()
+  end
+
+  @in_flight_states ~w(available scheduled executing retryable)
+
+  defp oban_job_counts_by_queue_and_state do
+    Oban.Job
+    |> where([j], j.state in @in_flight_states)
+    |> group_by([j], [j.queue, j.state])
+    |> select([j], {j.queue, j.state, count(j.id)})
+    |> Repo.all()
+    |> Enum.reduce(%{}, fn {queue, state, count}, acc ->
+      Map.update(acc, queue, %{state => count}, &Map.put(&1, state, count))
+    end)
+  end
+
+  defp graph_totals do
+    %{
+      entities: Repo.aggregate(Entity, :count, :id),
+      entity_mentions: Repo.aggregate(EntityMention, :count, :id),
+      entity_edges: Repo.aggregate(EntityEdge, :count, :id),
+      chunks: Repo.aggregate(Chunk, :count, :id)
+    }
+  end
 end

@@ -20,4 +20,18 @@ defmodule RetrievalNode.ChunkingTest do
       refute Chunking.binary_content?("")
     end
   end
+
+  describe "chunk_with_graph/2 (heuristic impl — test env default, no NIF)" do
+    test "the configured impl does not export chunk_with_graph/2" do
+      refute function_exported?(Chunking.impl(), :chunk_with_graph, 2)
+    end
+
+    test "wraps chunk/2's result with empty entities/references" do
+      source = "def foo\n  1\nend\n"
+      {:ok, chunks} = Chunking.chunk(source, "ruby")
+
+      assert {:ok, %{chunks: ^chunks, entities: [], references: []}} =
+               Chunking.chunk_with_graph(source, "ruby")
+    end
+  end
 end
