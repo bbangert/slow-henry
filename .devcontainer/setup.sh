@@ -47,6 +47,14 @@ setup_postgres() {
 
 setup_postgres
 
+# gitleaks — used by RetrievalNode.Ingest.Scrubber for secret scanning; without
+# it the scrubber degrades to a weaker built-in regex scan.
+if ! command -v gitleaks >/dev/null 2>&1; then
+  GITLEAKS_VER="8.30.1"
+  curl -sL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VER}/gitleaks_${GITLEAKS_VER}_linux_x64.tar.gz" \
+    | sudo tar -xzf - -C /usr/local/bin gitleaks
+fi
+
 mise install
 
 # Export tool paths for the rest of this script (mise activate relies on

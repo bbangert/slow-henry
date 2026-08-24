@@ -24,6 +24,12 @@ defmodule RetrievalNode.Ingest.PendingChunks do
   # without actually constructing 2,000+ rows.
   @insert_batch_size 2_000
 
+  # An org-scale first sync can stage tens of thousands of full-file rows in
+  # one call, all inside the single atomic transaction below — comfortably
+  # past Ecto's default 15s connection-checkout timeout even though no single
+  # batch is slow. Config-overridable for the same reason as the batch size.
+  @insert_timeout :timer.minutes(5)
+
   @doc """
   Bulk-insert freshly-discovered raw rows, batched under Postgres's 65,535-bind-
   parameter limit (one `insert_all` per `#{@insert_batch_size}`-row batch), all
@@ -43,6 +49,12 @@ defmodule RetrievalNode.Ingest.PendingChunks do
   skips) — callers enqueue `ChunkFiles` per returned id, so a skipped row
   correctly gets no chunking job, and callers that zip ids back against input rows
   can rely on the ordering.
+
+  An org-scale first sync can push tens of thousands of full-file rows through
+  this one atomic transaction, legitimately exceeding Ecto's default 15s
+  connection-checkout timeout even though every individual batch is fast — so
+  the transaction and each batch's `insert_all` are given the longer,
+  config-overridable `@insert_timeout` deadline instead.
   """
   @spec insert_raw_all([map()]) :: {:ok, [integer()]}
   def insert_raw_all(rows) do
@@ -53,14 +65,16 @@ defmodule RetrievalNode.Ingest.PendingChunks do
 
     entries = Enum.map(kept, &entry(&1, now))
 
-    Repo.transaction(fn -> insert_batches(entries) end)
+    Repo.transaction(fn -> insert_batches(entries) end, timeout: insert_timeout())
   end
 
   defp insert_batches(entries) do
     entries
     |> Enum.chunk_every(insert_batch_size())
     |> Enum.map(fn batch ->
-      {_count, rows} = Repo.insert_all(PendingChunk, batch, returning: [:id])
+      {_count, rows} =
+        Repo.insert_all(PendingChunk, batch, returning: [:id], timeout: insert_timeout())
+
       Enum.map(rows, & &1.id)
     end)
     |> List.flatten()
@@ -68,6 +82,9 @@ defmodule RetrievalNode.Ingest.PendingChunks do
 
   defp insert_batch_size,
     do: Application.get_env(:retrieval_node, :insert_raw_batch_size, @insert_batch_size)
+
+  defp insert_timeout,
+    do: Application.get_env(:retrieval_node, :insert_raw_timeout, @insert_timeout)
 
   defp binary?(attrs), do: Chunking.binary_content?(Map.get(attrs, :raw_content) || "")
 

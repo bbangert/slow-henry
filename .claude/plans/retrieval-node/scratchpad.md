@@ -82,13 +82,15 @@ Phases 0–7 merged to `main` (last: PR #7, MCP tools). `main` @ `7a77ca2`. All 
 
 ## Open action items (carried into implementation)
 
-- [ ] **Org-scale ingest bugs (found live on the NabuCasa pull, 2026-07-15) — filed
-      as GitHub issues #9/#10/#11**: (9) staging `insert_all` blows the PG 65,535
-      bind-parameter cap on repos >~5.4k files — batch it in
-      `PendingChunks.insert_raw_all`; (10) submodule gitlink entries make
-      `git show` fail and kill the whole RepoSync — filter mode-160000 in
-      ls-tree/diff + skip-not-fail per-file; (11) empty repos (unborn HEAD) crash
-      `head_sha` → should no-op sync. 4 of 71 NC sources discarded on these.
+- [x] **Org-scale ingest bugs #9/#10/#11 — FIXED, PR #14 merged 2026-07-15**
+      (batched staging inserts, gitlink filtering + per-file skip, empty-repo
+      no-op). Live-verified: buildroot-installer 12,896 files staged; yellow
+      synced sans submodule; raspberrypi-linux confirmed the batching then was
+      deliberately DROPPED (source deactivated + 1.32M staged rows purged —
+      kernel fork, not worth indexing). `home-assistant-issues` deactivated:
+      the repo now 404s upstream (deleted/renamed) — unrelated to #11.
+      Remaining open issue: #13 (hnsw.ef_search 40 vs 200-deep RRF pool —
+      measure nDCG via rn.bench first).
 
 - [x] **Verify tree-sitter NIF is dirty-scheduled** — DONE, and the answer is **NO**.
       `deps/tree_sitter_language_pack/native/.../src/lib.rs`: every `#[rustler::nif]` is
