@@ -12,8 +12,11 @@ defmodule RetrievalNode.MCP.Tools.RelatedCode do
     * `"definitions"` — where the matched entities are defined
     * `"callers"`     — entities that call the matched entities
     * `"callees"`     — entities the matched entities call
-    * `"importers"`   — entities that import the matched entities
-    * `"imports"`     — entities the matched entities import
+    * `"importers"`   — entities that import the matched entities, resolved
+      via import mentions on definition chunks (most imports are file-level
+      and never produce an edge — see `RetrievalNode.Graph.related_entities/3`)
+    * `"imports"`     — entities the matched entities import, resolved the
+      same way
 
   `hops: 2` extends `callers`/`callees`/`importers`/`imports` one edge
   further (transitive callers-of-callers, etc). Matching zero entities is a
@@ -50,7 +53,9 @@ defmodule RetrievalNode.MCP.Tools.RelatedCode do
 
     field(:relation, :string,
       description:
-        "One of definitions | callers | callees | imports | importers (default \"definitions\")"
+        "One of definitions | callers | callees | imports | importers (default \"definitions\"). " <>
+          "imports/importers are resolved via import mentions on definition chunks " <>
+          "(most imports are file-level and carry no call-style edge); hop 2 follows the same relation."
     )
 
     field(:hops, :integer,

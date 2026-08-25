@@ -51,8 +51,19 @@ setup_postgres
 # it the scrubber degrades to a weaker built-in regex scan.
 if ! command -v gitleaks >/dev/null 2>&1; then
   GITLEAKS_VER="8.30.1"
-  curl -sL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VER}/gitleaks_${GITLEAKS_VER}_linux_x64.tar.gz" \
-    | sudo tar -xzf - -C /usr/local/bin gitleaks
+
+  case "$(uname -m)" in
+    x86_64) GITLEAKS_ARCH="x64" ;;
+    aarch64 | arm64) GITLEAKS_ARCH="arm64" ;;
+    *) GITLEAKS_ARCH="" ;;
+  esac
+
+  if [ -n "${GITLEAKS_ARCH}" ]; then
+    curl -sL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VER}/gitleaks_${GITLEAKS_VER}_linux_${GITLEAKS_ARCH}.tar.gz" \
+      | sudo tar -xzf - -C /usr/local/bin gitleaks
+  else
+    echo "warning: unsupported architecture $(uname -m) for gitleaks — skipping install; the scrubber degrades to its built-in regex scan" >&2
+  fi
 fi
 
 mise install

@@ -418,6 +418,56 @@ defmodule RetrievalNode.GraphTest do
 
       assert new_target_id == entity_c.id
     end
+
+    test "a re-ingested file whose definition drops ALL its calls sheds its stale outgoing edge",
+         %{source: source} do
+      natural_key = "repo:acme/app:staleness-empty.py"
+
+      force_chunk_with_graph(rechunk_result("b"))
+      run_pipeline(seed_raw(source, "def a():\n    b()\n", natural_key))
+
+      entities = Entity |> Repo.all() |> Map.new(&{&1.qualified_name, &1})
+      entity_a = entities["a"]
+      entity_b = entities["b"]
+
+      assert Repo.aggregate(EntityEdge, :count, :id) == 1
+
+      # Re-ingest the same natural_key with a new aggregate that has NO
+      # references at all — the empty-aggregate case that the old
+      # aggregated-only delete scope skipped entirely, leaving the stale
+      # a -> b edge behind forever.
+      force_chunk_with_graph(
+        {:ok,
+         %{
+           chunks: [
+             %{
+               text: "def a():\n    return 1\n",
+               breadcrumb: "a",
+               start_line: 1,
+               end_line: 2,
+               kind: "function_definition",
+               parse_status: :ok
+             }
+           ],
+           entities: [%{qualified_name: "a", kind: :function, line: 1}],
+           references: []
+         }}
+      )
+
+      run_pipeline(seed_raw(source, "def a():\n    return 1\n", natural_key))
+
+      # the stale a -> b edge is gone
+      assert Repo.all(from e in EntityEdge, where: e.source_entity_id == ^entity_a.id) == []
+
+      # entities and mentions are otherwise correct: "a" still exists with a
+      # definition mention, and "b" (no longer called or defined) survives as
+      # a now-orphaned entity untouched by this batch.
+      assert Repo.get!(Entity, entity_a.id)
+      assert Repo.get!(Entity, entity_b.id)
+
+      assert [%{kind: :definition}] =
+               Repo.all(from m in EntityMention, where: m.entity_id == ^entity_a.id)
+    end
   end
 
   describe "reference-only entities never clobber a definition" do
@@ -906,6 +956,43 @@ defmodule RetrievalNode.GraphTest do
 
       assert [%{entity: found_imported}] = Graph.related_entities([importer.id], :imports, 1)
       assert found_imported.id == imported.id
+    end
+
+    test "a file-level import (from: nil, no entity_edges row) still resolves via import-mention",
+         %{source: source} do
+      force_chunk_with_graph(
+        {:ok,
+         %{
+           chunks: [
+             %{
+               text: "import os\n\ndef a():\n    return 1\n",
+               breadcrumb: "a",
+               start_line: 1,
+               end_line: 4,
+               kind: "function_definition",
+               parse_status: :ok
+             }
+           ],
+           entities: [%{qualified_name: "a", kind: :function, line: 3}],
+           references: [%{name: "os", kind: :import, from: nil, line: 1}]
+         }}
+      )
+
+      run_pipeline(seed_raw(source, "import os\n\ndef a():\n    return 1\n"))
+
+      entity_a = Repo.get_by!(Entity, qualified_name: "a")
+      entity_os = Repo.get_by!(Entity, qualified_name: "os")
+
+      # from: nil never resolves to a source_entity_id, so no edge exists —
+      # proving the assertions below can only pass via mention-based
+      # resolution, not the entity_edges leg.
+      assert Repo.aggregate(EntityEdge, :count, :id) == 0
+
+      assert [%{entity: found, hop: 1}] = Graph.related_entities([entity_os.id], :importers, 1)
+      assert found.id == entity_a.id
+
+      assert [%{entity: found, hop: 1}] = Graph.related_entities([entity_a.id], :imports, 1)
+      assert found.id == entity_os.id
     end
   end
 

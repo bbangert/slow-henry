@@ -1,10 +1,12 @@
 defmodule RetrievalNodeWeb.HealthControllerTest do
-  # Mutates global Application env (:embedding_serving_start) in the 503 test,
-  # so this file must run async: false to avoid racing other test processes
-  # that read the same key.
+  # Mutates global Application env (:embedding_serving_start,
+  # :reranking_serving_start) in the 503 tests, so this file must run
+  # async: false to avoid racing other test processes that read the same
+  # keys.
   use RetrievalNodeWeb.ConnCase, async: false
 
-  alias RetrievalNode.Embedding.Serving
+  alias RetrievalNode.Embedding.Serving, as: EmbeddingServing
+  alias RetrievalNode.Reranking.Serving, as: RerankingServing
 
   describe "GET /healthz — all config-disabled subsystems skipped, DB real" do
     test "200 with every gate ok or skipped", %{conn: conn} do
@@ -16,6 +18,7 @@ defmodule RetrievalNodeWeb.HealthControllerTest do
                  "grammar_cache" => %{"status" => "skipped"},
                  "nx_backend" => %{"status" => "skipped"},
                  "embedding_warm" => %{"status" => "skipped"},
+                 "reranking_warm" => %{"status" => "skipped"},
                  "db" => %{"status" => "ok"}
                }
              } = json_response(conn, 200)
@@ -26,11 +29,11 @@ defmodule RetrievalNodeWeb.HealthControllerTest do
     setup do
       original = Application.get_env(:retrieval_node, :embedding_serving_start, false)
       Application.put_env(:retrieval_node, :embedding_serving_start, true)
-      Serving.reset_ready()
+      EmbeddingServing.reset_ready()
 
       on_exit(fn ->
         Application.put_env(:retrieval_node, :embedding_serving_start, original)
-        Serving.reset_ready()
+        EmbeddingServing.reset_ready()
       end)
 
       :ok
@@ -43,6 +46,32 @@ defmodule RetrievalNodeWeb.HealthControllerTest do
                "status" => "error",
                "checks" => %{
                  "embedding_warm" => %{"status" => "error", "detail" => %{"ready" => false}}
+               }
+             } = json_response(conn, 503)
+    end
+  end
+
+  describe "GET /healthz — reranking_warm mirrors the embedding_warm gate" do
+    setup do
+      original = Application.get_env(:retrieval_node, :reranking_serving_start, false)
+      Application.put_env(:retrieval_node, :reranking_serving_start, true)
+      RerankingServing.reset_ready()
+
+      on_exit(fn ->
+        Application.put_env(:retrieval_node, :reranking_serving_start, original)
+        RerankingServing.reset_ready()
+      end)
+
+      :ok
+    end
+
+    test "503 with reranking_warm failed (serving never started in test)", %{conn: conn} do
+      conn = get(conn, ~p"/healthz")
+
+      assert %{
+               "status" => "error",
+               "checks" => %{
+                 "reranking_warm" => %{"status" => "error", "detail" => %{"ready" => false}}
                }
              } = json_response(conn, 503)
     end

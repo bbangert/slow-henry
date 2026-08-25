@@ -369,6 +369,23 @@ defmodule RetrievalNode.MCP.ToolsTest do
       assert snippet["repo"] == "repo-a"
     end
 
+    test "importers resolves via import mentions when no edge exists (file-level import)" do
+      source =
+        Repo.insert!(%Source{source_type: :git_repo, name: "imp", identifier: "file:///imp"})
+
+      importer = graph_entity(source, "app_module")
+      imported = graph_entity(source, "os")
+
+      chunk = graph_chunk(source, "app.py", "acme/imp")
+      graph_mention(importer, chunk, :definition)
+      graph_mention(imported, chunk, :import)
+
+      assert %{"entities" => [found]} =
+               ok(RelatedCode, %{entity: "os", relation: "importers"})
+
+      assert found["qualified_name"] == "app_module"
+    end
+
     test "lang filter scopes resolution to entities of that language" do
       source = Repo.insert!(%Source{source_type: :git_repo, name: "lg", identifier: "acme/lg"})
 

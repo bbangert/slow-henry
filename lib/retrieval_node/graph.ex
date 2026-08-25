@@ -95,7 +95,7 @@ defmodule RetrievalNode.Graph do
     delete_stale_mentions(repo, chunk_ids)
     mentions_written = insert_mentions(repo, staged_rows, chunk_ids_by_key, entity_ids, now)
 
-    edges_written = upsert_edges(repo, staged_rows, entity_ids, now)
+    edges_written = upsert_edges(repo, staged_rows, entity_ids, def_entities, now)
 
     {:ok,
      %{
@@ -257,30 +257,49 @@ defmodule RetrievalNode.Graph do
   defp run_limited(query, limit), do: query |> limit(^limit) |> Repo.all()
 
   @doc """
-  Traverse `entity_edges` from `entity_ids` along `relation`, 1 or 2 hops:
+  Traverse from `entity_ids` along `relation`, 1 or 2 hops:
 
     * `:callers`   — edges kind `:calls`, `target_entity_id` in the set;
       returns the calling (source) entities.
     * `:callees`   — edges kind `:calls`, `source_entity_id` in the set;
       returns the called (target) entities.
-    * `:importers` — edges kind `:imports`, `target_entity_id` in the set;
-      returns the importing (source) entities.
-    * `:imports`   — edges kind `:imports`, `source_entity_id` in the set;
-      returns the imported (target) entities.
+    * `:importers` — entities that import the matched entities.
+    * `:imports`   — entities the matched entities import.
 
-  `hops: 2` repeats the traversal starting from the first hop's entities,
-  unions the two hops, and dedups by entity — an entity reached at hop 1
-  is excluded from the hop-2 set (so it keeps its hop-1 weight/tag), and
-  the original seed ids are excluded from both hops (guards against a
-  traversal cycling back to a seed). Ties within a hop (the same entity
-  reachable via more than one edge) keep the larger weight. Final results
-  are ordered by weight desc and capped at #{@related_entities_limit}.
+  `:callers`/`:callees` traverse `entity_edges` only. `:importers`/`:imports`
+  UNION two resolution legs, deduped by entity id (ties keep the larger
+  weight):
 
-  Each underlying edge traversal is itself capped at
-  #{@edge_fanout_limit} edges (ordered by weight desc — see `edges_query/4`),
-  and the hop-1 -> hop-2 frontier is capped at #{@hop2_frontier_limit} entity
-  ids (also by weight desc) so a hot symbol's fan-out can't compound across
-  two hops into an unbounded traversal.
+    1. `entity_edges` kind `:imports` (same shape as callers/callees) — fires
+       when a reference happened to resolve a `from` (an import inside a
+       function/method scope, say).
+    2. Mention-based: a **file-level** import — the common case — carries
+       `from: nil` (no enclosing definition to source an edge from), so it
+       never produces an `entity_edges` row at all. Its only record is two
+       `entity_mentions` sharing one `chunk_id`: an `:import` mention of the
+       imported entity and a `:definition` mention of the importing file's
+       definition entity on that same chunk. `:importers` of X resolves this
+       by finding chunks with an `:import` mention of X, then those chunks'
+       `:definition` mentions; `:imports` of X resolves the opposite
+       direction (chunks with a `:definition` mention of X, then those
+       chunks' `:import` mentions). Weight is the count of qualifying import
+       mentions.
+
+  `hops: 2` repeats the same resolution (both legs, for imports/importers)
+  starting from the first hop's entities, unions the two hops, and dedups by
+  entity — an entity reached at hop 1 is excluded from the hop-2 set (so it
+  keeps its hop-1 weight/tag), and the original seed ids are excluded from
+  both hops (guards against a traversal cycling back to a seed). Ties within
+  a hop (the same entity reachable more than once) keep the larger weight.
+  Final results are ordered by weight desc and capped at
+  #{@related_entities_limit}.
+
+  Each underlying query (edge or mention leg) is itself capped at
+  #{@edge_fanout_limit} rows (ordered by weight/count desc — see
+  `edges_query/4` and the mention-leg query functions), and the hop-1 ->
+  hop-2 frontier is capped at #{@hop2_frontier_limit} entity ids (also by
+  weight desc) so a hot symbol's fan-out can't compound across two hops into
+  an unbounded traversal.
   """
   @spec related_entities([Ecto.UUID.t()], :callers | :callees | :imports | :importers, 1 | 2) ::
           [%{entity: Entity.t(), weight: integer(), hop: 1 | 2}]
@@ -355,10 +374,13 @@ defmodule RetrievalNode.Graph do
     do: edges_query(ids, :calls, :source_entity_id, :target_entity_id)
 
   defp traverse_edges(ids, :importers),
-    do: edges_query(ids, :imports, :target_entity_id, :source_entity_id)
+    do:
+      edges_query(ids, :imports, :target_entity_id, :source_entity_id) ++
+        importers_by_mention(ids)
 
   defp traverse_edges(ids, :imports),
-    do: edges_query(ids, :imports, :source_entity_id, :target_entity_id)
+    do:
+      edges_query(ids, :imports, :source_entity_id, :target_entity_id) ++ imports_by_mention(ids)
 
   defp edges_query(ids, kind, filter_field, select_field) do
     from(e in EntityEdge,
@@ -367,6 +389,44 @@ defmodule RetrievalNode.Graph do
       # Bounds one traversal query — hot symbols like `init` can have
       # six-figure in-degree in a many-repo corpus.
       order_by: [desc: e.weight],
+      limit: @edge_fanout_limit
+    )
+    |> Repo.all()
+  end
+
+  # Mention-based leg of :importers — see related_entities/3's doc for why
+  # this exists (file-level imports have `from: nil` and so never produce an
+  # entity_edges row). Finds chunks carrying an :import mention of one of
+  # `ids`, then those chunks' :definition mentions — the defining entity of
+  # each such chunk is "an importer of X". Weight is the count of qualifying
+  # import mentions per resulting entity. Bounded at @edge_fanout_limit rows,
+  # same rationale as edges_query/4 — a widely-imported module could
+  # otherwise pull an unbounded number of importing chunks into memory.
+  defp importers_by_mention(ids) do
+    from(m in EntityMention,
+      join: d in EntityMention,
+      on: d.chunk_id == m.chunk_id and d.kind == :definition,
+      where: m.kind == :import and m.entity_id in ^ids and d.entity_id not in ^ids,
+      group_by: d.entity_id,
+      select: %{entity_id: d.entity_id, weight: count(m.id)},
+      order_by: [desc: count(m.id)],
+      limit: @edge_fanout_limit
+    )
+    |> Repo.all()
+  end
+
+  # Mention-based leg of :imports — the mirror image of importers_by_mention/1:
+  # chunks carrying a :definition mention of one of `ids`, then those chunks'
+  # :import mentions — each imported entity is "imported by X". Same bound
+  # and weight rationale as importers_by_mention/1.
+  defp imports_by_mention(ids) do
+    from(m in EntityMention,
+      join: i in EntityMention,
+      on: i.chunk_id == m.chunk_id and i.kind == :import,
+      where: m.kind == :definition and m.entity_id in ^ids and i.entity_id not in ^ids,
+      group_by: i.entity_id,
+      select: %{entity_id: i.entity_id, weight: count(i.id)},
+      order_by: [desc: count(i.id)],
       limit: @edge_fanout_limit
     )
     |> Repo.all()
@@ -800,17 +860,26 @@ defmodule RetrievalNode.Graph do
 
   # --- edges -----------------------------------------------------------
 
-  defp upsert_edges(repo, staged_rows, entity_ids, now) do
+  defp upsert_edges(repo, staged_rows, entity_ids, def_entities, now) do
     aggregated =
       staged_rows
       |> Enum.flat_map(&Map.get(&1.graph, "references", []))
       |> Enum.reduce(%{}, &accumulate_edge(&2, &1, entity_ids))
 
-    if aggregated == %{} do
-      0
-    else
-      write_edges(repo, aggregated, now)
-    end
+    # Every reference's "from" name is (per accumulate_edge/3's contract) an
+    # enclosing definition in this same file/batch, so this batch's
+    # definition-entity ids are a superset of every id an edge could possibly
+    # be sourced from — including definitions that used to have outgoing
+    # edges but contributed nothing to `aggregated` this time (dropped all
+    # their calls). Deleting only `aggregated`'s (possibly smaller) set of
+    # source ids, as the old code did, left such a definition's stale edges
+    # behind forever.
+    def_entity_ids =
+      def_entities
+      |> Enum.map(&entity_ids[&1.qualified_name])
+      |> Enum.reject(&is_nil/1)
+
+    write_edges(repo, def_entity_ids, aggregated, now)
   end
 
   # Only a reference with BOTH ends resolved (its enclosing definition AND
@@ -838,20 +907,21 @@ defmodule RetrievalNode.Graph do
           "unknown edge kind #{inspect(other)} — expected \"call\" or \"import\""
   end
 
-  defp write_edges(repo, aggregated, now) do
-    source_entity_ids =
-      aggregated
-      |> Map.keys()
-      |> Enum.map(fn {source_id, _target, _kind} -> source_id end)
-      |> Enum.uniq()
-
+  defp write_edges(repo, def_entity_ids, aggregated, now) do
     # An entity's outgoing edges are wholly re-derived from its own file on
     # every ingest of that file — same staleness rationale as mentions.
+    # Scoped to EVERY definition entity resolved from this batch
+    # (def_entity_ids), not just the source ids still present in
+    # `aggregated` — this must run even when `aggregated` is empty (a
+    # definition that dropped every one of its calls), which is exactly the
+    # case an aggregated-only scope would miss.
     # Known best-effort gap: a from-entity defined under the same
     # qualified_name in two files of one source will have its edges
     # overwritten by whichever file is ingested last (the common case is one
     # definition per qualified_name per source, so this rarely bites).
-    repo.delete_all(from(e in EntityEdge, where: e.source_entity_id in ^source_entity_ids))
+    unless def_entity_ids == [] do
+      repo.delete_all(from(e in EntityEdge, where: e.source_entity_id in ^def_entity_ids))
+    end
 
     entries =
       aggregated

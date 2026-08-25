@@ -15,30 +15,36 @@ defmodule RetrievalNodeWeb.HealthController do
       `design-build.md` §4 step 2).
     * `embedding_warm` — `RetrievalNode.Embedding.Serving.ready?/0`, i.e. the
       warmup dummy inference (JIT compile) has completed.
+    * `reranking_warm` — `RetrievalNode.Reranking.Serving.ready?/0`, same
+      warmup-readiness check as `embedding_warm`, for the cross-encoder
+      reranking serving.
     * `db` — `RetrievalNode.Repo` can round-trip a trivial query.
 
   ## Skip rule
 
   `nx_backend` and `embedding_warm` only matter when the real `Nx.Serving`
-  sub-tree is running (`:embedding_serving_start`); `grammar_cache` only
-  matters when the configured `:chunking_impl` actually uses the tree-sitter
-  NIF. A config-disabled subsystem must not fail readiness for a node that was
-  deliberately built without it — those gates report `"skipped"` and count as
-  passing.
+  sub-tree is running (`:embedding_serving_start`); `reranking_warm` only
+  matters when its own serving is running (`:reranking_serving_start`);
+  `grammar_cache` only matters when the configured `:chunking_impl` actually
+  uses the tree-sitter NIF. A config-disabled subsystem must not fail
+  readiness for a node that was deliberately built without it — those gates
+  report `"skipped"` and count as passing.
   """
 
   use RetrievalNodeWeb, :controller
 
   alias RetrievalNode.Chunking
   alias RetrievalNode.Chunking.Grammars
-  alias RetrievalNode.Embedding.Serving
+  alias RetrievalNode.Embedding.Serving, as: EmbeddingServing
   alias RetrievalNode.Repo
+  alias RetrievalNode.Reranking.Serving, as: RerankingServing
 
   def show(conn, _params) do
     checks = %{
       grammar_cache: grammar_cache_check(),
       nx_backend: nx_backend_check(),
       embedding_warm: embedding_warm_check(),
+      reranking_warm: reranking_warm_check(),
       db: db_check()
     }
 
@@ -100,7 +106,17 @@ defmodule RetrievalNodeWeb.HealthController do
 
   defp embedding_warm_check do
     if embedding_serving_start?() do
-      if Serving.ready?(), do: ok(), else: error(%{ready: false})
+      if EmbeddingServing.ready?(), do: ok(), else: error(%{ready: false})
+    else
+      skipped()
+    end
+  end
+
+  # --- Gate: reranking_warm -------------------------------------------------
+
+  defp reranking_warm_check do
+    if reranking_serving_start?() do
+      if RerankingServing.ready?(), do: ok(), else: error(%{ready: false})
     else
       skipped()
     end
@@ -123,6 +139,9 @@ defmodule RetrievalNodeWeb.HealthController do
 
   defp embedding_serving_start?,
     do: Application.get_env(:retrieval_node, :embedding_serving_start, true)
+
+  defp reranking_serving_start?,
+    do: Application.get_env(:retrieval_node, :reranking_serving_start, true)
 
   defp ok, do: %{status: :ok, detail: nil}
   defp skipped, do: %{status: :skipped, detail: nil}
