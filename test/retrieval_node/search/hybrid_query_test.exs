@@ -309,6 +309,45 @@ defmodule RetrievalNode.Search.HybridQueryTest do
 
       assert Enum.map(hits, & &1.chunk.id) == expected_top2
     end
+
+    test "rerank normalizes an invalid top_k the same way the non-rerank path does (no raise, default 20)" do
+      source = source_fixture("repo-a")
+      query = "quick brown fox"
+
+      chunks =
+        for i <- 1..3 do
+          chunk_fixture(source,
+            repo: "repo-a",
+            content: "quick brown fox variant #{i}",
+            embedding: axis(0)
+          )
+        end
+
+      for bad_top_k <- [-1, "nope"] do
+        rerank_hits =
+          Search.hybrid_search(query,
+            embedding: axis(0),
+            repo: "repo-a",
+            rerank: true,
+            top_k: bad_top_k
+          )
+
+        non_rerank_hits =
+          Search.hybrid_search(query,
+            embedding: axis(0),
+            repo: "repo-a",
+            rerank: false,
+            top_k: bad_top_k
+          )
+
+        # top_k clamps to the default (20), which is >= all 3 seeded chunks —
+        # both paths return every chunk instead of raising or silently
+        # dropping results (the pre-fix Enum.take(-1) bug, or a raise on a
+        # non-integer top_k reaching Enum.take/2 or Postgres' $4 bind).
+        assert length(rerank_hits) == length(chunks)
+        assert length(non_rerank_hits) == length(chunks)
+      end
+    end
   end
 
   describe "significant_terms/1" do

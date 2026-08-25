@@ -659,6 +659,24 @@ defmodule RetrievalNode.GraphTest do
   end
 
   describe "gc_orphaned_entities/1" do
+    # The lock-and-recheck fix in delete_orphaned_batch/1 (candidate select
+    # FOR UPDATE SKIP LOCKED, then a DELETE that rechecks the zero-mention
+    # condition itself) exists to close a snapshot race against a *second*,
+    # genuinely concurrent Postgres transaction landing a mention insert
+    # between this module's SELECT and DELETE. `DataCase`'s sandbox gives
+    # every process in a test the SAME underlying connection/transaction
+    # (savepoints, not real concurrent transactions), so there is no seam
+    # here to drive that interleaving honestly without hand-rolling a second
+    # real connection outside the sandbox — not attempted, to avoid
+    # contorting the test's transactional isolation for the rest of the
+    # suite. The mechanism itself was verified by hand during development:
+    # capturing the statement log around a call to gc_orphaned_entities/1
+    # shows the candidate SELECT carrying `FOR UPDATE SKIP LOCKED` and the
+    # DELETE carrying its own `NOT EXISTS` recheck (matching
+    # delete_orphaned_batch/1's SQL exactly). What the tests below cover
+    # instead is the observable contract the fix must preserve: an entity
+    # with a mention is never deleted, a zero-mention entity is, and batching
+    # still exhausts every orphan across rounds.
     defp seed_chunk(source, path, chunk_key) do
       Repo.insert!(%Chunk{
         source_id: source.id,

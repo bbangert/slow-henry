@@ -298,11 +298,15 @@ defmodule RetrievalNode.Search.HybridQuery do
   (default #{@default_top_k}). `:source_type` is the DB enum string
   (`"git_repo"`/`"jira_project"`/`"drive_folder"`).
 
-  `:graph` (default from config `:graph_leg_default`, currently `false` until
-  the Phase-3.3 EXPLAIN + latency validation on the real corpus passes) adds
-  the third entity-mention leg described in the moduledoc. When true but
-  `text_query` yields no `significant_terms/1`, the leg is silently skipped
-  (nothing to match) and the plain two-leg query runs instead.
+  `:graph` (default from config `:graph_leg_default`, currently `false`) adds
+  the third entity-mention leg described in the moduledoc. The Phase-3.3
+  EXPLAIN + latency validation has passed on the full 595k-chunk corpus (all
+  three legs stay index-driven; the graph leg adds ~71ms end-to-end) — it
+  ships opt-in as a latency/relevance tradeoff (that cost is paid on every
+  request the leg runs on, proven relevance win or not), not because
+  validation is still pending. When true but `text_query` yields no
+  `significant_terms/1`, the leg is silently skipped (nothing to match) and
+  the plain two-leg query runs instead.
   """
   @spec search(opts) :: [result]
   # sobelow: `sql` is one of two compile-time module attributes (@sql /
@@ -366,6 +370,22 @@ defmodule RetrievalNode.Search.HybridQuery do
     |> Enum.take(@max_terms)
   end
 
+  @doc """
+  Clamp a caller-supplied `top_k` to `[1, #{@max_top_k}]`, defaulting to
+  #{@default_top_k} for anything that isn't a positive integer (`nil`, a
+  float, a negative number, or a non-numeric value like a string) — the
+  same normalization `search/1` applies to its own `:top_k` option.
+
+  Exposed so other callers that pick their own candidate pool size ahead of
+  calling `search/1` (namely `Search`'s rerank funnel, which needs the final
+  result count *before* it fetches an RRF pool) share exactly this
+  normalization instead of duplicating `#{@max_top_k}`/`#{@default_top_k}` as
+  separate constants.
+  """
+  @spec clamp_top_k(term()) :: pos_integer()
+  def clamp_top_k(k) when is_integer(k) and k >= 1, do: min(k, @max_top_k)
+  def clamp_top_k(_), do: @default_top_k
+
   defp row_to_result([id, source_type, repo, lang, breadcrumb, metadata, fused_score]) do
     %{
       chunk_id: Ecto.UUID.cast!(id),
@@ -382,9 +402,4 @@ defmodule RetrievalNode.Search.HybridQuery do
   defp to_float(%Decimal{} = d), do: Decimal.to_float(d)
   defp to_float(n) when is_float(n), do: n
   defp to_float(n) when is_integer(n), do: n * 1.0
-
-  # Clamp to [1, @max_top_k] so a caller (eventually the MCP tool layer) can't
-  # request an unbounded or nonsensical LIMIT.
-  defp clamp_top_k(k) when is_integer(k) and k >= 1, do: min(k, @max_top_k)
-  defp clamp_top_k(_), do: @default_top_k
 end

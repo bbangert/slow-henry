@@ -257,6 +257,119 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
     end
   end
 
+  describe "typescript" do
+    @src """
+    interface Shape {
+      area(): number;
+    }
+
+    class Circle {
+      area(): number {
+        return this.helper();
+      }
+
+      helper(): number {
+        return 1;
+      }
+    }
+
+    function standalone(): number {
+      return helper2();
+    }
+
+    function helper2(): number {
+      return 2;
+    }
+
+    import { thing } from "./thing";
+    """
+
+    test "entities: interface (class-like) and class, method-inside-class, top-level functions" do
+      %{entities: entities} = extract(@src, "typescript")
+
+      assert %{qualified_name: "Shape", kind: :class} = find(entities, "Shape")
+      assert %{qualified_name: "Circle", kind: :class} = find(entities, "Circle")
+      assert %{qualified_name: "Circle.area", kind: :method} = find(entities, "Circle.area")
+      assert %{qualified_name: "Circle.helper", kind: :method} = find(entities, "Circle.helper")
+      assert %{qualified_name: "standalone", kind: :function} = find(entities, "standalone")
+      assert %{qualified_name: "helper2", kind: :function} = find(entities, "helper2")
+    end
+
+    test "qualified-callee resolution: this.helper() -> \"helper\", scoped to Circle.area; a bare call scoped to its top-level function" do
+      %{references: refs} = extract(@src, "typescript")
+
+      assert %{name: "helper", kind: :call, from: "Circle.area"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+
+      assert %{name: "helper2", kind: :call, from: "standalone"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper2"))
+    end
+
+    test "import: source string with quotes stripped" do
+      %{references: refs} = extract(@src, "typescript")
+
+      assert Enum.any?(refs, &(&1.kind == :import and &1.name == "./thing" and &1.from == nil))
+    end
+  end
+
+  describe "rust" do
+    @src """
+    struct Point {
+        x: i32,
+    }
+
+    impl Point {
+        fn distance(&self) -> i32 {
+            self.helper()
+        }
+
+        fn helper(&self) -> i32 {
+            1
+        }
+    }
+
+    fn main() {
+        helper_fn();
+    }
+
+    fn helper_fn() -> i32 {
+        2
+    }
+
+    use std::collections::HashMap;
+    """
+
+    test "entities: struct, impl block (named via its \"type\" field), and methods-inside-impl, top-level function" do
+      %{entities: entities} = extract(@src, "rust")
+
+      assert %{qualified_name: "Point", kind: :class} = find(entities, "Point")
+      assert %{qualified_name: "Point.distance", kind: :method} = find(entities, "Point.distance")
+      assert %{qualified_name: "Point.helper", kind: :method} = find(entities, "Point.helper")
+      assert %{qualified_name: "main", kind: :function} = find(entities, "main")
+      assert %{qualified_name: "helper_fn", kind: :function} = find(entities, "helper_fn")
+    end
+
+    test "qualified-callee resolution: self.helper() -> \"helper\", scoped to Point.distance; a bare call scoped to main" do
+      %{references: refs} = extract(@src, "rust")
+
+      assert %{name: "helper", kind: :call, from: "Point.distance"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+
+      assert %{name: "helper_fn", kind: :call, from: "main"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper_fn"))
+    end
+
+    test "import: use_declaration argument text" do
+      %{references: refs} = extract(@src, "rust")
+
+      assert Enum.any?(
+               refs,
+               &(&1.kind == :import and &1.name == "std::collections::HashMap" and
+                   &1.from == nil)
+             )
+    end
+  end
+
   describe "oversized symbols" do
     # Mirrors @max_symbol_bytes in the extractor: identifiers past the cap are
     # minified/generated junk and would blow the entities unique btree index

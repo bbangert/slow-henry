@@ -120,8 +120,16 @@ defmodule RetrievalNode.Graph do
   statement: `entities` is sized for a many-repo corpus (can reach into the
   millions of rows), and one unbounded `DELETE` would hold its row locks
   and accumulate undo/WAL for the entire scan instead of releasing them
-  between batches. Loops until a round deletes fewer than a full batch.
-  Returns the total number of entities deleted.
+  between batches. Loops until a round's candidate select comes back
+  shorter than a full batch (see `delete_orphaned_batch/1` for why this is
+  no longer "deletes fewer than a batch" — the recheck it does can now
+  legitimately delete less than it selected). Returns the total number of
+  entities deleted.
+
+  Each batch selects and deletes inside one transaction, locking candidates
+  against a concurrent `UpsertChunks` upsert (queue concurrency 5) landing a
+  new mention in the gap between classification and delete — see
+  `delete_orphaned_batch/1`.
   """
   @spec gc_orphaned_entities(keyword()) :: non_neg_integer()
   def gc_orphaned_entities(opts \\ []) do
@@ -130,29 +138,83 @@ defmodule RetrievalNode.Graph do
   end
 
   defp gc_batches(batch_size, total) do
-    deleted = delete_orphaned_batch(batch_size)
+    {candidate_count, deleted} = delete_orphaned_batch(batch_size)
     total = total + deleted
 
-    if deleted < batch_size do
+    if candidate_count < batch_size do
       total
     else
       gc_batches(batch_size, total)
     end
   end
 
+  # A plain "SELECT zero-mention ids, then DELETE those ids" (the previous
+  # shape) is a snapshot race: a mention committed by a concurrent
+  # UpsertChunks between the SELECT and the DELETE is invisible to the
+  # SELECT's NOT EXISTS, so its entity looks orphaned and gets deleted
+  # anyway — cascading away the just-inserted mention along with it.
+  #
+  # Fixed with lock-then-recheck, both inside one transaction:
+  #
+  #   1. SELECT candidate ids `FOR UPDATE SKIP LOCKED`. This takes a row lock
+  #      on each candidate entity. SKIP LOCKED means GC never blocks behind
+  #      an in-flight UpsertChunks transaction that's already touching one of
+  #      these rows (e.g. via its own FK-driven lock) — it just moves on to
+  #      the next candidate and picks this one up on a later run instead.
+  #   2. DELETE those ids with the SAME zero-mention condition rechecked in
+  #      the DELETE's own WHERE. A concurrent mention INSERT must acquire a
+  #      FOR KEY SHARE lock on its parent entity row (Postgres does this
+  #      automatically for the FK reference) — which now blocks on our FOR
+  #      UPDATE until this transaction commits or rolls back. So by the time
+  #      the DELETE runs, any mention that could still land on a candidate
+  #      has either already committed (making the recheck's NOT EXISTS catch
+  #      it and spare the row) or is blocked until we're done (and lands
+  #      after, on a surviving row, since we only deleted what still had zero
+  #      mentions at DELETE time).
+  #
+  # Consequence: a round can now delete FEWER rows than it selected as
+  # candidates (some got spared by the recheck) — the candidate count, not
+  # the delete count, is what gc_batches/2 uses to decide whether to loop
+  # again.
   defp delete_orphaned_batch(batch_size) do
-    orphan_ids =
-      from(e in Entity,
-        as: :entity,
-        where:
-          not exists(
-            from(m in EntityMention, where: m.entity_id == parent_as(:entity).id, select: 1)
-          ),
-        select: e.id,
-        limit: ^batch_size
+    {:ok, {candidate_count, deleted}} =
+      Repo.transaction(fn ->
+        orphan_ids =
+          from(e in Entity,
+            as: :entity,
+            where:
+              not exists(
+                from(m in EntityMention, where: m.entity_id == parent_as(:entity).id, select: 1)
+              ),
+            select: e.id,
+            limit: ^batch_size,
+            lock: "FOR UPDATE SKIP LOCKED"
+          )
+          |> Repo.all()
+
+        deleted = delete_still_orphaned(orphan_ids)
+
+        {length(orphan_ids), deleted}
+      end)
+
+    {candidate_count, deleted}
+  end
+
+  defp delete_still_orphaned([]), do: 0
+
+  defp delete_still_orphaned(ids) do
+    {count, _} =
+      Repo.delete_all(
+        from(e in Entity,
+          as: :entity,
+          where: e.id in ^ids,
+          where:
+            not exists(
+              from(m in EntityMention, where: m.entity_id == parent_as(:entity).id, select: 1)
+            )
+        )
       )
 
-    {count, _} = Repo.delete_all(from(e in Entity, where: e.id in subquery(orphan_ids)))
     count
   end
 

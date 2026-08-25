@@ -30,9 +30,12 @@ defmodule RetrievalNode.Search do
       string (`"git_repo"`/`"jira_project"`/`"drive_folder"`)
     * `:top_k` — result count (default 20)
     * `:graph` — boolean; adds `HybridQuery`'s third entity-mention leg (default
-      from config `:graph_leg_default`, currently `false` until the Phase-3.3
-      EXPLAIN + latency validation on the real corpus passes). Not yet exposed
-      on the MCP tool layer.
+      from config `:graph_leg_default`, currently `false`). The Phase-3.3
+      EXPLAIN + latency validation has passed (~71ms end-to-end added on the
+      full corpus); it stays opt-in because that cost is paid on every request
+      whether or not the leg improves relevance, and proving the latter needs
+      a relevance eval (same bar as the rerank Phase-1.4 gate below). Exposed
+      on the MCP tool layer as the `graph` field on `semantic_search`.
     * `:embedding` — a precomputed 384-float query vector; when given, skips the
       embedding step (used by tests and callers that already hold an embedding)
     * `:rerank` — boolean; defaults from config `:rerank_default` (currently
@@ -55,7 +58,7 @@ defmodule RetrievalNode.Search do
   @spec hybrid_search(String.t(), keyword()) :: [hit]
   def hybrid_search(query_text, opts \\ []) when is_binary(query_text) do
     embedding = Keyword.get_lazy(opts, :embedding, fn -> Embedding.embed(query_text) end)
-    top_k = Keyword.get(opts, :top_k, @default_top_k)
+    top_k = opts |> Keyword.get(:top_k, @default_top_k) |> HybridQuery.clamp_top_k()
 
     rerank? =
       Keyword.get(opts, :rerank, Application.get_env(:retrieval_node, :rerank_default, false))

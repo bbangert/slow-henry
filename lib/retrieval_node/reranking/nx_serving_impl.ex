@@ -32,9 +32,21 @@ defmodule RetrievalNode.Reranking.NxServingImpl do
   # truncating; the tokenizer's token-level truncation still is.
   @max_passage_bytes 2_000
 
+  # Byte cap applied to the query text before it's paired with every passage.
+  # Unlike the passage cap, this one isn't about a single oversized input —
+  # it's about the query being the SAME text repeated across all ~50 pairs in
+  # one rerank_scores/2 call. An untruncated multi-KB caller-supplied query
+  # (unlike passages, this text is a search question, not a code chunk, so it
+  # has no legitimate reason to be large) would have its tokenizer cost paid
+  # once per pair instead of once, and could alone consume the entire
+  # 512-token pair budget, crowding out the passage half of every pair. 512
+  # bytes is generous for a real question while bounding that cost.
+  @max_query_bytes 512
+
   @impl true
   def rerank_scores(query, passages) when is_binary(query) and is_list(passages) do
-    pairs = Enum.map(passages, &{query, truncate_passage(&1)})
+    truncated_query = truncate_query(query)
+    pairs = Enum.map(passages, &{truncated_query, truncate_passage(&1)})
 
     # The input is always a list, so the serving always returns a list of
     # per-pair %{score: float} results (never a bare single map).
@@ -42,6 +54,14 @@ defmodule RetrievalNode.Reranking.NxServingImpl do
     |> Nx.Serving.batched_run(pairs)
     |> Enum.map(& &1.score)
   end
+
+  @doc """
+  Truncate `query` to at most #{@max_query_bytes} bytes — same codepoint-safe
+  mechanism as `truncate_passage/1`, just with the query's own (smaller)
+  budget. Pure (no serving/model), so it is unit-testable in isolation.
+  """
+  @spec truncate_query(String.t()) :: String.t()
+  def truncate_query(query) when is_binary(query), do: truncate(query, @max_query_bytes)
 
   @doc """
   Truncate `passage` to at most #{@max_passage_bytes} bytes without splitting
@@ -56,12 +76,17 @@ defmodule RetrievalNode.Reranking.NxServingImpl do
   since UTF-8 codepoints are at most 4 bytes).
   """
   @spec truncate_passage(String.t()) :: String.t()
-  def truncate_passage(passage) when is_binary(passage) do
-    if byte_size(passage) <= @max_passage_bytes do
-      passage
+  def truncate_passage(passage) when is_binary(passage), do: truncate(passage, @max_passage_bytes)
+
+  # Shared byte-cap mechanism behind truncate_query/1 and truncate_passage/1:
+  # a cheap binary_part/3 prefix cut, with any trailing bytes that don't form
+  # a complete UTF-8 codepoint trimmed off afterward.
+  defp truncate(text, max_bytes) do
+    if byte_size(text) <= max_bytes do
+      text
     else
-      passage
-      |> binary_part(0, @max_passage_bytes)
+      text
+      |> binary_part(0, max_bytes)
       |> trim_incomplete_codepoint()
     end
   end

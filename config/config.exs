@@ -101,9 +101,16 @@ config :retrieval_node, RetrievalNode.Reranking.Serving,
 config :retrieval_node, rerank_default: false, rerank_candidates: 50
 
 # Graph (entity-mention) leg of the hybrid RRF query — see HybridQuery
-# moduledoc. Ships off by default until the Phase-3.3 EXPLAIN + latency
-# validation on the real corpus passes; `graph_leg_weight` keeps the
-# as-yet-unproven leg from outvoting the tuned vector/FTS pair once enabled.
+# moduledoc. The Phase-3.3 EXPLAIN + latency validation has passed on the
+# full 595k-chunk corpus (vector/FTS/entity legs all index-driven; the graph
+# leg adds ~71ms end-to-end) — it stays off by default as a latency/relevance
+# tradeoff, not an open validation question: it costs real query latency for
+# every request whether or not it improves result quality, and enabling it
+# corpus-wide needs a relevance eval (the same bar the rerank feature's
+# Phase-1.4 gate sets) to show that tradeoff is worth paying. Callers can opt
+# in per-request today via the MCP `graph` field. `graph_leg_weight` keeps
+# the as-yet-unproven-on-relevance leg from outvoting the tuned vector/FTS
+# pair when a caller does enable it.
 config :retrieval_node, graph_leg_default: false, graph_leg_weight: 0.5
 
 # EXLA as the global Nx default backend — without this, any tensor op NOT
