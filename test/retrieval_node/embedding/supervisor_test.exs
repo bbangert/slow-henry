@@ -26,14 +26,13 @@ defmodule RetrievalNode.Embedding.SupervisorTest do
     on_exit(fn -> Serving.reset_ready() end)
   end
 
-  test "init/1 defaults to the production [Serving, Warmer] pair under rest_for_one" do
-    # Calling init/1 directly builds child specs without starting anything, so
-    # this is safe to run without a model — it just proves the opts seam added
-    # for this test suite left the production default (and child_spec) intact.
-    # Serving.child_spec/1 overrides :id to Serving.name() (the registered Nx.Serving
-    # process name), not the module — Warmer uses the default (its own module name).
-    assert {:ok, {%{strategy: :rest_for_one}, child_specs}} = Supervisor.init([])
-    assert Enum.map(child_specs, & &1.id) == [Serving.name(), Warmer]
+  test "the production default is the [Serving, Warmer] pair" do
+    # Asserted via default_children/0, NOT by calling init([]) — init/1 with
+    # the production default materializes Serving.child_spec/1, which builds
+    # the Bumblebee serving and downloads the real model on a cold cache
+    # (observed as a surprise model download in CI). The rest_for_one strategy
+    # and restart semantics are covered by the fake-children tests below.
+    assert Supervisor.default_children() == [Serving, Warmer]
   end
 
   test "a Serving crash restarts Warmer too, which resets ready? (rest_for_one)" do

@@ -60,9 +60,9 @@ defmodule RetrievalNode.Chunking.GrammarsTest do
   end
 
   describe "prefetch/0 and prefetch/1 (NIF-free via :grammar_pack_mod)" do
-    test "prefetch/1 passes through a successful download result" do
-      Application.put_env(:retrieval_node, :fake_download_result, {:ok, 3})
-      assert {:ok, 3} = Grammars.prefetch(["python", "go"])
+    test "prefetch/1 passes through a successful prefetch result" do
+      Application.put_env(:retrieval_node, :fake_download_result, {:ok, nil})
+      assert {:ok, nil} = Grammars.prefetch(["python", "go"])
     end
 
     test "prefetch/0 uses required/0 and passes through an error result" do

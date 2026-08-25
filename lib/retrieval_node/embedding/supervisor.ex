@@ -24,13 +24,20 @@ defmodule RetrievalNode.Embedding.Supervisor do
     Supervisor.start_link(__MODULE__, opts, name: name)
   end
 
+  # Exposed so tests can assert the production pair WITHOUT materializing
+  # child specs: `Serving.child_spec/1` builds the Bumblebee serving, which
+  # loads (and on a cold cache DOWNLOADS) the real model — `Supervisor.init([])`
+  # in a test was silently pulling the model from HuggingFace in CI.
+  @doc false
+  def default_children, do: [Serving, Warmer]
+
   @impl true
   def init(opts) do
     # `:children` is a test-only seam (RetrievalNode.Embedding.SupervisorTest):
     # the real Serving child loads a ~1.2 GB Bumblebee model, so tests swap it
     # for a stand-in to exercise rest_for_one restart semantics without a
     # model. Production never passes this opt, so it always gets the real pair.
-    children = Keyword.get(opts, :children, [Serving, Warmer])
+    children = Keyword.get(opts, :children, default_children())
 
     Supervisor.init(children, strategy: :rest_for_one)
   end

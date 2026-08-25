@@ -15,4 +15,9 @@ defmodule RetrievalNode.Chunking.FakeGrammarPack do
   def download(_languages) do
     Application.get_env(:retrieval_node, :fake_download_result, {:ok, 0})
   end
+
+  @spec prefetch([String.t()]) :: {:ok, term()} | {:error, atom(), String.t()}
+  def prefetch(_languages) do
+    Application.get_env(:retrieval_node, :fake_download_result, {:ok, nil})
+  end
 end

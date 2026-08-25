@@ -44,18 +44,27 @@ defmodule RetrievalNode.Chunking.Grammars do
   def all_cached?, do: missing() == []
 
   @doc "Prefetch every required language (see `required/0`)."
-  @spec prefetch() :: {:ok, non_neg_integer()} | {:error, atom(), String.t()}
+  @spec prefetch() :: {:ok, term()} | {:error, atom(), String.t()}
   def prefetch, do: prefetch(required())
 
   @doc """
-  Prefetch the given languages via the NIF's `download/1`, logging a clear line
+  Prefetch the given languages via the NIF's `prefetch/1`, logging a clear line
   per outcome and passing the result through unchanged.
+
+  `prefetch/1` (not `download/1`) is load-bearing: the pack's `download/1`
+  reports `{:ok, count}` without leaving loadable `.so` grammars in the cache
+  dir that `downloaded_languages/0` lists — only `prefetch/1` (download AND
+  load into the process registry) extracts the shared libraries. Verified
+  empirically on a cold cache: `download/1` → `missing/0` still lists every
+  language; `prefetch/1` → `missing/0` is empty. Using `download/1` here made
+  `mix rn.grammars.prefetch` always fail on a fresh machine/CI runner — the
+  warm dev cache (populated as a side effect of real parsing) masked it.
   """
-  @spec prefetch([String.t()]) :: {:ok, non_neg_integer()} | {:error, atom(), String.t()}
+  @spec prefetch([String.t()]) :: {:ok, term()} | {:error, atom(), String.t()}
   def prefetch(languages) when is_list(languages) do
-    case pack_mod().download(languages) do
-      {:ok, count} = ok ->
-        Logger.info("Grammar prefetch: downloaded #{count} language(s): #{inspect(languages)}")
+    case pack_mod().prefetch(languages) do
+      {:ok, _} = ok ->
+        Logger.info("Grammar prefetch: downloaded + loaded: #{inspect(languages)}")
         ok
 
       {:error, kind, message} = error ->
