@@ -386,6 +386,20 @@ defmodule RetrievalNode.MCP.ToolsTest do
       assert found["qualified_name"] == "app_module"
     end
 
+    test "a matched entity with no traversal results carries a note explaining why" do
+      source =
+        Repo.insert!(%Source{source_type: :git_repo, name: "empty", identifier: "file:///e"})
+
+      entity = graph_entity(source, "lonely_fn")
+      chunk = graph_chunk(source, "lonely.py", "acme/empty")
+      graph_mention(entity, chunk, :definition)
+
+      assert %{"entities" => [], "definitions" => [], "note" => note} =
+               ok(RelatedCode, %{entity: "lonely_fn", relation: "callers"})
+
+      assert note =~ "no call edges"
+    end
+
     test "lang filter scopes resolution to entities of that language" do
       source = Repo.insert!(%Source{source_type: :git_repo, name: "lg", identifier: "acme/lg"})
 

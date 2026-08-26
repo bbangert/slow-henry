@@ -20,7 +20,8 @@ defmodule RetrievalNode.MCP.Tools.RelatedCode do
 
   `hops: 2` extends `callers`/`callees`/`importers`/`imports` one edge
   further (transitive callers-of-callers, etc). Matching zero entities is a
-  valid empty result, not an error — the reply carries a `note` explaining
+  valid empty result, not an error, and so is a matched entity whose
+  traversal finds nothing — either way the reply carries a `note` explaining
   why.
   """
   use Anubis.Server.Component, type: :tool
@@ -108,10 +109,29 @@ defmodule RetrievalNode.MCP.Tools.RelatedCode do
   defp build_payload(matched, relation, hops) do
     related = matched |> Enum.map(& &1.id) |> Graph.related_entities(relation, hops)
 
-    %{
+    payload = %{
       entities: Enum.map(related, &related_result/1),
       definitions: related |> Enum.map(& &1.entity.id) |> Graph.definition_snippets()
     }
+
+    case related do
+      [] -> Map.put(payload, :note, empty_relation_note(relation))
+      _ -> payload
+    end
+  end
+
+  # The entity matched but the traversal found nothing — explain why per
+  # relation family instead of returning a bare empty result, so an agent
+  # consumer doesn't mistake "no edges yet" for "tool is broken".
+  defp empty_relation_note(relation) when relation in [:importers, :imports] do
+    "no import mentions or edges reference this entity — file-level " <>
+      "`from X import Y`-style imports record both the module and the " <>
+      "imported symbol only for content indexed after this change, so " <>
+      "older chunks re-derive their import mentions on their next sync"
+  end
+
+  defp empty_relation_note(_relation) do
+    "no call edges reference this entity"
   end
 
   defp entity_result(entity) do

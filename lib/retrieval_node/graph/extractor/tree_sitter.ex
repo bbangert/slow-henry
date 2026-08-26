@@ -356,8 +356,27 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
       "import_from_statement" ->
         case TS.node_child_by_field_name(node, "module_name") do
-          nil -> []
-          mod_node -> [{slice(source, mod_node), line(mod_node)}]
+          nil ->
+            []
+
+          mod_node ->
+            ln = line(mod_node)
+            module_ref = {slice(source, mod_node), ln}
+
+            # `import_from_statement` repeats the "name:" field once per
+            # imported symbol (`dotted_name` or, aliased, `aliased_import`) —
+            # separate from the single "module_name:" field handled above.
+            # Emitting these too is what makes `related_code` importers of a
+            # symbol non-empty: only the module ref existed before. A
+            # `wildcard_import` (`from x import *`) carries no field name, so
+            # the "name" filter below already excludes it — nothing to name.
+            symbol_refs =
+              node
+              |> children_with_field("name")
+              |> Enum.filter(&(TS.node_kind(&1) in ["dotted_name", "aliased_import"]))
+              |> Enum.map(&{python_import_symbol(&1, source), ln})
+
+            [module_ref | symbol_refs]
         end
 
       _ ->
@@ -367,11 +386,19 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp import_refs(node, source, lang) when lang in ["javascript", "typescript"] do
     case TS.node_child_by_field_name(node, "source") do
-      nil -> []
-      src_node -> [{strip_quotes(slice(source, src_node)), line(node)}]
+      nil ->
+        []
+
+      src_node ->
+        ln = line(node)
+        module_ref = {strip_quotes(slice(source, src_node)), ln}
+        [module_ref | js_import_symbol_refs(node, source, ln)]
     end
   end
 
+  # go/rust/java import refs already carry the imported symbol (go/rust: the
+  # full package/use path is the meaningful "name" there; java: the imported
+  # class/member's scoped identifier) — no separate per-symbol ref needed.
   defp import_refs(node, source, "go") do
     node
     |> collect_kind("import_spec")
@@ -405,16 +432,60 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp import_refs(_node, _source, _language), do: []
 
-  defp python_import_name(n, source) do
+  # `import_statement`'s optional `import_clause` holds, in source order: a
+  # bare default identifier (no field name), then either `named_imports`
+  # (each `import_specifier` resolved to its ORIGINAL "name:" field, alias
+  # ignored — same policy as python's aliased imports) or a `namespace_import`
+  # (`* as ns`, which names no individual symbol and is skipped; the module
+  # ref above already covers it).
+  defp js_import_symbol_refs(node, source, ln) do
+    node
+    |> named_children()
+    |> Enum.find(&(TS.node_kind(&1) == "import_clause"))
+    |> case do
+      nil -> []
+      clause -> clause |> named_children() |> Enum.flat_map(&js_clause_child_refs(&1, source, ln))
+    end
+  end
+
+  defp js_clause_child_refs(child, source, ln) do
+    case TS.node_kind(child) do
+      "identifier" ->
+        [{slice(source, child), ln}]
+
+      "named_imports" ->
+        child
+        |> named_children()
+        |> Enum.filter(&(TS.node_kind(&1) == "import_specifier"))
+        |> Enum.flat_map(&import_specifier_ref(&1, source, ln))
+
+      _ ->
+        []
+    end
+  end
+
+  defp import_specifier_ref(spec, source, ln) do
+    case TS.node_child_by_field_name(spec, "name") do
+      nil -> []
+      name_node -> [{slice(source, name_node), ln}]
+    end
+  end
+
+  defp python_import_name(n, source), do: {python_import_symbol(n, source), line(n)}
+
+  # Aliased imports resolve to the ORIGINAL name (the `name:` field of
+  # `aliased_import`), never the alias — consistent for both plain
+  # `import a as b` and from-import symbols (`from m import a as b`).
+  defp python_import_symbol(n, source) do
     case TS.node_kind(n) do
       "aliased_import" ->
         case TS.node_child_by_field_name(n, "name") do
-          nil -> {slice(source, n), line(n)}
-          name_node -> {slice(source, name_node), line(n)}
+          nil -> slice(source, n)
+          name_node -> slice(source, name_node)
         end
 
       _ ->
-        {slice(source, n), line(n)}
+        slice(source, n)
     end
   end
 
@@ -449,6 +520,38 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
     if TS.treecursor_goto_next_sibling(cursor) do
       collect_siblings(cursor, acc)
+    else
+      Enum.reverse(acc)
+    end
+  end
+
+  # Like `named_children/1`, but keeps only children bound to `field_name` in
+  # the grammar. Needed where `node_child_by_field_name/2` isn't enough:
+  # python's `import_from_statement` repeats the "name:" field once per
+  # imported symbol, and `node_child_by_field_name` only ever returns the
+  # first match.
+  defp children_with_field(node, field_name) do
+    cursor = TS.node_walk(node)
+
+    if TS.treecursor_goto_first_child(cursor) do
+      collect_field_siblings(cursor, field_name, [])
+    else
+      []
+    end
+  end
+
+  defp collect_field_siblings(cursor, field_name, acc) do
+    node = TS.treecursor_node(cursor)
+
+    acc =
+      if TS.node_is_named(node) and TS.treecursor_field_name(cursor) == field_name do
+        [node | acc]
+      else
+        acc
+      end
+
+    if TS.treecursor_goto_next_sibling(cursor) do
+      collect_field_siblings(cursor, field_name, acc)
     else
       Enum.reverse(acc)
     end

@@ -63,6 +63,25 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       assert Enum.any?(imports, &(&1.name == "os.path" and &1.from == nil))
       assert Enum.any?(imports, &(&1.name == "collections" and &1.from == nil))
     end
+
+    test "from-import records both the module and each imported symbol (aliased -> original name)" do
+      %{references: refs} =
+        extract("from a.b import Klass, func as f\n", "python")
+
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert "a.b" in names
+      assert "Klass" in names
+      assert "func" in names
+      refute "f" in names
+    end
+
+    test "wildcard from-import records only the module, no symbol" do
+      %{references: refs} = extract("from x import *\n", "python")
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert names == ["x"]
+    end
   end
 
   describe "javascript" do
@@ -113,6 +132,26 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       %{references: refs} = extract(@src, "javascript")
 
       assert Enum.any?(refs, &(&1.kind == :import and &1.name == "./thing" and &1.from == nil))
+    end
+
+    test "named import: records the module plus default and named symbols (alias -> original name)" do
+      %{references: refs} =
+        extract("import Default, { named, orig as alias } from \"./mod\";\n", "javascript")
+
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert "./mod" in names
+      assert "Default" in names
+      assert "named" in names
+      assert "orig" in names
+      refute "alias" in names
+    end
+
+    test "namespace import records only the module, no symbol" do
+      %{references: refs} = extract("import * as ns from \"y\";\n", "javascript")
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert names == ["y"]
     end
   end
 
@@ -309,6 +348,19 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       %{references: refs} = extract(@src, "typescript")
 
       assert Enum.any?(refs, &(&1.kind == :import and &1.name == "./thing" and &1.from == nil))
+    end
+
+    test "named import: records the module plus default and named symbols (alias -> original name)" do
+      %{references: refs} =
+        extract("import Default, { named, orig as alias } from \"./mod\";\n", "typescript")
+
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert "./mod" in names
+      assert "Default" in names
+      assert "named" in names
+      assert "orig" in names
+      refute "alias" in names
     end
   end
 
