@@ -28,6 +28,16 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       per call, `enclosing_qname` — and therefore every reference's `from` —
       can only ever name a definition from THIS file, never another file of
       the same source.
+    * `class_qname` — the qualified_name of the nearest NAMED enclosing
+      class-like/module-like definition (set on entering one, carried
+      unchanged through nested function-likes so a method's inner helper
+      still knows its class). Used to resolve `self.x()`/`this.x()` calls: in
+      python/rust/ruby (`self`) and javascript/typescript/java (`this`), the
+      receiver is statically the enclosing class -- no type inference needed
+      -- so the callee name is scoped to `<class_qname>.<member>` instead of
+      the bare rightmost member. Every other receiver shape keeps the
+      rightmost-member best-effort below; full receiver resolution would
+      require type inference, deliberately out of scope.
 
   Defensive cap: at most `@max_items` combined entities+references are
   collected per file; a generated/minified file could otherwise produce
@@ -131,7 +141,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     import_kinds = Map.get(@import_kinds, language, [])
     lang_ctx = %{def_kinds: def_kinds, call_kind: call_kind, import_kinds: import_kinds}
 
-    state = %{scope: [], container_kind: nil, enclosing_qname: nil}
+    state = %{scope: [], container_kind: nil, enclosing_qname: nil, class_qname: nil}
     acc = %{entities: [], references: [], count: 0}
 
     acc = walk(root, source, language, lang_ctx, state, acc)
@@ -180,16 +190,20 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     category = Map.fetch!(lang_ctx.def_kinds, kind)
     name = name_field(child, language, kind, source)
 
-    {new_scope, new_enclosing_qname, acc} =
+    {new_scope, new_enclosing_qname, new_class_qname, acc} =
       case name do
         nil ->
-          {state.scope, state.enclosing_qname, acc}
+          {state.scope, state.enclosing_qname, state.class_qname, acc}
 
         _ ->
           qname = Enum.join(state.scope ++ [name], ".")
           entity_kind = entity_kind_for(category, state.container_kind)
           entity = %{qualified_name: qname, kind: entity_kind, line: line(child)}
-          {state.scope ++ [name], qname, add_entity(acc, entity)}
+
+          class_qname =
+            if category in [:class_like, :module_like], do: qname, else: state.class_qname
+
+          {state.scope ++ [name], qname, class_qname, add_entity(acc, entity)}
       end
 
     if at_cap?(acc) do
@@ -198,7 +212,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       new_state = %{
         scope: new_scope,
         container_kind: category,
-        enclosing_qname: new_enclosing_qname
+        enclosing_qname: new_enclosing_qname,
+        class_qname: new_class_qname
       }
 
       walk(child, source, language, lang_ctx, new_state, acc)
@@ -217,7 +232,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       nil ->
         acc
 
-      name ->
+      {name, self_receiver?} ->
         case ruby_import(child, source, language, name) do
           {:import, import_name} ->
             add_reference(acc, %{
@@ -229,7 +244,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
           :not_import ->
             add_reference(acc, %{
-              name: name,
+              name: scoped_callee_name(name, self_receiver?, state.class_qname),
               kind: :call,
               from: state.enclosing_qname,
               line: line(child)
@@ -238,63 +253,123 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
+  # `self.helper()` / `this.helper()` -- the ONLY receiver shape that's
+  # statically resolvable without type inference, since the receiver is
+  # lexically the enclosing class. Scoped only when a class-like/module-like
+  # ancestor is actually in scope (e.g. a top-level JS `this.x()` has none --
+  # falls back to the bare name).
+  defp scoped_callee_name(name, true, class_qname) when is_binary(class_qname),
+    do: class_qname <> "." <> name
+
+  defp scoped_callee_name(name, _self_receiver?, _class_qname), do: name
+
   defp callee_name(call_node, source, "python") do
     with fn_node when not is_nil(fn_node) <- TS.node_child_by_field_name(call_node, "function") do
-      qualified_or_bare(fn_node, source, "attribute", "attribute")
+      qualified_or_bare(fn_node, source, "attribute", "object", "attribute", &python_self?/2)
     end
   end
 
   defp callee_name(call_node, source, lang) when lang in ["javascript", "typescript"] do
     with fn_node when not is_nil(fn_node) <- TS.node_child_by_field_name(call_node, "function") do
-      qualified_or_bare(fn_node, source, "member_expression", "property")
+      qualified_or_bare(fn_node, source, "member_expression", "object", "property", &this_node?/2)
     end
   end
 
   defp callee_name(call_node, source, "go") do
     with fn_node when not is_nil(fn_node) <- TS.node_child_by_field_name(call_node, "function") do
-      qualified_or_bare(fn_node, source, "selector_expression", "field")
+      # Go has no `self`/`this` keyword (receivers are user-named), so the
+      # object side is never scope-resolvable here.
+      qualified_or_bare(fn_node, source, "selector_expression", "operand", "field", fn _, _ ->
+        false
+      end)
     end
   end
 
   defp callee_name(call_node, source, "rust") do
     with fn_node when not is_nil(fn_node) <- TS.node_child_by_field_name(call_node, "function") do
-      fallback_last_segment(source, fn_node)
+      if TS.node_kind(fn_node) == "field_expression" do
+        rust_field_expression_callee(fn_node, source)
+      else
+        {fallback_last_segment(source, fn_node), false}
+      end
     end
   end
 
   defp callee_name(call_node, source, "ruby") do
     with m_node when not is_nil(m_node) <- TS.node_child_by_field_name(call_node, "method") do
-      slice(source, m_node)
+      self? =
+        case TS.node_child_by_field_name(call_node, "receiver") do
+          nil -> false
+          recv_node -> TS.node_kind(recv_node) == "self"
+        end
+
+      {slice(source, m_node), self?}
     end
   end
 
   defp callee_name(call_node, source, "java") do
     with n_node when not is_nil(n_node) <- TS.node_child_by_field_name(call_node, "name") do
-      slice(source, n_node)
+      self? =
+        case TS.node_child_by_field_name(call_node, "object") do
+          nil -> false
+          obj_node -> TS.node_kind(obj_node) == "this"
+        end
+
+      {slice(source, n_node), self?}
     end
   end
 
   defp callee_name(_call_node, _source, _language), do: nil
 
-  # Shared shape for the three qualified-callee grammars (python `attribute`,
-  # js/ts `member_expression`, go `selector_expression`): if the callee subtree
-  # is the qualified wrapper kind, resolve its rightmost field; otherwise it's
-  # already a bare identifier, sliced directly.
-  defp qualified_or_bare(fn_node, source, wrapper_kind, field_name) do
+  defp rust_field_expression_callee(fn_node, source) do
+    self? =
+      case TS.node_child_by_field_name(fn_node, "value") do
+        nil -> false
+        value_node -> TS.node_kind(value_node) == "self"
+      end
+
+    case TS.node_child_by_field_name(fn_node, "field") do
+      nil -> {fallback_last_segment(source, fn_node), false}
+      field_node -> {slice(source, field_node), self?}
+    end
+  end
+
+  # Grammar-specific self-reference checks, used by `qualified_or_bare/6`.
+  # Python has no dedicated `self` node kind -- `self` is a plain identifier,
+  # so it takes a text comparison. JS/TS give `this` its own node kind, so a
+  # kind check alone is enough (no text slice needed).
+  defp python_self?(obj_node, source),
+    do: TS.node_kind(obj_node) == "identifier" and slice(source, obj_node) == "self"
+
+  defp this_node?(obj_node, _source), do: TS.node_kind(obj_node) == "this"
+
+  # Shared shape for the qualified-callee grammars (python `attribute`, js/ts
+  # `member_expression`, go `selector_expression`): if the callee subtree is
+  # the qualified wrapper kind, resolve its rightmost field (plus whether its
+  # object side is a self-reference per `self_pred`); otherwise it's already
+  # a bare identifier, sliced directly (never a self-reference).
+  defp qualified_or_bare(fn_node, source, wrapper_kind, object_field, member_field, self_pred) do
     if TS.node_kind(fn_node) == wrapper_kind do
-      case TS.node_child_by_field_name(fn_node, field_name) do
-        nil -> fallback_last_segment(source, fn_node)
-        field_node -> slice(source, field_node)
+      self? =
+        case TS.node_child_by_field_name(fn_node, object_field) do
+          nil -> false
+          obj_node -> self_pred.(obj_node, source)
+        end
+
+      case TS.node_child_by_field_name(fn_node, member_field) do
+        nil -> {fallback_last_segment(source, fn_node), false}
+        field_node -> {slice(source, field_node), self?}
       end
     else
-      slice(source, fn_node)
+      {slice(source, fn_node), false}
     end
   end
 
   # Defensive fallback for the qualified-callee shapes: slice the whole callee
   # subtree and take the last `.`/`::`-separated segment. Also handles the
   # plain-identifier case (no separator -> the whole text is the segment), so
-  # rust's `function:` field can share this single implementation.
+  # rust's `function:` field can share this single implementation. Never a
+  # self-reference: reached only when the expected member field is missing.
   defp fallback_last_segment(source, node) do
     source
     |> slice(node)

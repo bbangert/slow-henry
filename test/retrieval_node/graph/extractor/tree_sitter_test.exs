@@ -48,8 +48,23 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       assert %{qualified_name: "helper", kind: :function} = find(entities, "helper")
     end
 
-    test "qualified-callee resolution: self.helper() -> \"helper\", scoped to Payment.process" do
+    test "self.helper() -> \"Payment.helper\": self-receiver scoped to the enclosing class" do
       %{references: refs} = extract(@src, "python")
+
+      assert %{name: "Payment.helper", kind: :call, from: "Payment.process"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "Payment.helper"))
+    end
+
+    test "other.helper() -> \"helper\": non-self receiver stays unscoped best-effort" do
+      %{references: refs} =
+        extract(
+          """
+          class Payment:
+              def process(self, other):
+                  return other.helper()
+          """,
+          "python"
+        )
 
       assert %{name: "helper", kind: :call, from: "Payment.process"} =
                Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
@@ -244,6 +259,27 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
                Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
     end
 
+    test "self.helper() -> \"Greeter.helper\": self-receiver scoped to the enclosing class" do
+      %{references: refs} =
+        extract(
+          """
+          class Greeter
+            def hello
+              self.helper()
+            end
+
+            def helper
+              1
+            end
+          end
+          """,
+          "ruby"
+        )
+
+      assert %{name: "Greeter.helper", kind: :call, from: "Greeter.hello"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "Greeter.helper"))
+    end
+
     test "require is classified :import (not :call), content of its string argument" do
       %{references: refs} = extract(@src, "ruby")
 
@@ -279,8 +315,29 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
                find(entities, "Calculator.helper")
     end
 
-    test "qualified-callee resolution: this.helper(a, b) -> \"helper\", scoped to Calculator.add" do
+    test "this.helper(a, b) -> \"Calculator.helper\": self-receiver scoped to the enclosing class" do
       %{references: refs} = extract(@src, "java")
+
+      assert %{name: "Calculator.helper", kind: :call, from: "Calculator.add"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "Calculator.helper"))
+    end
+
+    test "bare helper(a, b) (implicit this, no explicit receiver) stays unscoped" do
+      %{references: refs} =
+        extract(
+          """
+          class Calculator {
+              int add(int a, int b) {
+                  return helper(a, b);
+              }
+
+              int helper(int a, int b) {
+                  return a + b;
+              }
+          }
+          """,
+          "java"
+        )
 
       assert %{name: "helper", kind: :call, from: "Calculator.add"} =
                Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
@@ -334,14 +391,29 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       assert %{qualified_name: "helper2", kind: :function} = find(entities, "helper2")
     end
 
-    test "qualified-callee resolution: this.helper() -> \"helper\", scoped to Circle.area; a bare call scoped to its top-level function" do
+    test "this.helper() -> \"Circle.helper\": self-receiver scoped to the enclosing class; a bare call scoped to its top-level function" do
       %{references: refs} = extract(@src, "typescript")
 
-      assert %{name: "helper", kind: :call, from: "Circle.area"} =
-               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+      assert %{name: "Circle.helper", kind: :call, from: "Circle.area"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "Circle.helper"))
 
       assert %{name: "helper2", kind: :call, from: "standalone"} =
                Enum.find(refs, &(&1.kind == :call and &1.name == "helper2"))
+    end
+
+    test "foo.helper() at module level (no enclosing class) stays unscoped best-effort" do
+      %{references: refs} =
+        extract(
+          """
+          function standalone(): number {
+            return foo.helper();
+          }
+          """,
+          "typescript"
+        )
+
+      assert %{name: "helper", kind: :call, from: "standalone"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
     end
 
     test "import: source string with quotes stripped" do
@@ -401,11 +473,11 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       assert %{qualified_name: "helper_fn", kind: :function} = find(entities, "helper_fn")
     end
 
-    test "qualified-callee resolution: self.helper() -> \"helper\", scoped to Point.distance; a bare call scoped to main" do
+    test "self.helper() -> \"Point.helper\": self-receiver scoped to the enclosing impl block; a bare call scoped to main" do
       %{references: refs} = extract(@src, "rust")
 
-      assert %{name: "helper", kind: :call, from: "Point.distance"} =
-               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+      assert %{name: "Point.helper", kind: :call, from: "Point.distance"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "Point.helper"))
 
       assert %{name: "helper_fn", kind: :call, from: "main"} =
                Enum.find(refs, &(&1.kind == :call and &1.name == "helper_fn"))
