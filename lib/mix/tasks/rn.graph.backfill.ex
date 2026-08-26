@@ -77,22 +77,59 @@ defmodule Mix.Tasks.Rn.Graph.Backfill do
   @spec run([binary()]) :: no_return()
   @impl Mix.Task
   def run(args) do
-    {opts, _args, _invalid} = OptionParser.parse(args, strict: @switches)
+    case parse_args(args) do
+      {:ok, opts} ->
+        boot()
 
-    boot()
+        if opts[:status] do
+          print_status()
+        else
+          backfill()
+        end
 
-    if opts[:status] do
-      print_status()
-    else
-      backfill()
+        # boot/0 brings up the *entire* supervision tree (Endpoint, Oban, the
+        # embedding Serving/Warmer sub-tree, ...) since Oban.insert/1 needs a
+        # running Oban instance to resolve its config — none of which has a
+        # reason to keep running once this task's report is printed. Without
+        # an explicit halt, `mix rn.graph.backfill` would hang after printing.
+        System.halt(0)
+
+      {:error, message} ->
+        # Raised BEFORE boot/0 (and so before backfill/0's destructive
+        # watermark reset) — an unrecognized flag or stray positional
+        # argument must never silently fall through to the default
+        # (destructive) branch. `--statsu` (a typo of `--status`) is exactly
+        # the failure mode this guards against: strict parsing rejects it
+        # instead of running the full-resync backfill.
+        Mix.raise(message)
     end
+  end
 
-    # boot/0 brings up the *entire* supervision tree (Endpoint, Oban, the
-    # embedding Serving/Warmer sub-tree, ...) since Oban.insert/1 needs a
-    # running Oban instance to resolve its config — none of which has a
-    # reason to keep running once this task's report is printed. Without an
-    # explicit halt, `mix rn.graph.backfill` would hang after printing.
-    System.halt(0)
+  # Pulled out of run/1 so it's testable as a pure function — Mix.Task tests
+  # that boot the app are undesirable here (boot/0 starts Oban/Endpoint/the
+  # embedding sub-tree, none of which a parse-only test needs).
+  @spec parse_args([binary()]) :: {:ok, keyword()} | {:error, String.t()}
+  def parse_args(args) do
+    case OptionParser.parse(args, strict: @switches) do
+      {opts, [], []} ->
+        {:ok, opts}
+
+      {_opts, extra_args, invalid} ->
+        {:error, usage_error(extra_args, invalid)}
+    end
+  end
+
+  defp usage_error(extra_args, invalid) do
+    offenders =
+      Enum.map(invalid, fn
+        {flag, nil} -> flag
+        {flag, value} -> "#{flag}=#{value}"
+      end) ++ extra_args
+
+    "unrecognized option(s)/argument(s): #{Enum.join(offenders, ", ")}\n\n" <>
+      "Usage:\n" <>
+      "  mix rn.graph.backfill           # force a full re-sync backfill\n" <>
+      "  mix rn.graph.backfill --status  # read-only status report"
   end
 
   # --- boot ---

@@ -296,8 +296,13 @@ defmodule RetrievalNode.MCP.ToolsTest do
 
       assert found["qualified_name"] == "PaymentProcessor.process"
       assert found["kind"] == "function"
+      assert found["entity_id"] == entity.id
+      assert found["source_id"] == source.id
       assert snippet["repo"] == "acme/d"
       assert snippet["path"] == "process.py"
+      # correlatable: the entity object and its definition snippet carry the
+      # same entity_id, so a caller can tie a snippet back to its entity.
+      assert snippet["entity_id"] == found["entity_id"]
     end
 
     test "callers with hops=2 returns transitive callers tagged with the right hop" do
@@ -313,8 +318,10 @@ defmodule RetrievalNode.MCP.ToolsTest do
                ok(RelatedCode, %{entity: "target_fn", relation: "callers", hops: 2})
 
       by_name = Map.new(entities, &{&1["qualified_name"], &1})
-      assert %{"weight" => 3, "hop" => 1} = by_name["caller1_fn"]
-      assert %{"weight" => 7, "hop" => 2} = by_name["caller2_fn"]
+      assert %{"weight" => 3, "hop" => 1, "entity_id" => caller1_id} = by_name["caller1_fn"]
+      assert %{"weight" => 7, "hop" => 2, "entity_id" => caller2_id} = by_name["caller2_fn"]
+      assert caller1_id == caller1.id
+      assert caller2_id == caller2.id
     end
 
     test "an invalid relation is rejected with a listing of valid values" do
@@ -366,7 +373,10 @@ defmodule RetrievalNode.MCP.ToolsTest do
                ok(RelatedCode, %{entity: "shared_fn", repo: "repo-a"})
 
       assert found["qualified_name"] == "shared_fn"
+      assert found["entity_id"] == entity_a.id
+      refute found["entity_id"] == entity_b.id
       assert snippet["repo"] == "repo-a"
+      assert snippet["entity_id"] == found["entity_id"]
     end
 
     test "importers resolves via import mentions when no edge exists (file-level import)" do

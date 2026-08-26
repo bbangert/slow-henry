@@ -135,11 +135,19 @@ defmodule RetrievalNode.MCP.Tools.RelatedCode do
   end
 
   defp entity_result(entity) do
-    %{qualified_name: entity.qualified_name, kind: entity.kind, language: entity.language}
+    %{
+      entity_id: entity.id,
+      source_id: entity.source_id,
+      qualified_name: entity.qualified_name,
+      kind: entity.kind,
+      language: entity.language
+    }
   end
 
   defp related_result(%{entity: entity, weight: weight, hop: hop}) do
     %{
+      entity_id: entity.id,
+      source_id: entity.source_id,
       qualified_name: entity.qualified_name,
       kind: entity.kind,
       language: entity.language,

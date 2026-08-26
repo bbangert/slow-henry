@@ -8,19 +8,7 @@ defmodule RetrievalNode.Embedding.SupervisorTest do
   import ExUnit.CaptureLog
 
   alias RetrievalNode.Embedding.{Serving, Supervisor, Warmer}
-
-  # Stands in for the real Serving child, which loads a ~1.2 GB Bumblebee model
-  # and can't be started in test. Only needs to occupy child position 1 of the
-  # rest_for_one pair and be killable — it doesn't need to be a real Nx.Serving.
-  defmodule FakeServing do
-    @moduledoc false
-    use GenServer
-
-    def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-
-    @impl true
-    def init(_opts), do: {:ok, %{}}
-  end
+  alias RetrievalNode.FakeServing
 
   setup do
     on_exit(fn -> Serving.reset_ready() end)

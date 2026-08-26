@@ -470,6 +470,162 @@ defmodule RetrievalNode.GraphTest do
     end
   end
 
+  describe "chunk-level edge provenance" do
+    # A single-chunk file whose one definition calls one callee — enough to
+    # drive an outgoing edge from a merged entity for the tests below.
+    defp calling_result(caller_name, callee_name) do
+      {:ok,
+       %{
+         chunks: [
+           %{
+             text: "def #{caller_name}():\n    #{callee_name}()\n",
+             breadcrumb: caller_name,
+             start_line: 1,
+             end_line: 2,
+             kind: "function_definition",
+             parse_status: :ok
+           }
+         ],
+         entities: [%{qualified_name: caller_name, kind: :function, line: 1}],
+         references: [%{name: callee_name, kind: :call, from: caller_name, line: 2}]
+       }}
+    end
+
+    defp outgoing_targets(source_entity) do
+      EntityEdge
+      |> where([e], e.source_entity_id == ^source_entity.id)
+      |> Repo.all()
+      |> Enum.map(& &1.target_entity_id)
+      |> Enum.sort()
+    end
+
+    test "two files in one source defining the same merged entity each keep their own outgoing edge — neither file's ingest clobbers the other's",
+         %{source: source} do
+      force_chunk_with_graph(calling_result("shared", "x"))
+
+      run_pipeline(
+        seed_raw(source, "def shared():\n    x()\n", "repo:acme/app:file1.py", "file1.py")
+      )
+
+      force_chunk_with_graph(calling_result("shared", "y"))
+
+      run_pipeline(
+        seed_raw(source, "def shared():\n    y()\n", "repo:acme/app:file2.py", "file2.py")
+      )
+
+      # only ONE "shared" entity exists — entity identity merges across
+      # files of a source (same source_id/language/qualified_name).
+      assert [shared] = Repo.all(from e in Entity, where: e.qualified_name == "shared")
+
+      entities = Entity |> Repo.all() |> Map.new(&{&1.qualified_name, &1})
+      x = entities["x"]
+      y = entities["y"]
+
+      # Pre-fix, file2's UpsertChunks would delete every outgoing edge of
+      # "shared" (file-wide re-derivation) before writing its own, wiping
+      # out file1's x-edge. With chunk-level provenance, both contributions
+      # survive as their own rows.
+      assert outgoing_targets(shared) == Enum.sort([x.id, y.id])
+    end
+
+    test "re-ingesting file A with a changed call updates only A's contribution; file B's edge survives",
+         %{source: source} do
+      force_chunk_with_graph(calling_result("shared", "x"))
+
+      run_pipeline(
+        seed_raw(source, "def shared():\n    x()\n", "repo:acme/app:file1.py", "file1.py")
+      )
+
+      force_chunk_with_graph(calling_result("shared", "y"))
+
+      run_pipeline(
+        seed_raw(source, "def shared():\n    y()\n", "repo:acme/app:file2.py", "file2.py")
+      )
+
+      [shared] = Repo.all(from e in Entity, where: e.qualified_name == "shared")
+      y = Repo.get_by!(Entity, qualified_name: "y")
+
+      # Re-ingest file1 (same natural_key/chunk_key) with a different callee.
+      force_chunk_with_graph(calling_result("shared", "z"))
+
+      run_pipeline(
+        seed_raw(source, "def shared():\n    z()\n", "repo:acme/app:file1.py", "file1.py")
+      )
+
+      z = Repo.get_by!(Entity, qualified_name: "z")
+
+      assert outgoing_targets(shared) == Enum.sort([y.id, z.id])
+    end
+
+    test "read-side aggregation: the same logical edge contributed by two chunks sums into one weighted result",
+         %{source: source} do
+      force_chunk_with_graph(calling_result("shared", "x"))
+
+      run_pipeline(
+        seed_raw(source, "def shared():\n    x()\n", "repo:acme/app:file1.py", "file1.py")
+      )
+
+      run_pipeline(
+        seed_raw(source, "def shared():\n    x()\n", "repo:acme/app:file2.py", "file2.py")
+      )
+
+      [shared] = Repo.all(from e in Entity, where: e.qualified_name == "shared")
+      x = Repo.get_by!(Entity, qualified_name: "x")
+
+      # Two chunk-scoped rows back this one logical edge...
+      assert Repo.aggregate(
+               from(e in EntityEdge, where: e.source_entity_id == ^shared.id),
+               :count,
+               :id
+             ) == 2
+
+      # ...but the read path (Graph.related_entities/3) sums them into a
+      # single logical edge instead of surfacing two separate rows.
+      assert [%{entity: found, weight: 2, hop: 1}] =
+               Graph.related_entities([shared.id], :callees, 1)
+
+      assert found.id == x.id
+    end
+
+    test "a legacy NULL-chunk_id edge on a batch definition entity is removed by the transitional delete on re-ingest",
+         %{source: source} do
+      force_chunk_with_graph(calling_result("shared", "x"))
+
+      run_pipeline(
+        seed_raw(source, "def shared():\n    x()\n", "repo:acme/app:file1.py", "file1.py")
+      )
+
+      [shared] = Repo.all(from e in Entity, where: e.qualified_name == "shared")
+
+      legacy_target =
+        Repo.insert!(%Entity{
+          source_id: source.id,
+          language: "python",
+          qualified_name: "legacy_target",
+          kind: :function
+        })
+
+      legacy_edge =
+        Repo.insert!(%EntityEdge{
+          source_entity_id: shared.id,
+          target_entity_id: legacy_target.id,
+          kind: :calls
+        })
+
+      assert is_nil(legacy_edge.chunk_id)
+
+      # Re-ingest file1 — "shared" is a definition entity in this batch, so
+      # the transitional `is_nil(chunk_id) and source_entity_id in
+      # def_entity_ids` delete scope catches this pre-provenance row even
+      # though it was never written by this batch's own chunk.
+      run_pipeline(
+        seed_raw(source, "def shared():\n    x()\n", "repo:acme/app:file1.py", "file1.py")
+      )
+
+      refute Repo.get(EntityEdge, legacy_edge.id)
+    end
+  end
+
   describe "reference-only entities never clobber a definition" do
     test "an existing definition's kind/path survive a later reference-only sighting", %{
       source: source

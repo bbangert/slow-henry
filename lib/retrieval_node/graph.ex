@@ -95,7 +95,8 @@ defmodule RetrievalNode.Graph do
     delete_stale_mentions(repo, chunk_ids)
     mentions_written = insert_mentions(repo, staged_rows, chunk_ids_by_key, entity_ids, now)
 
-    edges_written = upsert_edges(repo, staged_rows, entity_ids, def_entities, now)
+    edges_written =
+      upsert_edges(repo, staged_rows, chunk_ids_by_key, chunk_ids, entity_ids, def_entities, now)
 
     {:ok,
      %{
@@ -114,7 +115,13 @@ defmodule RetrievalNode.Graph do
   reason to know about the entities they used to point at, so a
   zero-mention entity is a durable orphan until something reaps it. Its
   `entity_edges` rows die for free via their own `entities` FK cascade —
-  no separate edge cleanup needed here.
+  no separate edge cleanup needed here. Chunk-provenance edge rows (those
+  carrying a non-NULL `chunk_id`) additionally cascade the moment their
+  owning chunk is deleted, via `entity_edges.chunk_id`'s own FK — same
+  lifecycle as `entity_mentions` — so this GC's job for those rows is
+  already partly done by the time an entity goes zero-mention; the
+  `entities` FK cascade above remains the catch-all for whatever a chunk
+  deletion didn't reach (e.g. legacy NULL-`chunk_id` edge rows).
 
   Deletes in batches of `:batch_size` (default 10,000) rather than one
   statement: `entities` is sized for a many-repo corpus (can reach into the
@@ -444,13 +451,20 @@ defmodule RetrievalNode.Graph do
     do:
       edges_query(ids, :imports, :source_entity_id, :target_entity_id) ++ imports_by_mention(ids)
 
+  # A logical (source, target, kind) edge can now back onto MULTIPLE
+  # entity_edges rows — one per contributing chunk (see EntityEdge's
+  # moduledoc) — so this groups by the entity pair before a consumer ever
+  # sees a row, summing each pair's chunk-level weights into one logical
+  # weight. Without this, a merged entity's edge contributed by two files
+  # would surface as two separate (lower-weight) rows instead of one.
   defp edges_query(ids, kind, filter_field, select_field) do
     from(e in EntityEdge,
       where: e.kind == ^kind and field(e, ^filter_field) in ^ids,
-      select: %{entity_id: field(e, ^select_field), weight: e.weight},
+      group_by: [e.source_entity_id, e.target_entity_id],
+      select: %{entity_id: field(e, ^select_field), weight: sum(e.weight)},
       # Bounds one traversal query — hot symbols like `init` can have
       # six-figure in-degree in a many-repo corpus.
-      order_by: [desc: e.weight],
+      order_by: [desc: sum(e.weight)],
       limit: @edge_fanout_limit
     )
     |> Repo.all()
@@ -922,37 +936,57 @@ defmodule RetrievalNode.Graph do
 
   # --- edges -----------------------------------------------------------
 
-  defp upsert_edges(repo, staged_rows, entity_ids, def_entities, now) do
+  # Aggregated per (chunk_id, source_entity_id, target_entity_id, kind) — NOT
+  # collapsed across the whole batch — because the chunk is the edge's
+  # provenance (see EntityEdge's moduledoc). This is what lets two files
+  # contributing outgoing edges for one merged entity (same qualified_name
+  # across files of a source) each hold their own row instead of one
+  # clobbering the other's contribution on delete+insert.
+  defp upsert_edges(repo, staged_rows, chunk_ids_by_key, chunk_ids, entity_ids, def_entities, now) do
     aggregated =
       staged_rows
-      |> Enum.flat_map(&Map.get(&1.graph, "references", []))
-      |> Enum.reduce(%{}, &accumulate_edge(&2, &1, entity_ids))
+      |> Enum.reduce(%{}, fn row, acc ->
+        case Map.get(chunk_ids_by_key, row.chunk_key) do
+          nil ->
+            # Same "shouldn't happen in practice" skip as mention_entries/3 —
+            # every staged row in this job was just written, but a missing
+            # chunk id must be skipped, not written as a bogus NULL-chunk_id
+            # row (that column's NULL is reserved for pre-provenance legacy
+            # rows, not new writes with an unresolved id).
+            acc
 
-    # Every reference's "from" name is (per accumulate_edge/3's contract) an
+          chunk_id ->
+            row.graph
+            |> Map.get("references", [])
+            |> Enum.reduce(acc, &accumulate_edge(&2, &1, entity_ids, chunk_id))
+        end
+      end)
+
+    # Every reference's "from" name is (per accumulate_edge/4's contract) an
     # enclosing definition in this same file/batch, so this batch's
     # definition-entity ids are a superset of every id an edge could possibly
     # be sourced from — including definitions that used to have outgoing
     # edges but contributed nothing to `aggregated` this time (dropped all
     # their calls). Deleting only `aggregated`'s (possibly smaller) set of
-    # source ids, as the old code did, left such a definition's stale edges
-    # behind forever.
+    # source ids, as an earlier version did, left such a definition's stale
+    # edges behind forever.
     def_entity_ids =
       def_entities
       |> Enum.map(&entity_ids[&1.qualified_name])
       |> Enum.reject(&is_nil/1)
 
-    write_edges(repo, def_entity_ids, aggregated, now)
+    write_edges(repo, def_entity_ids, chunk_ids, aggregated, now)
   end
 
   # Only a reference with BOTH ends resolved (its enclosing definition AND
   # its target) becomes a candidate edge — an unresolved end means we never
   # saw a definition for one side, so there's no entity to point the edge at.
-  defp accumulate_edge(acc, ref, entity_ids) do
+  defp accumulate_edge(acc, ref, entity_ids, chunk_id) do
     with from_name when not is_nil(from_name) <- Map.get(ref, "from"),
          source_entity_id when not is_nil(source_entity_id) <- entity_ids[from_name],
          target_entity_id when not is_nil(target_entity_id) <- entity_ids[Map.fetch!(ref, "name")] do
       kind = edge_kind(Map.fetch!(ref, "kind"))
-      Map.update(acc, {source_entity_id, target_entity_id, kind}, 1, &(&1 + 1))
+      Map.update(acc, {source_entity_id, target_entity_id, kind, chunk_id}, 1, &(&1 + 1))
     else
       _ -> acc
     end
@@ -969,34 +1003,50 @@ defmodule RetrievalNode.Graph do
           "unknown edge kind #{inspect(other)} — expected \"call\" or \"import\""
   end
 
-  defp write_edges(repo, def_entity_ids, aggregated, now) do
-    # An entity's outgoing edges are wholly re-derived from its own file on
-    # every ingest of that file — same staleness rationale as mentions.
-    # Scoped to EVERY definition entity resolved from this batch
-    # (def_entity_ids), not just the source ids still present in
-    # `aggregated` — this must run even when `aggregated` is empty (a
-    # definition that dropped every one of its calls), which is exactly the
-    # case an aggregated-only scope would miss.
-    # Known best-effort gap: a from-entity defined under the same
-    # qualified_name in two files of one source will have its edges
-    # overwritten by whichever file is ingested last (the common case is one
-    # definition per qualified_name per source, so this rarely bites).
-    unless def_entity_ids == [] do
-      repo.delete_all(from(e in EntityEdge, where: e.source_entity_id in ^def_entity_ids))
+  defp write_edges(repo, def_entity_ids, chunk_ids, aggregated, now) do
+    # An entity's outgoing edges are re-derived per CHUNK, not per file: each
+    # staged row's contribution is keyed by its own chunk_id (see
+    # accumulate_edge/4), so this batch only needs to clear the rows THIS
+    # batch's chunks are about to replace — `chunk_id in chunk_ids`. A merged
+    # entity's edges contributed by a DIFFERENT file (different chunk ids)
+    # are untouched, which is the fix: the old file-wide delete-then-rederive
+    # let two files defining the same qualified_name clobber each other's
+    # outgoing edges depending on ingest order.
+    #
+    # `is_nil(chunk_id) and source_entity_id in def_entity_ids` is
+    # TRANSITIONAL: it reproduces the pre-provenance delete scope (every
+    # definition entity resolved from this batch, so a definition that
+    # dropped ALL its calls still sheds its stale edge even though
+    # `aggregated` came back empty for it) for legacy rows that predate the
+    # chunk_id column. It's scoped to this batch's own definition entities,
+    # same known best-effort gap as before for those legacy rows: a
+    # from-entity defined under the same qualified_name in two files can
+    # still have its legacy (NULL chunk_id) edges clobbered by whichever
+    # file is ingested last. This disjunct — and the gap — goes away once
+    # every legacy row has been replaced by a chunk-scoped re-ingest.
+    unless chunk_ids == [] and def_entity_ids == [] do
+      repo.delete_all(
+        from(e in EntityEdge,
+          where:
+            e.chunk_id in ^chunk_ids or
+              (is_nil(e.chunk_id) and e.source_entity_id in ^def_entity_ids)
+        )
+      )
     end
 
     entries =
       aggregated
       # conflict key IS the map key here (source_entity_id, target_entity_id,
-      # kind — matching EntityEdge's conflict_target below), so sorting by
-      # key is sorting by conflict target directly — see
+      # kind, chunk_id — matching EntityEdge's conflict_target below), so
+      # sorting by key is sorting by conflict target directly — see
       # sort_by_conflict_key/2's comment.
       |> sort_by_conflict_key(fn {key, _weight} -> key end)
-      |> Enum.map(fn {{source_entity_id, target_entity_id, kind}, weight} ->
+      |> Enum.map(fn {{source_entity_id, target_entity_id, kind, chunk_id}, weight} ->
         %{
           source_entity_id: source_entity_id,
           target_entity_id: target_entity_id,
           kind: kind,
+          chunk_id: chunk_id,
           weight: weight,
           inserted_at: {:placeholder, :now},
           updated_at: {:placeholder, :now}
@@ -1006,7 +1056,7 @@ defmodule RetrievalNode.Graph do
     insert_all_batched(repo, EntityEdge, entries,
       placeholders: %{now: now},
       on_conflict: {:replace, [:weight, :updated_at]},
-      conflict_target: [:source_entity_id, :target_entity_id, :kind]
+      conflict_target: [:source_entity_id, :target_entity_id, :kind, :chunk_id]
     )
   end
 

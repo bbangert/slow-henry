@@ -88,16 +88,65 @@ defmodule RetrievalNode.Graph.SchemaTest do
       end
     end
 
-    test "duplicate (source_entity_id, target_entity_id, kind) on entity_edges raises" do
+    test "duplicate (source_entity_id, target_entity_id, kind, chunk_id) on entity_edges raises" do
+      source = source_fixture()
+      chunk = chunk_fixture(source)
+      a = entity_fixture(source)
+      b = entity_fixture(source, %{qualified_name: "PaymentProcessor.charge"})
+
+      Repo.insert!(%EntityEdge{
+        source_entity_id: a.id,
+        target_entity_id: b.id,
+        kind: :calls,
+        chunk_id: chunk.id
+      })
+
+      assert_raise Ecto.ConstraintError, fn ->
+        Repo.insert!(%EntityEdge{
+          source_entity_id: a.id,
+          target_entity_id: b.id,
+          kind: :calls,
+          chunk_id: chunk.id
+        })
+      end
+    end
+
+    test "the same (source_entity_id, target_entity_id, kind) triple contributed by two DIFFERENT chunks does not raise" do
+      # This is the whole point of chunk-level provenance: two files (two
+      # chunks) contributing an outgoing edge for the same merged entity must
+      # be able to coexist as distinct rows instead of colliding.
+      source = source_fixture()
+      chunk_a = chunk_fixture(source)
+      chunk_b = chunk_fixture(source)
+      a = entity_fixture(source)
+      b = entity_fixture(source, %{qualified_name: "PaymentProcessor.charge"})
+
+      Repo.insert!(%EntityEdge{
+        source_entity_id: a.id,
+        target_entity_id: b.id,
+        kind: :calls,
+        chunk_id: chunk_a.id
+      })
+
+      Repo.insert!(%EntityEdge{
+        source_entity_id: a.id,
+        target_entity_id: b.id,
+        kind: :calls,
+        chunk_id: chunk_b.id
+      })
+
+      assert Repo.aggregate(EntityEdge, :count, :id) == 2
+    end
+
+    test "legacy NULL chunk_id rows for the same triple do not collide (Postgres treats NULL as distinct in a unique index)" do
       source = source_fixture()
       a = entity_fixture(source)
       b = entity_fixture(source, %{qualified_name: "PaymentProcessor.charge"})
 
       Repo.insert!(%EntityEdge{source_entity_id: a.id, target_entity_id: b.id, kind: :calls})
+      Repo.insert!(%EntityEdge{source_entity_id: a.id, target_entity_id: b.id, kind: :calls})
 
-      assert_raise Ecto.ConstraintError, fn ->
-        Repo.insert!(%EntityEdge{source_entity_id: a.id, target_entity_id: b.id, kind: :calls})
-      end
+      assert Repo.aggregate(EntityEdge, :count, :id) == 2
     end
   end
 
@@ -135,6 +184,28 @@ defmodule RetrievalNode.Graph.SchemaTest do
 
       refute Repo.get(EntityMention, mention.id)
       refute Repo.get(EntityEdge, edge.id)
+    end
+
+    test "deleting a chunk cascades its provenance edge (chunk_id FK), same lifecycle as mentions" do
+      source = source_fixture()
+      chunk = chunk_fixture(source)
+      a = entity_fixture(source)
+      b = entity_fixture(source, %{qualified_name: "PaymentProcessor.charge"})
+
+      edge =
+        Repo.insert!(%EntityEdge{
+          source_entity_id: a.id,
+          target_entity_id: b.id,
+          kind: :calls,
+          chunk_id: chunk.id
+        })
+
+      Repo.delete!(chunk)
+
+      refute Repo.get(EntityEdge, edge.id)
+      # the entities themselves have no FK back to chunks — they survive.
+      assert Repo.get(Entity, a.id)
+      assert Repo.get(Entity, b.id)
     end
   end
 end
