@@ -134,6 +134,20 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     "java" => ~w(import_declaration)
   }
 
+  # Elixir's grammar gives every construct the SAME node kind ("call",
+  # discriminated by its `target:` field's identifier text) — the kind-keyed
+  # tables above can't express that, so elixir is dispatched through its own
+  # process_child/6 clause (handle_elixir_call/6 and friends) instead of
+  # gaining entries here. defmodule/defprotocol/defimpl are :module_like
+  # containers; the def-family are :function_like (entity_kind_for/2 already
+  # turns :function_like nested in a :module_like container into :function —
+  # same rule that gives rust's mod_item-nested functions :function, not
+  # :method). alias/import/use/require are the import forms.
+  @elixir_module_forms ~w(defmodule defprotocol defimpl)
+  @elixir_function_forms ~w(def defp defmacro defmacrop defguard defguardp)
+  @elixir_def_forms @elixir_module_forms ++ @elixir_function_forms
+  @elixir_import_forms ~w(alias import use require)
+
   @impl true
   def extract({root, source}, language, _opts) do
     def_kinds = Map.get(@definition_kinds, language, %{})
@@ -159,6 +173,17 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         {:cont, process_child(child, source, language, lang_ctx, state, acc)}
       end
     end)
+  end
+
+  # Elixir has no kind-keyed table to dispatch through (see @elixir_def_forms
+  # above) — every node worth inspecting is a "call", discriminated by its
+  # target text, so it gets its own clause ahead of the generic one below.
+  defp process_child(child, source, "elixir" = language, lang_ctx, state, acc) do
+    if TS.node_kind(child) == "call" do
+      handle_elixir_call(child, source, language, lang_ctx, state, acc)
+    else
+      walk(child, source, language, lang_ctx, state, acc)
+    end
   end
 
   defp process_child(child, source, language, lang_ctx, state, acc) do
@@ -189,7 +214,14 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp handle_definition(child, kind, source, language, lang_ctx, state, acc) do
     category = Map.fetch!(lang_ctx.def_kinds, kind)
     name = name_field(child, language, kind, source)
+    handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
+  end
 
+  # Shared by the kind-table-driven languages (handle_definition/7 above) and
+  # elixir's predicate-driven handle_elixir_definition/6 below — the
+  # scope/qname/class_qname threading is identical once `category` and `name`
+  # are known, regardless of how they were derived.
+  defp handle_definition_category(child, category, name, source, language, lang_ctx, state, acc) do
     {new_scope, new_enclosing_qname, new_class_qname, acc} =
       case name do
         nil ->
@@ -224,6 +256,227 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp entity_kind_for(:module_like, _container), do: :module
   defp entity_kind_for(:function_like, :class_like), do: :method
   defp entity_kind_for(:function_like, _container), do: :function
+
+  # --- elixir --------------------------------------------------------------
+  #
+  # Every elixir construct parses as a `call` node (target: identifier), so
+  # there's no kind to key a table on — this dispatches by the target text
+  # instead, one predicate check at a time: def-form -> definition,
+  # alias/import/use/require -> import ref, the `@attr` name-call itself ->
+  # skip (but still descend for calls nested in the attribute's value), else
+  # a real call reference (bare identifier or dot-qualified).
+
+  defp handle_elixir_call(call_node, source, language, lang_ctx, state, acc) do
+    target_node = TS.node_child_by_field_name(call_node, "target")
+    target_identifier = elixir_target_identifier(target_node, source)
+
+    cond do
+      is_nil(target_node) ->
+        walk(call_node, source, language, lang_ctx, state, acc)
+
+      target_identifier in @elixir_def_forms ->
+        handle_elixir_definition(
+          call_node,
+          target_identifier,
+          source,
+          language,
+          lang_ctx,
+          state,
+          acc
+        )
+
+      target_identifier in @elixir_import_forms ->
+        handle_elixir_import(call_node, source, state, acc)
+
+      elixir_attribute_name_call?(call_node, source) ->
+        walk(call_node, source, language, lang_ctx, state, acc)
+
+      true ->
+        acc
+        |> handle_elixir_call_ref(call_node, target_node, source, state)
+        |> maybe_walk(call_node, source, language, lang_ctx, state)
+    end
+  end
+
+  defp elixir_target_identifier(nil, _source), do: nil
+
+  defp elixir_target_identifier(target_node, source) do
+    if TS.node_kind(target_node) == "identifier", do: slice(source, target_node), else: nil
+  end
+
+  # `@moduledoc "x"` / `@x String.trim(y)` both parse as
+  # `unary_operator(operator: "@", operand: call(target: identifier ...))` —
+  # the attribute-NAME call itself (target "moduledoc"/"x") is noise, not a
+  # real callee, but is indistinguishable from a real call by target alone.
+  # `node_parent` + the unary_operator's own `operator:` field (not just its
+  # kind, which every unary op — `!`, `not`, `-` — also produces) is what
+  # actually identifies it.
+  defp elixir_attribute_name_call?(call_node, source) do
+    case TS.node_parent(call_node) do
+      nil ->
+        false
+
+      parent ->
+        TS.node_kind(parent) == "unary_operator" and
+          case TS.node_child_by_field_name(parent, "operator") do
+            nil -> false
+            op_node -> slice(source, op_node) == "@"
+          end
+    end
+  end
+
+  defp handle_elixir_definition(child, target_text, source, language, lang_ctx, state, acc) do
+    category = if target_text in @elixir_module_forms, do: :module_like, else: :function_like
+    name = elixir_definition_name(child, category, source)
+    handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
+  end
+
+  defp elixir_definition_name(call_node, :module_like, source) do
+    case elixir_arguments_node(call_node) do
+      nil ->
+        nil
+
+      args_node ->
+        args_node
+        |> named_children()
+        |> Enum.find(&(TS.node_kind(&1) == "alias"))
+        |> case do
+          nil -> nil
+          alias_node -> slice(source, alias_node)
+        end
+    end
+  end
+
+  defp elixir_definition_name(call_node, :function_like, source) do
+    case elixir_arguments_node(call_node) do
+      nil ->
+        nil
+
+      args_node ->
+        case named_children(args_node) do
+          [] -> nil
+          [first | _] -> elixir_def_name_from(first, source)
+        end
+    end
+  end
+
+  # `arguments` (like `do_block`) is a plain positional child in this
+  # grammar, NOT a `node_child_by_field_name`-reachable field — empirically
+  # verified: only `target`/`left`/`right`/`operator`/`operand`/`key`/`value`
+  # are real fields here. Find it by kind among the call's named children.
+  defp elixir_arguments_node(call_node) do
+    call_node
+    |> named_children()
+    |> Enum.find(&(TS.node_kind(&1) == "arguments"))
+  end
+
+  # Three empirically verified name shapes: a bare identifier (zero-arity
+  # no-paren def), a nested `call` (the common `def name(...)` case), or a
+  # `binary_operator` (a `when`-guard clause) whose `left:` is the name-call.
+  defp elixir_def_name_from(node, source) do
+    case TS.node_kind(node) do
+      "call" ->
+        case TS.node_child_by_field_name(node, "target") do
+          nil -> nil
+          target_node -> slice(source, target_node)
+        end
+
+      "identifier" ->
+        slice(source, node)
+
+      "binary_operator" ->
+        case TS.node_child_by_field_name(node, "left") do
+          nil -> nil
+          left_node -> elixir_def_name_from(left_node, source)
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp handle_elixir_call_ref(acc, call_node, target_node, source, state) do
+    case elixir_callee_name(target_node, source) do
+      nil ->
+        acc
+
+      name ->
+        add_reference(acc, %{
+          name: name,
+          kind: :call,
+          from: state.enclosing_qname,
+          line: line(call_node)
+        })
+    end
+  end
+
+  # Bare `helper(order)` -> target is a plain identifier, sliced directly.
+  # Qualified `B.run(order)` -> target is `dot(left: alias, right:
+  # identifier)`, resolved to the rightmost member, same convention as the
+  # other qualified-callee languages (no self/this concept in elixir, so no
+  # receiver-scoping to do here).
+  defp elixir_callee_name(target_node, source) do
+    case TS.node_kind(target_node) do
+      "identifier" ->
+        slice(source, target_node)
+
+      "dot" ->
+        case TS.node_child_by_field_name(target_node, "right") do
+          nil -> nil
+          right_node -> slice(source, right_node)
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  # alias/import/use/require all resolve to a single :import ref named by the
+  # alias argument's source text (the alias node's text IS the full dotted
+  # module name, e.g. "Foo.Bar" — one leaf token in this grammar, not nested
+  # segments). `alias Foo.{Bar, Baz}` parses its argument as
+  # `dot(left: alias "Foo", right: tuple(...))` instead of a plain `alias`
+  # node — best-effort here is a single "Foo" ref rather than resolving each
+  # brace member.
+  defp handle_elixir_import(call_node, source, state, acc) do
+    case elixir_arguments_node(call_node) do
+      nil ->
+        acc
+
+      args_node ->
+        case elixir_import_symbol(args_node, source) do
+          nil ->
+            acc
+
+          name ->
+            add_reference(acc, %{
+              name: name,
+              kind: :import,
+              from: state.enclosing_qname,
+              line: line(call_node)
+            })
+        end
+    end
+  end
+
+  defp elixir_import_symbol(args_node, source) do
+    args_node
+    |> named_children()
+    |> Enum.find_value(fn child ->
+      case TS.node_kind(child) do
+        "alias" -> slice(source, child)
+        "dot" -> elixir_alias_dot_name(child, source)
+        _ -> nil
+      end
+    end)
+  end
+
+  defp elixir_alias_dot_name(dot_node, source) do
+    case TS.node_child_by_field_name(dot_node, "left") do
+      nil -> nil
+      left_node -> if TS.node_kind(left_node) == "alias", do: slice(source, left_node), else: nil
+    end
+  end
 
   # --- calls -------------------------------------------------------------
 

@@ -88,11 +88,58 @@ defmodule RetrievalNode.Ingest do
   deduped onto) does the full re-stage regardless of which caller's args won.
   """
   @spec force_full_resync_git_sources() :: {:ok, non_neg_integer()} | {:error, term()}
-  def force_full_resync_git_sources do
+  def force_full_resync_git_sources, do: force_full_resync_git_sources(:all)
+
+  @doc """
+  Like `force_full_resync_git_sources/0`, but scoped to specific sources —
+  `mix rn.graph.backfill --source <name>` targets a re-derive at one or a
+  few repos instead of paying the full-corpus re-embed cost (see that task's
+  moduledoc). `:all` behaves exactly like the arity-0 function.
+
+  Each entry in `names_or_identifiers` is matched against either a source's
+  `name` OR its `identifier` (whichever the caller has handy). Any entry
+  that matches no *active* git source is reported back as
+  `{:error, {:unknown_sources, unmatched}}` — the whole call is rejected
+  (no cursor is cleared, nothing is enqueued) rather than silently
+  resyncing a partial set, so a typo'd source name never runs a full
+  backfill for the wrong repo without warning.
+  """
+  @spec force_full_resync_git_sources(:all | [String.t()]) ::
+          {:ok, non_neg_integer()}
+          | {:error, {:unknown_sources, [String.t()]}}
+          | {:error, term()}
+  def force_full_resync_git_sources(:all) do
+    active_git_sources() |> resync_sources()
+  end
+
+  def force_full_resync_git_sources(names_or_identifiers) when is_list(names_or_identifiers) do
+    sources = active_git_sources()
+
+    matched =
+      Enum.filter(sources, fn s ->
+        s.name in names_or_identifiers or s.identifier in names_or_identifiers
+      end)
+
+    unknown =
+      Enum.reject(names_or_identifiers, fn key ->
+        Enum.any?(sources, &(&1.name == key or &1.identifier == key))
+      end)
+
+    if unknown == [] do
+      resync_sources(matched)
+    else
+      {:error, {:unknown_sources, unknown}}
+    end
+  end
+
+  defp active_git_sources do
     Source
     |> where([s], s.source_type == :git_repo and s.active == true)
     |> Repo.all()
-    |> Enum.reduce_while({:ok, 0}, fn source, {:ok, count} ->
+  end
+
+  defp resync_sources(sources) do
+    Enum.reduce_while(sources, {:ok, 0}, fn source, {:ok, count} ->
       clear_sync_cursor!(source.id)
 
       case Oban.insert(RepoSync.new(%{"source_id" => source.id})) do

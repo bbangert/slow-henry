@@ -78,6 +78,60 @@ defmodule RetrievalNode.IngestTest do
     end
   end
 
+  describe "force_full_resync_git_sources/1 (targeted)" do
+    test "clears only the named source's cursor and enqueues only its RepoSync job" do
+      target =
+        Repo.insert!(%Source{source_type: :git_repo, name: "target", identifier: "file:///t"})
+
+      other =
+        Repo.insert!(%Source{source_type: :git_repo, name: "other", identifier: "file:///o"})
+
+      Repo.insert!(%SyncState{source_id: target.id, cursor: %{"last_sha" => "aaa"}})
+      Repo.insert!(%SyncState{source_id: other.id, cursor: %{"last_sha" => "bbb"}})
+
+      assert {:ok, 1} = Ingest.force_full_resync_git_sources(["target"])
+
+      target_state = Repo.get_by!(SyncState, source_id: target.id)
+      assert target_state.cursor == %{}
+
+      other_state = Repo.get_by!(SyncState, source_id: other.id)
+      assert other_state.cursor == %{"last_sha" => "bbb"}
+
+      assert_enqueued(worker: RepoSync, args: %{"source_id" => target.id})
+      refute_enqueued(worker: RepoSync, args: %{"source_id" => other.id})
+    end
+
+    test "matches on identifier as well as name" do
+      target =
+        Repo.insert!(%Source{source_type: :git_repo, name: "target", identifier: "file:///t"})
+
+      assert {:ok, 1} = Ingest.force_full_resync_git_sources(["file:///t"])
+      assert_enqueued(worker: RepoSync, args: %{"source_id" => target.id})
+    end
+
+    test "an unknown name is rejected — nothing is cleared or enqueued" do
+      known =
+        Repo.insert!(%Source{source_type: :git_repo, name: "known", identifier: "file:///k"})
+
+      Repo.insert!(%SyncState{source_id: known.id, cursor: %{"last_sha" => "keep"}})
+
+      assert {:error, {:unknown_sources, ["nope"]}} =
+               Ingest.force_full_resync_git_sources(["known", "nope"])
+
+      state = Repo.get_by!(SyncState, source_id: known.id)
+      assert state.cursor == %{"last_sha" => "keep"}
+      refute_enqueued(worker: RepoSync, args: %{"source_id" => known.id})
+    end
+
+    test ":all behaves exactly like the arity-0 function" do
+      git =
+        Repo.insert!(%Source{source_type: :git_repo, name: "g", identifier: "file:///g"})
+
+      assert {:ok, 1} = Ingest.force_full_resync_git_sources(:all)
+      assert_enqueued(worker: RepoSync, args: %{"source_id" => git.id})
+    end
+  end
+
   describe "backfill_status/0" do
     test "returns pending_chunks, oban_jobs, and graph counts" do
       source = Repo.insert!(%Source{source_type: :git_repo, name: "g", identifier: "file:///g"})

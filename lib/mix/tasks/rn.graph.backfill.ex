@@ -51,6 +51,16 @@ defmodule Mix.Tasks.Rn.Graph.Backfill do
   resync, then prints how many `RepoSync` jobs were enqueued plus a
   `--status` hint.
 
+  ## Targeted re-sync
+
+      mix rn.graph.backfill --source my-repo --source other-repo
+
+  Repeatable `--source <name-or-identifier>` resets and enqueues ONLY the
+  named active git source(s) — matched against either a source's `name` or
+  its `identifier` — instead of paying the full-corpus re-embed cost. Any
+  name that matches no active git source aborts the whole run (nothing is
+  reset or enqueued) with the unmatched name(s) listed.
+
   ## Status only
 
       mix rn.graph.backfill --status
@@ -68,7 +78,10 @@ defmodule Mix.Tasks.Rn.Graph.Backfill do
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.Source
 
-  @switches [status: :boolean]
+  # source: :keep collects one {:source, value} pair per repeated flag
+  # (never overwrites/merges), so --source a --source b survives parse_args
+  # as [source: "a", source: "b"] for run/1 to Keyword.get_values/2 out.
+  @switches [status: :boolean, source: :keep]
 
   # run/1 ends in System.halt/1 (boot/0's ensure_all_started boots the full
   # supervision tree, which would otherwise keep the VM alive after this task
@@ -84,7 +97,7 @@ defmodule Mix.Tasks.Rn.Graph.Backfill do
         if opts[:status] do
           print_status()
         else
-          backfill()
+          backfill(Keyword.get_values(opts, :source))
         end
 
         # boot/0 brings up the *entire* supervision tree (Endpoint, Oban, the
@@ -128,8 +141,9 @@ defmodule Mix.Tasks.Rn.Graph.Backfill do
 
     "unrecognized option(s)/argument(s): #{Enum.join(offenders, ", ")}\n\n" <>
       "Usage:\n" <>
-      "  mix rn.graph.backfill           # force a full re-sync backfill\n" <>
-      "  mix rn.graph.backfill --status  # read-only status report"
+      "  mix rn.graph.backfill                              # force a full re-sync backfill\n" <>
+      "  mix rn.graph.backfill --source NAME [--source ...]  # targeted re-sync backfill\n" <>
+      "  mix rn.graph.backfill --status                      # read-only status report"
   end
 
   # --- boot ---
@@ -168,7 +182,7 @@ defmodule Mix.Tasks.Rn.Graph.Backfill do
 
   # --- backfill ---
 
-  defp backfill do
+  defp backfill([]) do
     source_count =
       Repo.aggregate(
         from(s in Source, where: s.source_type == :git_repo and s.active == true),
@@ -178,7 +192,20 @@ defmodule Mix.Tasks.Rn.Graph.Backfill do
 
     Mix.shell().info("Resetting sync watermark for #{source_count} active git source(s)...")
 
-    case Ingest.force_full_resync_git_sources() do
+    report_resync(Ingest.force_full_resync_git_sources(), "full resync")
+  end
+
+  defp backfill(source_names) do
+    Mix.shell().info(
+      "Resetting sync watermark for #{length(source_names)} named git source(s): " <>
+        "#{Enum.join(source_names, ", ")}..."
+    )
+
+    report_resync(Ingest.force_full_resync_git_sources(source_names), "targeted resync")
+  end
+
+  defp report_resync(result, label) do
+    case result do
       {:ok, enqueued} ->
         Mix.shell().info("""
         Enqueued #{enqueued} RepoSync job(s) with cleared watermarks.
@@ -188,8 +215,11 @@ defmodule Mix.Tasks.Rn.Graph.Backfill do
           mix rn.graph.backfill --status
         """)
 
+      {:error, {:unknown_sources, unknown}} ->
+        Mix.raise("unknown source name(s)/identifier(s): #{Enum.join(unknown, ", ")}")
+
       {:error, reason} ->
-        Mix.raise("failed to enqueue full resync: #{inspect(reason)}")
+        Mix.raise("failed to enqueue #{label}: #{inspect(reason)}")
     end
   end
 

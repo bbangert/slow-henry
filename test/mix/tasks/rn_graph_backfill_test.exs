@@ -35,5 +35,24 @@ defmodule Mix.Tasks.Rn.Graph.BackfillTest do
       assert {:error, message} = Backfill.parse_args(["--status=bogus"])
       assert message =~ "--status"
     end
+
+    test "a single --source parses to source: <name>" do
+      assert Backfill.parse_args(["--source", "acme/app"]) == {:ok, [source: "acme/app"]}
+    end
+
+    test "repeated --source flags all survive parsing (no overwrite/merge)" do
+      assert Backfill.parse_args(["--source", "a", "--source", "b"]) ==
+               {:ok, [source: "a", source: "b"]}
+    end
+
+    test "--source combined with --status both survive parsing" do
+      assert Backfill.parse_args(["--status", "--source", "a"]) ==
+               {:ok, [status: true, source: "a"]}
+    end
+
+    test "an unknown flag alongside --source is rejected" do
+      assert {:error, message} = Backfill.parse_args(["--source", "a", "--bogus"])
+      assert message =~ "--bogus"
+    end
   end
 end

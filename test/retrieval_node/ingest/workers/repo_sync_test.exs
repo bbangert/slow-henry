@@ -67,6 +67,22 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     assert state.cursor["last_sha"] == head
   end
 
+  test ".ex and .exs files are tagged lang: \"elixir\"", ctx do
+    commit(ctx.src, [
+      {"a.ex", "defmodule A do\nend\n"},
+      {"a_test.exs", "1 + 1\n"}
+    ])
+
+    assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+    raws = Repo.all(from p in PendingChunk, where: p.status == "raw")
+
+    assert Enum.sort(Enum.map(raws, & &1.natural_key)) ==
+             ["repo:#{ctx.source.id}:a.ex", "repo:#{ctx.source.id}:a_test.exs"]
+
+    assert Enum.all?(raws, &(&1.lang == "elixir"))
+  end
+
   test "an unchanged repo is a no-op on the second sync", ctx do
     commit(ctx.src, [{"a.py", "x\n"}])
     perform_job(RepoSync, %{"source_id" => ctx.source.id})

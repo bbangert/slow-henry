@@ -22,9 +22,9 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
       assert {:error, :unsupported_language} = TSI.chunk("x = 1", "cobol")
     end
 
-    test "allowed_languages/0 is the mainstream code set" do
+    test "allowed_languages/0 is the mainstream code set plus elixir" do
       assert "python" in TSI.allowed_languages()
-      refute "elixir" in TSI.allowed_languages()
+      assert "elixir" in TSI.allowed_languages()
     end
   end
 
@@ -94,6 +94,39 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
       assert "foo" in crumbs
       assert "A > bar" in crumbs
       assert Enum.all?(chunks, &(&1.parse_status == :ok))
+    end
+
+    test "chunks elixir def/defp/defmacro at module-scoped boundaries" do
+      src = """
+      defmodule Payment.Processor do
+        def process(order) do
+          helper(order)
+        end
+
+        defp helper(o), do: o
+
+        defmacro mymacro(x) do
+          quote do
+            unquote(x)
+          end
+        end
+      end
+      """
+
+      {:ok, chunks} = TSI.chunk(src, "elixir")
+
+      crumbs = Enum.map(chunks, & &1.breadcrumb)
+      assert "Payment.Processor > process" in crumbs
+      assert "Payment.Processor > helper" in crumbs
+      assert "Payment.Processor > mymacro" in crumbs
+      assert Enum.all?(chunks, &(&1.parse_status == :ok))
+    end
+
+    test "a module-less top-level def file (script) still chunks" do
+      src = "def top(x) do\n  x + 1\nend\n"
+      {:ok, chunks} = TSI.chunk(src, "elixir")
+
+      assert Enum.map(chunks, & &1.breadcrumb) == ["top"]
     end
   end
 

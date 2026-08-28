@@ -60,7 +60,9 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
     "go" => "go",
     "rs" => "rust",
     "rb" => "ruby",
-    "java" => "java"
+    "java" => "java",
+    "ex" => "elixir",
+    "exs" => "elixir"
   }
 
   @impl Oban.Worker

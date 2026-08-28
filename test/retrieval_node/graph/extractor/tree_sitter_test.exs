@@ -494,6 +494,97 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
     end
   end
 
+  describe "elixir" do
+    @src """
+    defmodule Payment.Processor do
+      @moduledoc "docs"
+
+      alias Foo.Bar, as: B
+      import Ecto.Query
+      use GenServer
+      require Logger
+
+      def process(order) do
+        B.run(order)
+        helper(order)
+      end
+
+      defp helper(o), do: o
+
+      def init, do: :ok
+
+      def guarded(x) when x > 1 do
+        x
+      end
+
+      @x String.trim("y")
+    end
+    """
+
+    test "entities: module, def/defp-inside-module as :function with qualified names" do
+      %{entities: entities} = extract(@src, "elixir")
+
+      assert %{qualified_name: "Payment.Processor", kind: :module} =
+               find(entities, "Payment.Processor")
+
+      assert %{qualified_name: "Payment.Processor.process", kind: :function} =
+               find(entities, "Payment.Processor.process")
+
+      assert %{qualified_name: "Payment.Processor.helper", kind: :function} =
+               find(entities, "Payment.Processor.helper")
+    end
+
+    test "zero-arity no-paren def is named correctly" do
+      %{entities: entities} = extract(@src, "elixir")
+
+      assert %{qualified_name: "Payment.Processor.init", kind: :function} =
+               find(entities, "Payment.Processor.init")
+    end
+
+    test "a when-guard def is named correctly (not \"guarded(x) when x > 1\")" do
+      %{entities: entities} = extract(@src, "elixir")
+
+      assert %{qualified_name: "Payment.Processor.guarded", kind: :function} =
+               find(entities, "Payment.Processor.guarded")
+    end
+
+    test "bare and dot-qualified calls scoped to the enclosing def" do
+      %{references: refs} = extract(@src, "elixir")
+
+      assert %{name: "helper", kind: :call, from: "Payment.Processor.process"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+
+      assert %{name: "run", kind: :call, from: "Payment.Processor.process"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "run"))
+    end
+
+    test "alias/import/use/require all become :import refs named by the full module text" do
+      %{references: refs} = extract(@src, "elixir")
+      imports = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert "Foo.Bar" in imports
+      assert "Ecto.Query" in imports
+      assert "GenServer" in imports
+      assert "Logger" in imports
+    end
+
+    test "@moduledoc does not produce a call ref, but a call nested in an attribute value is found" do
+      %{references: refs} = extract(@src, "elixir")
+
+      refute Enum.any?(refs, &(&1.kind == :call and &1.name == "moduledoc"))
+      refute Enum.any?(refs, &(&1.kind == :call and &1.name == "x"))
+
+      assert %{name: "trim", kind: :call, from: "Payment.Processor"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "trim"))
+    end
+
+    test "alias braces form best-effort: alias Foo.{Bar, Baz} records a single \"Foo\" import ref" do
+      %{references: refs} = extract("alias Foo.{Bar, Baz}\n", "elixir")
+
+      assert Enum.any?(refs, &(&1.kind == :import and &1.name == "Foo"))
+    end
+  end
+
   describe "oversized symbols" do
     # Mirrors @max_symbol_bytes in the extractor: identifiers past the cap are
     # minified/generated junk and would blow the entities unique btree index
