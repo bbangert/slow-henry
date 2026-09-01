@@ -623,6 +623,39 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
                Enum.find(refs, &(&1.kind == :call and &1.name == "trim"))
     end
 
+    test "typespec attributes (@spec/@callback/@type) are never walked as calls, unlike other attributes" do
+      %{references: refs} =
+        extract(
+          """
+          defmodule M do
+            @spec f(binary()) :: :ok
+            def f(x), do: g(x)
+
+            @callback cb(term()) :: :ok
+
+            @type t :: map()
+
+            @custom String.trim("a")
+          end
+          """,
+          "elixir"
+        )
+
+      call_names = refs |> Enum.filter(&(&1.kind == :call)) |> Enum.map(& &1.name)
+
+      assert %{name: "g", kind: :call, from: "M.f"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "g"))
+
+      assert %{name: "trim", kind: :call, from: "M"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "trim"))
+
+      refute "f" in call_names
+      refute "binary" in call_names
+      refute "cb" in call_names
+      refute "term" in call_names
+      refute "map" in call_names
+    end
+
     test "alias braces form best-effort: alias Foo.{Bar, Baz} records a single \"Foo\" import ref" do
       %{references: refs} = extract("alias Foo.{Bar, Baz}\n", "elixir")
 

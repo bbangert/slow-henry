@@ -148,6 +148,13 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   @elixir_def_forms @elixir_module_forms ++ @elixir_function_forms
   @elixir_import_forms ~w(alias import use require)
 
+  # Typespec attributes are the type language, not runtime code: `@spec
+  # f(binary()) :: :ok` writes `f` and `binary` in call syntax, but neither is
+  # a call -- they're a function signature. Unlike other attribute values
+  # (walked below so a real call like `@x String.trim(y)` is still found),
+  # these are never descended into at all.
+  @elixir_typespec_attrs ~w(spec callback macrocallback type typep opaque)
+
   @impl true
   def extract({root, source}, language, _opts) do
     def_kinds = Map.get(@definition_kinds, language, %{})
@@ -349,8 +356,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # Every elixir construct parses as a `call` node (target: identifier), so
   # there's no kind to key a table on — this dispatches by the target text
   # instead, one predicate check at a time: def-form -> definition,
-  # alias/import/use/require -> import ref, the `@attr` name-call itself ->
-  # skip (but still descend for calls nested in the attribute's value), else
+  # alias/import/use/require -> import ref, a typespec attribute
+  # (@elixir_typespec_attrs) -> skip entirely (its value is the type
+  # language, not calls), any other `@attr` name-call -> skip the name-call
+  # itself but still descend for calls nested in the attribute's value, else
   # a real call reference (bare identifier or dot-qualified).
 
   defp handle_elixir_call(call_node, source, language, lang_ctx, state, acc) do
@@ -374,6 +383,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
       target_identifier in @elixir_import_forms ->
         handle_elixir_import(call_node, source, state, acc)
+
+      target_identifier in @elixir_typespec_attrs and
+          elixir_attribute_name_call?(call_node, source) ->
+        acc
 
       elixir_attribute_name_call?(call_node, source) ->
         walk(call_node, source, language, lang_ctx, state, acc)
