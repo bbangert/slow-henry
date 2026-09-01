@@ -164,13 +164,19 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp walk(node, source, language, lang_ctx, state, acc) do
-    node
-    |> named_children()
-    |> Enum.reduce_while(acc, fn child, acc ->
+    walk_nodes(named_children(node), source, language, lang_ctx, state, acc)
+  end
+
+  # Like walk/6, but over an explicit node list instead of a parent's named
+  # children — used where the nodes to descend into are picked out by hand
+  # (see walk_elixir_keywords_values/6) rather than being "every named child
+  # of this node".
+  defp walk_nodes(nodes, source, language, lang_ctx, state, acc) do
+    Enum.reduce_while(nodes, acc, fn node, acc ->
       if at_cap?(acc) do
         {:halt, acc}
       else
-        {:cont, process_child(child, source, language, lang_ctx, state, acc)}
+        {:cont, process_child(node, source, language, lang_ctx, state, acc)}
       end
     end)
   end
@@ -248,8 +254,89 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         class_qname: new_class_qname
       }
 
-      walk(child, source, language, lang_ctx, new_state, acc)
+      walk_definition_body(child, category, language, source, lang_ctx, new_state, acc)
     end
+  end
+
+  # An elixir def's head (`process(order)`, or the `when`-guard wrapping it —
+  # see the dump in handle_elixir_definition/6's neighborhood) parses as an
+  # ordinary nested `call`/`binary_operator`, indistinguishable by shape from
+  # a real call site (handle_elixir_call/6 dispatches on shape alone) —
+  # walking the whole definition node verbatim, as every other language does,
+  # would turn every def into a spurious self-call to its own name. So
+  # elixir's def-family (:function_like; :module_like — defmodule et al —
+  # still falls through to the generic clause below, since its head is a
+  # plain `alias`, not a call) walks only the body instead: the `do_block`,
+  # or (keyword form, `def f(x), do: expr`) the `keywords` pair's value.
+  # `when`-guard expressions (`when is_binary(x)`) are deliberately skipped
+  # too, even though they're arguably real references, for consistency with
+  # the head skip — both live in the same `arguments` node the walk below
+  # ignores except for `keywords`. Default-arg expressions
+  # (`def f(x \\ default())`) are skipped as well: the arguments node mixes
+  # them with the head call with no cheap way to tell them apart.
+  defp walk_definition_body(
+         child,
+         :function_like,
+         "elixir" = language,
+         source,
+         lang_ctx,
+         state,
+         acc
+       ) do
+    child
+    |> named_children()
+    |> Enum.filter(&(TS.node_kind(&1) in ["do_block", "arguments"]))
+    |> Enum.reduce_while(acc, fn node, acc ->
+      if at_cap?(acc) do
+        {:halt, acc}
+      else
+        {:cont, walk_elixir_def_body_node(node, source, language, lang_ctx, state, acc)}
+      end
+    end)
+  end
+
+  # Every kind-table-driven language (and elixir's :module_like) walks the
+  # whole definition node as before: their grammars give the parameter list
+  # its own dedicated node kind, so there's no ambiguity to worry about
+  # there.
+  defp walk_definition_body(child, _category, language, source, lang_ctx, state, acc) do
+    walk(child, source, language, lang_ctx, state, acc)
+  end
+
+  defp walk_elixir_def_body_node(node, source, language, lang_ctx, state, acc) do
+    case TS.node_kind(node) do
+      "do_block" ->
+        walk(node, source, language, lang_ctx, state, acc)
+
+      "arguments" ->
+        node
+        |> named_children()
+        |> Enum.find(&(TS.node_kind(&1) == "keywords"))
+        |> case do
+          nil ->
+            acc
+
+          keywords_node ->
+            walk_elixir_keywords_values(keywords_node, source, language, lang_ctx, state, acc)
+        end
+    end
+  end
+
+  # `keywords` holds one `pair` per `key: value` entry (just `do:` for defs
+  # in practice) — walk each pair's `value` as an ordinary node (not its
+  # whole `pair`, whose `key` is a `keyword` leaf with nothing to walk
+  # anyway) so a value that is itself a call (`do: helper(order)`) is
+  # recognized as one via process_child/6, same as any other call site.
+  defp walk_elixir_keywords_values(keywords_node, source, language, lang_ctx, state, acc) do
+    keywords_node
+    |> named_children()
+    |> Enum.flat_map(fn pair ->
+      case TS.node_child_by_field_name(pair, "value") do
+        nil -> []
+        value_node -> [value_node]
+      end
+    end)
+    |> walk_nodes(source, language, lang_ctx, state, acc)
   end
 
   defp entity_kind_for(:class_like, _container), do: :class

@@ -558,6 +558,51 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
                Enum.find(refs, &(&1.kind == :call and &1.name == "run"))
     end
 
+    test "a def's own head is not walked as a call: no spurious self-call from process to process" do
+      %{references: refs} = extract(@src, "elixir")
+
+      refute Enum.any?(
+               refs,
+               &(&1.kind == :call and &1.name == "process" and
+                   &1.from == "Payment.Processor.process")
+             )
+    end
+
+    test "a when-guard def's head and guard are not walked as calls, but its body still is" do
+      %{references: refs} =
+        extract(
+          """
+          defmodule Payment.Processor do
+            def guarded(x) when is_binary(x) do
+              helper(x)
+            end
+          end
+          """,
+          "elixir"
+        )
+
+      refute Enum.any?(refs, &(&1.kind == :call and &1.name == "guarded"))
+      refute Enum.any?(refs, &(&1.kind == :call and &1.name == "is_binary"))
+
+      assert %{name: "helper", kind: :call, from: "Payment.Processor.guarded"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+    end
+
+    test "keyword `do:` form still walks its body: defp x(a), do: helper(a) finds the call" do
+      %{references: refs} =
+        extract(
+          """
+          defmodule Payment.Processor do
+            defp x(a), do: helper(a)
+          end
+          """,
+          "elixir"
+        )
+
+      assert %{name: "helper", kind: :call, from: "Payment.Processor.x"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+    end
+
     test "alias/import/use/require all become :import refs named by the full module text" do
       %{references: refs} = extract(@src, "elixir")
       imports = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)

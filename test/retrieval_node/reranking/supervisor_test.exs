@@ -70,6 +70,74 @@ defmodule RetrievalNode.Reranking.SupervisorTest do
     end)
   end
 
+  test "a warmup that fails once then succeeds retries and ends readiness at true" do
+    counter = start_supervised!({Agent, fn -> 0 end})
+
+    warmup_fun = fn ->
+      case Agent.get_and_update(counter, &{&1, &1 + 1}) do
+        0 ->
+          :error
+
+        _ ->
+          :persistent_term.put({Serving, :ready?}, true)
+          :ok
+      end
+    end
+
+    capture_log(fn ->
+      # base/max_backoff_ms shrunk from production's 1s/60s so the test
+      # doesn't wait out a real backoff window; max_attempts is unrelated to
+      # this test but harmless to shrink too.
+      start_supervised!(
+        {Warmer, warmup_fun: warmup_fun, base_backoff_ms: 2, max_backoff_ms: 5, max_attempts: 5}
+      )
+
+      wait_until(fn -> Serving.ready?() end)
+    end)
+
+    assert Serving.ready?()
+    # exactly 2: the first (failing) attempt from handle_continue, then the
+    # one scheduled retry that succeeds — proves the retry actually fired
+    # rather than readiness coincidentally already being true.
+    assert Agent.get(counter, & &1) == 2
+  end
+
+  test "max-attempts exhaustion logs an error and stops retrying" do
+    counter = start_supervised!({Agent, fn -> 0 end})
+    warmup_fun = fn -> Agent.get_and_update(counter, &{&1 + 1, &1 + 1}) && :error end
+
+    log =
+      capture_log(fn ->
+        start_supervised!(
+          {Warmer, warmup_fun: warmup_fun, base_backoff_ms: 2, max_backoff_ms: 5, max_attempts: 3}
+        )
+
+        wait_until(fn -> Agent.get(counter, & &1) >= 3 end)
+        # give an (incorrect) further retry a chance to fire, so the exact
+        # count assertion below can actually catch it if backoff didn't stop.
+        Process.sleep(30)
+      end)
+
+    assert Agent.get(counter, & &1) == 3
+    assert log =~ "failed after 3/3 attempts"
+    refute Serving.ready?()
+  end
+
+  # Generic condition poll, mirroring wait_for_new_pid/3 below but for an
+  # arbitrary predicate instead of a specific pid change.
+  defp wait_until(fun, deadline \\ System.monotonic_time(:millisecond) + 2000) do
+    if fun.() do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) > deadline do
+        flunk("timed out waiting for condition")
+      else
+        Process.sleep(5)
+        wait_until(fun, deadline)
+      end
+    end
+  end
+
   # rest_for_one restarts asynchronously relative to this test process, so poll
   # briefly for the new pid instead of asserting immediately after the :DOWN.
   defp wait_for_new_pid(name, old_pid, deadline \\ System.monotonic_time(:millisecond) + 2000)

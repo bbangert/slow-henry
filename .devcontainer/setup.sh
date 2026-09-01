@@ -48,22 +48,58 @@ setup_postgres() {
 setup_postgres
 
 # gitleaks — used by RetrievalNode.Ingest.Scrubber for secret scanning; without
-# it the scrubber degrades to a weaker built-in regex scan.
-if ! command -v gitleaks >/dev/null 2>&1; then
-  GITLEAKS_VER="8.30.1"
+# it the scrubber degrades to a weaker built-in regex scan. Downloaded to a
+# temp dir and verified against the release's published SHA-256 checksums
+# file before extraction, rather than piping the tarball straight into `tar`.
+install_gitleaks() {
+  local ver="8.30.1" arch tarball tmpdir
 
   case "$(uname -m)" in
-    x86_64) GITLEAKS_ARCH="x64" ;;
-    aarch64 | arm64) GITLEAKS_ARCH="arm64" ;;
-    *) GITLEAKS_ARCH="" ;;
+    x86_64) arch="x64" ;;
+    aarch64 | arm64) arch="arm64" ;;
+    *)
+      echo "warning: unsupported architecture $(uname -m) for gitleaks — skipping install; the scrubber degrades to its built-in regex scan" >&2
+      return 0
+      ;;
   esac
 
-  if [ -n "${GITLEAKS_ARCH}" ]; then
-    curl -sL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VER}/gitleaks_${GITLEAKS_VER}_linux_${GITLEAKS_ARCH}.tar.gz" \
-      | sudo tar -xzf - -C /usr/local/bin gitleaks
-  else
-    echo "warning: unsupported architecture $(uname -m) for gitleaks — skipping install; the scrubber degrades to its built-in regex scan" >&2
+  tarball="gitleaks_${ver}_linux_${arch}.tar.gz"
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "${tmpdir}"' RETURN
+
+  # Verified against the release's own published checksums file rather than a
+  # digest hardcoded per arch in this script: one pin (ver, which the
+  # checksums filename is built from) covers every arch this function can
+  # install, instead of a digest to copy in by hand and keep in sync on every
+  # version bump.
+  if ! curl -sL -o "${tmpdir}/${tarball}" \
+      "https://github.com/gitleaks/gitleaks/releases/download/v${ver}/${tarball}"; then
+    echo "error: failed to download gitleaks ${tarball} — skipping install; the scrubber degrades to its built-in regex scan" >&2
+    return 0
   fi
+
+  if ! curl -sL -o "${tmpdir}/checksums.txt" \
+      "https://github.com/gitleaks/gitleaks/releases/download/v${ver}/gitleaks_${ver}_checksums.txt"; then
+    echo "error: failed to download gitleaks checksums file — skipping install; the scrubber degrades to its built-in regex scan" >&2
+    return 0
+  fi
+
+  if ! grep " ${tarball}\$" "${tmpdir}/checksums.txt" > "${tmpdir}/checksums.filtered.txt" ||
+      [ ! -s "${tmpdir}/checksums.filtered.txt" ]; then
+    echo "error: no checksum entry for ${tarball} in the gitleaks release — skipping install; the scrubber degrades to its built-in regex scan" >&2
+    return 0
+  fi
+
+  if ! (cd "${tmpdir}" && sha256sum -c checksums.filtered.txt >/dev/null); then
+    echo "error: gitleaks tarball ${tarball} FAILED checksum verification — refusing to install; the scrubber degrades to its built-in regex scan" >&2
+    return 0
+  fi
+
+  sudo tar -xzf "${tmpdir}/${tarball}" -C /usr/local/bin gitleaks
+}
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  install_gitleaks
 fi
 
 mise install
