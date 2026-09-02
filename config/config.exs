@@ -31,8 +31,9 @@ config :retrieval_node,
 # chunk CPU+NIF (bounded so it doesn't monopolize dirty schedulers); embed=1
 # (single Nx.Serving, must not starve the MCP endpoint); upsert cheap Postgres.
 # Pruner keeps 14d of job history; Lifeline rescues jobs orphaned >20m. The Cron
-# plugin (per-source watermark sync entrypoints) is added with the workers in the
-# next step. Repo pool_size is raised (dev/runtime) to num_queues + sum(limits) + buffer.
+# plugin below drives per-source watermark syncs via SyncScheduler (see its own
+# comment for the fan-out rationale). Repo pool_size is raised (dev/runtime) to
+# num_queues + sum(limits) + buffer.
 config :retrieval_node, Oban,
   repo: RetrievalNode.Repo,
   queues: [sync: 3, chunk: 2, embed: 1, upsert: 5],

@@ -6,12 +6,12 @@ defmodule RetrievalNode.Graph.Extractor do
   tree-sitter impl (an already-parsed AST) and a future LLM impl (raw text)
   can share one seam.
 
-  Output shapes map directly onto the eventual persistence targets
-  (`RetrievalNode.Graph.Entity` / `EntityMention` / `EntityEdge`, Phase 8+):
-  an `entity` becomes a definition-kind `entity_mention` plus its owning
-  `Entity` row; a `reference` becomes a call/import-kind `entity_mention`,
-  and when its `from` is non-nil, a candidate `entity_edge` from the
-  enclosing definition to the referenced name.
+  Output shapes map directly onto what `RetrievalNode.Graph.upsert_from_staged/3`
+  persists (`Entity` / `EntityMention` / `EntityEdge`): an `entity` becomes a
+  definition-kind `entity_mention` plus its owning `Entity` row; a `reference`
+  becomes a call/import-kind `entity_mention`, and when its `from` is
+  non-nil, a candidate `entity_edge` from the enclosing definition to the
+  referenced name.
   """
 
   @typedoc "A definition site: a named function/method/class/module."

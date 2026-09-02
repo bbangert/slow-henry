@@ -6,13 +6,16 @@ defmodule RetrievalNode.Chunking.Grammars do
 
   ## Required set
 
-  `TreeSitterImpl.allowed_languages/0` (the 7 mainstream code languages actually
-  parsed today) plus `"elixir"`, `"heex"`, `"eex"` — prefetched now even though
-  `TreeSitterImpl` doesn't chunk them yet, so the cache is already warm when the
-  planned native-AST Elixir/HEEx/EEx chunking path lands (fast-follow; see
-  `TreeSitterImpl`'s moduledoc). Fetching them early avoids a first-deploy
-  surprise where that follow-up ships and only then discovers the grammars
-  aren't cached in the target environment.
+  `TreeSitterImpl.allowed_languages/0` (the 8 languages actually parsed
+  today — 7 mainstream code languages plus elixir) plus `"heex"`/`"eex"` —
+  prefetched now even though `TreeSitterImpl` doesn't chunk them yet, so the
+  cache is already warm when the planned native-AST HEEx/EEx chunking path
+  lands (fast-follow; see `TreeSitterImpl`'s moduledoc). Fetching them early
+  avoids a first-deploy surprise where that follow-up ships and only then
+  discovers the grammars aren't cached in the target environment.
+  `@extra_languages` below still lists `"elixir"` too — harmless overlap with
+  `allowed_languages/0` that `Enum.uniq/1` in `required/0` dedups away, left
+  alone rather than trimmed for what should stay a doc-only change.
 
   ## NIF boundary
 
@@ -27,8 +30,10 @@ defmodule RetrievalNode.Chunking.Grammars do
 
   require Logger
 
-  # Prefetched ahead of the native-AST Elixir/HEEx/EEx chunking fast-follow —
-  # see the moduledoc.
+  # heex/eex are prefetched ahead of the native-AST chunking fast-follow (see
+  # the moduledoc); elixir is listed here too but is redundant now that
+  # `TreeSitterImpl.allowed_languages/0` already covers it — `Enum.uniq/1` in
+  # `required/0` absorbs the overlap.
   @extra_languages ~w(elixir heex eex)
 
   @doc "Languages that must be present in the local grammar cache."

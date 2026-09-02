@@ -34,8 +34,9 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
 
   # DEPENDENCY: this named Task.Supervisor must be in the supervision tree before
   # any runtime caller invokes chunk/2 — otherwise `async_nolink` raises :noproc
-  # in the caller (which guarded/1 cannot catch, since no task exists yet). Added
-  # to the tree in Phase 8; until then only tests use it (via start_supervised!).
+  # in the caller (which guarded/1 cannot catch, since no task exists yet). Started
+  # unconditionally in `RetrievalNode.Application`; a test that doesn't boot the
+  # full app starts it itself (via `start_supervised!`).
   @supervisor RetrievalNode.ChunkTaskSupervisor
 
   @allowed_languages ~w(python javascript typescript go rust ruby java elixir)

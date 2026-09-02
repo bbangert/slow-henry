@@ -3,19 +3,18 @@ defmodule RetrievalNode.Repo.Migrations.AddIngestGenerationToChunks do
 
   @moduledoc false
 
-  # Monotonic per-file ingest generation, used to make chunk upserts and
-  # per-file reconciliation order-safe. Two versions of one file can be in
-  # flight at once (a retried EmbedBatch, or an hours-deep embed backlog), and
-  # ChunkFiles/EmbedBatch/UpsertChunks are unique only by staging-row ids — so
-  # the OLDER version's terminal job can run last, overwriting newer content
-  # and (since per-file reconciliation landed) deleting the newer version's
-  # chunks. The generation is the raw `pending_chunks` row id of the file
-  # version that produced the chunk (bigserial ⇒ monotonic per database);
-  # UpsertChunks and ChunkFiles' zero-chunk path skip a batch whose generation
-  # is older than the one already persisted for that file identity.
+  # Monotonic per-file ingest generation, copied onto the permanent chunk row
+  # as PROVENANCE ONLY — the generation is the raw `pending_chunks` row id of
+  # the file version that produced the chunk (bigserial ⇒ monotonic per
+  # database). This column is never read back to decide whether to skip a
+  # batch: that order-safety guard is the atomic claim in `file_versions`
+  # (`Ingest.claim_file_version/4`, added by a later migration), a row-locked
+  # compare-and-set that serializes concurrent terminal jobs for the same
+  # file before any chunk is written. This column just carries the winning
+  # claim's generation onto the row for debugging/audit.
   #
   # Nullable: legacy rows predate the column and are treated as generation 0
-  # (any real batch wins over them). Deliberately additive — no backfill.
+  # anywhere it IS read. Deliberately additive — no backfill.
   def change do
     alter table(:chunks) do
       add :ingest_generation, :bigint, null: true

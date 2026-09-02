@@ -3,7 +3,7 @@ defmodule Mix.Tasks.Rn.Seed do
 
   @moduledoc """
   Registers the thin-corpus ingest sources (design-mcp.md Phase 9 Task 1) so the
-  four MCP tools have data to answer over, then enqueues each source's first
+  five MCP tools have data to answer over, then enqueues each source's first
   `*Sync` job the same way `Ingest.Workers.SyncScheduler`'s cron fan-out does.
 
   ## Git (always seedable, zero credentials)
