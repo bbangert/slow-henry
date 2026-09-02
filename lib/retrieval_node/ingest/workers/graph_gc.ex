@@ -8,13 +8,17 @@ defmodule RetrievalNode.Ingest.Workers.GraphGc do
   path itself notices — a deletion event never looks back at the entities it
   just orphaned — so this runs as its own cron job instead.
 
-  Documented gap this does NOT cover: an intra-file edit that only shifts
-  chunk boundaries (no path change) can leave the *old* chunk row orphaned
-  (pre-existing pipeline gap, not fixed here) — that orphaned chunk's own
-  graph rows (its mentions, and any entity that becomes zero-mention as a
-  result) persist right along with it. This worker only reaps entities that
-  are *already* at zero mentions; it has no way to tell a stale chunk from a
-  live one.
+  An intra-file edit that only shifts chunk boundaries (no path change) used
+  to leave the *old* chunk row orphaned forever, with its own graph rows
+  (mentions, and any entity that went zero-mention as a result) persisting
+  right along with it — `UpsertChunks` now reconciles a file's chunk row set
+  on every upsert (deleting rows whose `chunk_key` it no longer produces, see
+  its moduledoc), so that gap is closed at the source and this worker no
+  longer needs to compensate for it. It remains the catch-all for entities
+  that reach zero mentions any other way — this worker only reaps entities
+  that are *already* at zero mentions; it has no way to tell a stale chunk
+  from a live one, which is fine now that stale chunk rows aren't supposed to
+  exist in the first place.
   """
   use Oban.Worker,
     queue: :upsert,
