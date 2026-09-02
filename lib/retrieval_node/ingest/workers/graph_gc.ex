@@ -1,12 +1,16 @@
 defmodule RetrievalNode.Ingest.Workers.GraphGc do
   @moduledoc """
   Periodic sweep for graph rows stranded by the ingest pipeline's file-deletion
-  path: `RepoSync.delete_removed/2` (and the analogous `DriveSync`/`JiraSync`
-  paths) run a path-based `Repo.delete_all` on `chunks`, whose FK cascade kills
-  that file's `entity_mentions` but leaves behind any `entities` (and their
-  `entity_edges`) that now have zero mentions anywhere. Nothing in the ingest
-  path itself notices — a deletion event never looks back at the entities it
-  just orphaned — so this runs as its own cron job instead.
+  paths. Two direct-deletion paths exist today: `RepoSync.delete_removed/2`
+  deletes a removed path's `chunks` by `metadata->>"path"`, and
+  `DriveSync.delete_removed/2` deletes a removed Doc's `chunks` by
+  `metadata->>"doc_id"` (not a filesystem path — Drive files are identified by
+  id). `JiraSync` has no removal path today (see `Ingest.file_identity/2`'s
+  moduledoc comment). Either deletion's `Repo.delete_all` on `chunks` cascades
+  via FK to that file's `entity_mentions`, but leaves behind any `entities`
+  (and their `entity_edges`) that now have zero mentions anywhere. Nothing in
+  the ingest path itself notices — a deletion event never looks back at the
+  entities it just orphaned — so this runs as its own cron job instead.
 
   An intra-file edit that only shifts chunk boundaries (no path change) used
   to leave the *old* chunk row orphaned forever, with its own graph rows

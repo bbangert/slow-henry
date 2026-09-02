@@ -4,11 +4,39 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   current, takes the `diff --raw` (`changed_entries`) between the stored
   `last_sha` and `HEAD`, then for each added/modified file inserts a raw
   `pending_chunks` row and enqueues a `ChunkFiles` job; files the diff marks
-  **deleted** have their permanent `chunks` removed. Deletion is decided by the diff
-  status, not by whether `show` can read the blob, so an unreadable-but-present file
-  is skipped rather than wrongly pruned. The watermark is advanced last (only after
-  enqueues succeed), so a crash re-discovers the same work (the `ChunkFiles`/
+  **deleted** are handled as a tombstone claim, not a guard-row delete — see
+  `delete_removed/2`. Deletion is decided by the diff status, not by whether
+  `show` can read the blob, so an unreadable-but-present file is skipped rather
+  than wrongly pruned. The watermark is advanced last (only after enqueues
+  succeed), so a crash re-discovers the same work (the `ChunkFiles`/
   `UpsertChunks` idempotency makes re-processing harmless).
+
+  ## Deletion is a tombstone claim, not a row delete
+
+  `delete_removed/2` never deletes a `file_versions` row — it claims a fresh
+  generation for the deleted path through the exact same `Ingest.claim_file_version/4`
+  compare-and-set `Ingest.Workers.UpsertChunks` claims through, then deletes the
+  path's `chunks` only if that claim wins (`:claimed`). Deleting the guard row
+  instead (the previous design) left a hole: this job advances its watermark
+  after enqueueing `ChunkFiles` jobs, not after their downstream `UpsertChunks`
+  jobs commit, so a pre-deletion edit's `UpsertChunks` job can still be in
+  flight when the deletion runs. If the guard row were simply gone, that
+  delayed job would see no `file_versions` row for the path, treat its own
+  (now-stale) generation as a fresh first claim, and resurrect the deleted
+  file's chunks right after this job removed them.
+
+  Claiming instead of deleting closes that hole: the generation drawn for a
+  deletion (`Ingest.next_ingest_generation/1`, from the same `pending_chunks.id`
+  sequence raw rows draw their generation from) is guaranteed greater than any
+  raw row staged before the deletion ran, so a delayed pre-deletion job's claim
+  always loses (`:stale`) instead of resurrecting anything. A file re-added
+  after a deletion is unaffected — it simply claims a still-higher generation
+  (its own later raw row id) the normal way and persists normally. And a
+  deletion that runs after a newer version already committed a higher
+  generation loses too (`:stale`), so it can never delete that newer version's
+  chunks out from under it. `file_versions` rows are therefore never deleted
+  for a source's whole lifetime — a deleted path's row simply stays as a
+  tombstone recording the highest generation ever claimed for it.
 
   Two edge cases short-circuit before any staging happens:
 
@@ -46,10 +74,11 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   import Ecto.Query
   require Logger
 
+  alias RetrievalNode.Ingest
   alias RetrievalNode.Ingest.{GitMirror, PendingChunks}
   alias RetrievalNode.Ingest.Workers.ChunkFiles
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.{Chunk, FileVersion, Source, SyncState}
+  alias RetrievalNode.Retrieval.{Chunk, Source, SyncState}
 
   @lang_by_ext %{
     "py" => "python",
@@ -108,19 +137,34 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   defp delete_removed(_source, []), do: :ok
 
   defp delete_removed(source, paths) do
-    # One DELETE with an IN over the extracted JSONB path — not one query per path.
-    from(c in Chunk,
-      where: c.source_id == ^source.id and fragment("?->>'path'", c.metadata) in ^paths
-    )
-    |> Repo.delete_all()
+    Enum.each(paths, &delete_one_path(source, &1))
+    :ok
+  end
 
-    # Tidiness, not correctness: a stale `file_versions` row left behind for a
-    # deleted path is harmless — a re-added file with the same path claims a
-    # higher generation regardless (see `Ingest.claim_file_version/4`) — but
-    # there's no reason to let the table grow unbounded with rows for files
-    # that no longer exist.
-    from(fv in FileVersion, where: fv.source_id == ^source.id and fv.identity in ^paths)
-    |> Repo.delete_all()
+  # Each deleted path claims its own fresh generation through the same
+  # compare-and-set `Ingest.Workers.UpsertChunks` claims through — see the
+  # moduledoc's "Deletion is a tombstone claim" section for why a guard-row
+  # delete is unsafe here. The generation draw and the claim run in one
+  # transaction: `claim_file_version/4` must be called inside the caller's own
+  # transaction (its own @doc), and the draw only needs to happen-before the
+  # claim, not be transactional itself (`next_ingest_generation/1`'s @doc).
+  defp delete_one_path(source, path) do
+    Repo.transaction(fn ->
+      generation = Ingest.next_ingest_generation(Repo)
+
+      case Ingest.claim_file_version(Repo, source.id, path, generation) do
+        :claimed ->
+          from(c in Chunk,
+            where: c.source_id == ^source.id and fragment("?->>'path'", c.metadata) == ^path
+          )
+          |> Repo.delete_all()
+
+        :stale ->
+          # A newer version's terminal job already claimed a higher generation
+          # for this path — its chunks must stay untouched.
+          :ok
+      end
+    end)
 
     :ok
   end

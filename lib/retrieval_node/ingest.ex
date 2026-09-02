@@ -340,6 +340,33 @@ defmodule RetrievalNode.Ingest do
     if count > 0, do: :claimed, else: :stale
   end
 
+  @doc """
+  Draws a fresh generation number from the SAME sequence `pending_chunks.id`
+  (a bigserial) is drawn from, rather than minting an independent counter.
+  Sharing that domain is what makes the draw safely usable as an ingest
+  generation for `claim_file_version/4`: every raw staging row already in
+  existence at the moment of this call has a strictly smaller id, so a
+  generation drawn here outranks any pipeline job staged before this moment —
+  including one whose `UpsertChunks` claim hasn't landed yet — while still
+  losing to a genuinely later ingest generation (a file re-added after this
+  draw stages its own, even later, raw row id and claims with that instead).
+  See `Ingest.Workers.RepoSync.delete_removed/2`, today's only caller, for how
+  a file deletion uses this to claim a tombstone generation through
+  `claim_file_version/4` rather than deleting the `file_versions` row
+  outright.
+
+  `nextval` is not transactional — a rolled-back call does not return its
+  value to the sequence — which is fine here: the only property this needs
+  is monotonicity, not gap-free numbering.
+  """
+  @spec next_ingest_generation(Ecto.Repo.t()) :: integer()
+  def next_ingest_generation(repo) do
+    %Postgrex.Result{rows: [[value]]} =
+      repo.query!("SELECT nextval(pg_get_serial_sequence('pending_chunks', 'id'))")
+
+    value
+  end
+
   # `metadata->>?` binds the jsonb key as an ordinary text parameter — unlike
   # a column/table name, `->>`'s right-hand side isn't a SQL identifier, so
   # one query shape covers all three known identity fields instead of one

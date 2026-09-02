@@ -1,9 +1,13 @@
 defmodule RetrievalNode.Graph.EntityEdge do
   @moduledoc """
   A definition-site -> call-site relationship between two entities,
-  contributed by one chunk. `weight` is the mention count backing this
-  chunk's contribution to the edge (how many `entity_mentions` rows on
-  `chunk_id` collapsed into it).
+  contributed by one chunk. `weight` is the count of extracted reference
+  OCCURRENCES this chunk contributed to the edge (see `Graph.accumulate_edge/4`
+  — one increment per raw reference in the chunk's staged `references`, not
+  deduped). This is distinct from `entity_mentions`, which dedups to one row
+  per `(entity, chunk, kind)` — a chunk that calls the same target twice can
+  contribute `weight: 2` to an edge while still producing only one `:call`
+  mention.
 
   `chunk_id` is the chunk-level provenance for this row — entities merge one
   `qualified_name` across every file of a source, so two files defining the

@@ -6,7 +6,8 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
 
   import ExUnit.CaptureLog
 
-  alias RetrievalNode.Ingest.Workers.{ChunkFiles, RepoSync}
+  alias RetrievalNode.Ingest
+  alias RetrievalNode.Ingest.Workers.{ChunkFiles, EmbedBatch, RepoSync, UpsertChunks}
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.{Chunk, FileVersion, PendingChunk, Source, SyncState}
 
@@ -92,7 +93,8 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     assert Repo.aggregate(PendingChunk, :count, :id) == 0
   end
 
-  test "a deleted file removes its permanent chunks on the next sync", ctx do
+  test "a deleted file removes its permanent chunks and leaves file_versions as a tombstone with a higher generation",
+       ctx do
     commit(ctx.src, [{"gone.py", "def g(): pass\n"}])
     perform_job(RepoSync, %{"source_id" => ctx.source.id})
 
@@ -118,7 +120,133 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
     assert Repo.aggregate(from(c in Chunk, where: c.chunk_key == "k1"), :count, :id) == 0
 
-    refute Repo.get_by(FileVersion, source_id: ctx.source.id, identity: "gone.py")
+    # The file_versions row is NEVER deleted — deletion is a tombstone claim,
+    # not a guard-row delete (see the moduledoc). The claimed generation is
+    # strictly greater than the prior one.
+    tombstone = Repo.get_by!(FileVersion, source_id: ctx.source.id, identity: "gone.py")
+    assert tombstone.generation > 1
+  end
+
+  describe "delete_removed/2 tombstone claim (Fix 1)" do
+    test "THE HOLE: a delayed pre-deletion UpsertChunks job is stale, not a resurrection", ctx do
+      commit(ctx.src, [{"hole.py", "def h(): pass\n"}])
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+      # v1's raw row is staged and ChunkFiles enqueued, but NOT yet run — an
+      # hours-deep backlog stalls it right here.
+      raw1 = Repo.one!(from p in PendingChunk, where: p.status == "raw")
+
+      # The path is deleted and re-synced BEFORE v1's pipeline ever runs.
+      File.rm!(Path.join(ctx.src, "hole.py"))
+      git!(ctx.src, ["add", "-A"])
+      git!(ctx.src, ["commit", "-qm", "rm"])
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+      # The tombstone claim landed for hole.py, at a generation greater than
+      # raw1's id (same pending_chunks id sequence the deletion drew from).
+      tombstone = Repo.get_by!(FileVersion, source_id: ctx.source.id, identity: "hole.py")
+      assert tombstone.generation > raw1.id
+
+      # v1's stalled pipeline finally runs to completion.
+      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw1.id})
+      ids = Repo.all(from p in PendingChunk, select: p.id)
+      assert :ok = perform_job(EmbedBatch, %{"pending_chunk_ids" => ids})
+      ids = Repo.all(from p in PendingChunk, where: p.id in ^ids, select: p.id)
+      assert :ok = perform_job(UpsertChunks, %{"pending_chunk_ids" => ids})
+
+      # No chunk was resurrected for hole.py, and staging is fully drained —
+      # the stale claim still cleans up its own staging rows.
+      assert Repo.aggregate(from(c in Chunk, where: c.source_id == ^ctx.source.id), :count, :id) ==
+               0
+
+      assert Repo.aggregate(PendingChunk, :count, :id) == 0
+
+      # The tombstone's generation is untouched by the stale claim.
+      assert Repo.get_by!(FileVersion, source_id: ctx.source.id, identity: "hole.py").generation ==
+               tombstone.generation
+    end
+
+    test "a re-added file after a deletion claims a higher generation and persists normally",
+         ctx do
+      commit(ctx.src, [{"back.py", "def b(): return 1\n"}])
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+      raw1 = Repo.one!(from p in PendingChunk, where: p.status == "raw")
+      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw1.id})
+      ids = Repo.all(from p in PendingChunk, select: p.id)
+      assert :ok = perform_job(EmbedBatch, %{"pending_chunk_ids" => ids})
+      ids = Repo.all(from p in PendingChunk, where: p.id in ^ids, select: p.id)
+      assert :ok = perform_job(UpsertChunks, %{"pending_chunk_ids" => ids})
+      assert [_] = Repo.all(from c in Chunk, where: c.source_id == ^ctx.source.id)
+
+      # Delete it — tombstone claim removes the chunk.
+      File.rm!(Path.join(ctx.src, "back.py"))
+      git!(ctx.src, ["add", "-A"])
+      git!(ctx.src, ["commit", "-qm", "rm"])
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+      assert Repo.all(from c in Chunk, where: c.source_id == ^ctx.source.id) == []
+
+      tombstone = Repo.get_by!(FileVersion, source_id: ctx.source.id, identity: "back.py")
+
+      # Re-add the file with new content — a fresh raw row, at a higher id
+      # than the tombstone's claimed generation.
+      commit(ctx.src, [{"back.py", "def b(): return 2\n"}])
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+      raw2 = Repo.one!(from p in PendingChunk, where: p.status == "raw")
+      assert raw2.id > tombstone.generation
+
+      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw2.id})
+      ids2 = Repo.all(from p in PendingChunk, select: p.id)
+      assert :ok = perform_job(EmbedBatch, %{"pending_chunk_ids" => ids2})
+      ids2 = Repo.all(from p in PendingChunk, where: p.id in ^ids2, select: p.id)
+      assert :ok = perform_job(UpsertChunks, %{"pending_chunk_ids" => ids2})
+
+      assert [chunk] = Repo.all(from c in Chunk, where: c.source_id == ^ctx.source.id)
+      assert chunk.content =~ "return 2"
+
+      assert Repo.get_by!(FileVersion, source_id: ctx.source.id, identity: "back.py").generation ==
+               raw2.id
+    end
+
+    test "a deletion that loses to an already-higher committed generation leaves that version's chunks untouched",
+         ctx do
+      commit(ctx.src, [{"newer.py", "def n(): pass\n"}])
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+      # Simulate a newer version of newer.py that already committed at a
+      # generation higher than anything this deletion's tombstone draw could
+      # produce (the sequence's current value is nowhere near this).
+      future_generation = Ingest.next_ingest_generation(Repo) + 1_000_000
+
+      Repo.insert!(%Chunk{
+        source_id: ctx.source.id,
+        source_type: :git_repo,
+        chunk_key: "future-k1",
+        content_hash: "h",
+        content: "def n(): pass  # newer",
+        context_breadcrumb: "newer.py",
+        metadata: %{"path" => "newer.py"},
+        ingest_generation: future_generation
+      })
+
+      Repo.insert!(%FileVersion{
+        source_id: ctx.source.id,
+        identity: "newer.py",
+        generation: future_generation
+      })
+
+      File.rm!(Path.join(ctx.src, "newer.py"))
+      git!(ctx.src, ["add", "-A"])
+      git!(ctx.src, ["commit", "-qm", "rm"])
+
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+      # The deletion's claim lost (:stale) — the newer chunk is untouched and
+      # the tombstone's generation is unchanged.
+      assert Repo.aggregate(from(c in Chunk, where: c.chunk_key == "future-k1"), :count, :id) == 1
+
+      assert Repo.get_by!(FileVersion, source_id: ctx.source.id, identity: "newer.py").generation ==
+               future_generation
+    end
   end
 
   test "a modified file is re-enqueued, NOT treated as a deletion", ctx do

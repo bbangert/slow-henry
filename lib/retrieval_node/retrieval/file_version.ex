@@ -5,6 +5,15 @@ defmodule RetrievalNode.Retrieval.FileVersion do
   `Ingest.claim_file_version/4` claims against with a row-locked
   compare-and-set. See that function and the `file_versions` migration for
   the concurrency story this table exists to solve.
+
+  Rows are never deleted for a deleted file. `Ingest.Workers.RepoSync.delete_removed/2`
+  handles a file removal as a tombstone claim — drawing a fresh generation via
+  `Ingest.next_ingest_generation/1` and claiming it through the same
+  compare-and-set — rather than deleting the guard row outright, so a
+  still-in-flight pre-deletion job can never mistake the absence of a row for
+  "no version has ever claimed this identity" and resurrect deleted chunks. A
+  file later re-added at the same identity simply claims a higher generation,
+  the same way any edit does.
   """
   use Ecto.Schema
   import Ecto.Changeset

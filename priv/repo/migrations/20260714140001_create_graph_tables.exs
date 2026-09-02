@@ -39,10 +39,13 @@ defmodule RetrievalNode.Repo.Migrations.CreateGraphTables do
     create unique_index(:entity_mentions, [:entity_id, :chunk_id, :kind])
     create index(:entity_mentions, [:chunk_id])
 
-    # entity_edges aggregates def-site -> call-site relationships across mentions
-    # (weight = mention count), so graph traversal doesn't need to scan
-    # entity_mentions directly. target_entity_id is indexed separately from the
-    # cascade FK to support reverse traversal ("who calls X").
+    # entity_edges aggregates def-site -> call-site relationships across
+    # references (weight = count of extracted reference occurrences, not a
+    # mention count — entity_mentions dedups to one row per entity/chunk/kind,
+    # so a chunk calling the same target twice contributes weight 2 from one
+    # mention), so graph traversal doesn't need to scan entity_mentions
+    # directly. target_entity_id is indexed separately from the cascade FK to
+    # support reverse traversal ("who calls X").
     create table(:entity_edges, primary_key: false) do
       add :id, :binary_id, primary_key: true
 
