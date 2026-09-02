@@ -26,6 +26,20 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
   jsonb column (`RetrievalNode.Graph.upsert_from_staged/3`), inside the same
   transaction — the chunk insert's `returning: [:id, :chunk_key]` gives Graph
   the (possibly ON CONFLICT-preserved) chunk ids it needs to link mentions.
+
+  Order-safety: two versions of one file can be in flight at once (a retried
+  job, an hours-deep `:embed` backlog), and this worker is unique only by
+  `pending_chunk_ids` — not by file — so the OLDER version's job can run
+  LAST. Each staged row carries `ingest_generation` (the raw row's own,
+  monotonic id — see `Ingest.Workers.ChunkFiles`); before touching anything,
+  `perform/1` groups the batch by file identity (`Ingest.file_identity/2`)
+  and compares each group's generation against `Ingest.max_ingest_generation/4`
+  for that file. A group whose generation is older than what's already
+  persisted is stale: it's excluded from the insert/reconcile/graph steps
+  entirely (so it can neither overwrite newer content nor delete the newer
+  chunks via reconciliation) but its staging rows are still cleaned up like
+  the rest of the batch. Legacy chunk rows (predating this column) read as
+  generation 0, so any real batch always wins over them.
   """
   use Oban.Worker,
     queue: :upsert,
@@ -57,6 +71,7 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
     :metadata,
     :parse_status,
     :secrets_status,
+    :ingest_generation,
     :updated_at
   ]
 
@@ -71,16 +86,20 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"pending_chunk_ids" => ids}}) do
     staged_rows = PendingChunks.fetch_many!(ids)
-    entries = Enum.map(staged_rows, &to_chunk_entry/1)
     now = DateTime.utc_now()
 
     Ecto.Multi.new()
-    |> Ecto.Multi.run(:chunks, fn repo, _ -> {:ok, insert_batches(repo, entries, now)} end)
-    |> Ecto.Multi.run(:reconcile, fn repo, _ ->
-      {:ok, reconcile_stale_chunks(repo, staged_rows)}
+    |> Ecto.Multi.run(:partition, fn repo, _ ->
+      {:ok, partition_by_generation(repo, staged_rows)}
     end)
-    |> Ecto.Multi.run(:graph, fn repo, %{chunks: chunk_ids_by_key} ->
-      Graph.upsert_from_staged(repo, staged_rows, chunk_ids_by_key)
+    |> Ecto.Multi.run(:chunks, fn repo, %{partition: %{fresh: fresh}} ->
+      {:ok, insert_batches(repo, Enum.map(fresh, &to_chunk_entry/1), now)}
+    end)
+    |> Ecto.Multi.run(:reconcile, fn repo, %{partition: %{fresh: fresh}} ->
+      {:ok, reconcile_stale_chunks(repo, fresh)}
+    end)
+    |> Ecto.Multi.run(:graph, fn repo, %{chunks: chunk_ids_by_key, partition: %{fresh: fresh}} ->
+      Graph.upsert_from_staged(repo, fresh, chunk_ids_by_key)
     end)
     |> Ecto.Multi.run(:cleanup, fn repo, _ ->
       {:ok, repo.delete_all(PendingChunks.by_ids(ids))}
@@ -96,6 +115,44 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
 
       {:error, _step, reason, _changes} ->
         {:error, reason}
+    end
+  end
+
+  # Splits the batch into `:fresh` rows (safe to upsert/reconcile/graph) and
+  # `:stale` rows (a file identity whose persisted generation already beats
+  # this batch's — see the moduledoc's order-safety note). A row whose
+  # identity can't be resolved always counts as fresh: the guard needs an
+  # identity to compare against, and reconciliation already no-ops for it
+  # (see `Ingest.reconcile_file_chunks/5`). Grouped by identity (not treated
+  # as one batch) because a batch can defensively span more than one file —
+  # see `reconcile_stale_chunks/2`'s own moduledoc reference.
+  defp partition_by_generation(repo, staged_rows) do
+    staged_rows
+    |> Enum.group_by(&batch_identity/1)
+    |> Enum.reduce(%{fresh: [], stale: []}, &sort_group(repo, &1, &2))
+  end
+
+  defp sort_group(_repo, {nil, rows}, acc), do: update_in(acc.fresh, &(rows ++ &1))
+
+  defp sort_group(repo, {{source_id, source_type, field, value}, rows}, acc) do
+    batch_generation = rows |> Enum.map(&(&1.ingest_generation || 0)) |> Enum.max()
+    persisted = Ingest.max_ingest_generation(repo, source_id, source_type, %{field => value})
+
+    if persisted > batch_generation do
+      Logger.info(
+        "skipping stale ingest generation #{batch_generation} < #{persisted} for #{field}=#{value}"
+      )
+
+      update_in(acc.stale, &(rows ++ &1))
+    else
+      update_in(acc.fresh, &(rows ++ &1))
+    end
+  end
+
+  defp batch_identity(row) do
+    case Ingest.file_identity(row.source_type, row.metadata) do
+      {field, value} -> {row.source_id, row.source_type, field, value}
+      nil -> nil
     end
   end
 
@@ -168,6 +225,9 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
       embedding: row.embedding,
       parse_status: to_enum(:parse_status, row.parse_status),
       secrets_status: to_enum(:secrets_status, row.secrets_status),
+      # NULL for legacy pre-column rows (never produced by the current
+      # pipeline) — treated as generation 0 by the order-safety guard.
+      ingest_generation: row.ingest_generation,
       inserted_at: {:placeholder, :now},
       updated_at: {:placeholder, :now}
     }

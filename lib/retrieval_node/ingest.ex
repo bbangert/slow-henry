@@ -269,6 +269,43 @@ defmodule RetrievalNode.Ingest do
     end
   end
 
+  @doc """
+  The highest `ingest_generation` already persisted among a file's existing
+  `chunks` rows (identity resolved the same way as `reconcile_file_chunks/5`).
+  NULL generations (rows written before the column existed) and "no chunks
+  yet for this identity" both read as `0` — a real batch (generation >= 1,
+  `pending_chunks` is `bigserial`) always beats either.
+
+  `source_type`/`metadata` resolving no identity also reads as `0` — the
+  order-safety guard has nothing to compare against, so it never blocks a
+  batch it can't place.
+
+  Shared by `Ingest.Workers.UpsertChunks`' stale-batch guard and
+  `Ingest.Workers.ChunkFiles`' zero-chunk reconciliation guard: both must
+  check this BEFORE deleting/overwriting anything for the file, so an
+  in-flight OLDER version's terminal job can't clobber a newer one that
+  already landed (see both workers' moduledocs).
+  """
+  @spec max_ingest_generation(Ecto.Repo.t(), binary(), String.t(), map() | nil) ::
+          non_neg_integer()
+  def max_ingest_generation(repo, source_id, source_type, metadata) do
+    case file_identity(source_type, metadata) do
+      nil -> 0
+      {field, value} -> persisted_max_generation(repo, source_id, field, value)
+    end
+  end
+
+  defp persisted_max_generation(repo, source_id, field, value) do
+    repo.one(
+      from(c in Chunk,
+        where:
+          c.source_id == ^source_id and
+            fragment("?->>?", c.metadata, ^field) == ^value,
+        select: coalesce(max(c.ingest_generation), 0)
+      )
+    )
+  end
+
   # `metadata->>?` binds the jsonb key as an ordinary text parameter — unlike
   # a column/table name, `->>`'s right-hand side isn't a SQL identifier, so
   # one query shape covers all three known identity fields instead of one

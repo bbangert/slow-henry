@@ -29,6 +29,12 @@ defmodule RetrievalNode.Retrieval.Chunk do
 
     field :secrets_status, Ecto.Enum, values: [:clean, :redacted], default: :clean
 
+    # Monotonic per-file version marker (the raw `pending_chunks` row id that
+    # produced this chunk) — lets UpsertChunks/ChunkFiles detect and skip a
+    # batch older than what's already persisted for the file. NULL (legacy
+    # rows predating this column) counts as generation 0.
+    field :ingest_generation, :integer
+
     # tsv is DB-generated (GENERATED ALWAYS ... STORED). `writable: :never` keeps
     # the pipeline from ever trying to insert/update it; `load_in_query: false`
     # keeps it off the default select (hot search path stays lean) while still

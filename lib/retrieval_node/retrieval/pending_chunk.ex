@@ -46,6 +46,10 @@ defmodule RetrievalNode.Retrieval.PendingChunk do
     # Staging-only carrier for per-chunk graph entities/references (see the
     # migration that added this column) — never copied into permanent chunks.
     field :graph, :map, default: %{}
+    # The raw row's own id (bigserial ⇒ monotonic), threaded through from
+    # ChunkFiles onto every chunk row it splits out — see the migration that
+    # added this column. UpsertChunks copies it onto the permanent `Chunk` row.
+    field :ingest_generation, :integer
 
     timestamps(type: :utc_datetime_usec)
   end
@@ -70,7 +74,8 @@ defmodule RetrievalNode.Retrieval.PendingChunk do
     :scrub_mode,
     :chunk_quality,
     :embedding,
-    :graph
+    :graph,
+    :ingest_generation
   ]
 
   @doc "Changeset for a freshly-discovered raw row (`*Sync` workers)."

@@ -12,6 +12,14 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
   raw row is deleted once its chunk rows are written. Idempotent: a retry after the
   raw row is gone is a no-op. `finalize/6` runs write-chunks → enqueue → reap in one
   transaction, so a crash never redoes that work under a fresh id set.
+
+  Every chunk row this worker writes is stamped with `ingest_generation: row.id` —
+  the raw row's own (monotonic) id. The zero-chunk (whitespace-only) reconciliation
+  path below reads that same id back as ITS generation and skips deleting a file's
+  persisted chunks when a newer version's generation already beat it there — see
+  `Ingest.max_ingest_generation/4` and `Ingest.Workers.UpsertChunks`' moduledoc for
+  why (two versions of one file can be in flight; this worker is unique only by
+  `pending_chunk_id`, not by file, so the older version's job can run last).
   """
   use Oban.Worker,
     queue: :chunk,
@@ -105,9 +113,7 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
   # ingest) or no resolvable identity (see `Ingest.file_identity/2`).
   defp finalize(row, [], _parse_status, _opts, _entities, _references) do
     Ecto.Multi.new()
-    |> Ecto.Multi.run(:reconcile, fn repo, _ ->
-      {:ok, Ingest.reconcile_file_chunks(repo, row.source_id, row.source_type, row.metadata, [])}
-    end)
+    |> Ecto.Multi.run(:reconcile, fn repo, _ -> {:ok, reconcile_or_skip_stale(repo, row)} end)
     |> Ecto.Multi.run(:reap, fn repo, _ ->
       {:ok, repo.delete_all(PendingChunks.by_ids([row.id]))}
     end)
@@ -163,6 +169,35 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
     end
   end
 
+  # Generation guard for the zero-chunk (whitespace-only) reconciliation path:
+  # this raw row's generation is its own `id` (bigserial ⇒ monotonic — see the
+  # `chunks.ingest_generation` migration). If a NEWER version of this file
+  # already has chunks persisted, this (older, delayed) whitespace-only run
+  # must NOT delete them — a stale ChunkFiles retry/backlog job racing behind
+  # the newer version's UpsertChunks would otherwise wipe out real content.
+  # Skip the delete but still let the raw row get reaped (the `:reap` step
+  # runs regardless).
+  defp reconcile_or_skip_stale(repo, row) do
+    persisted = Ingest.max_ingest_generation(repo, row.source_id, row.source_type, row.metadata)
+
+    if persisted > row.id do
+      Logger.info(
+        "skipping stale ingest generation #{row.id} < #{persisted} for #{identity_label(row)}"
+      )
+
+      0
+    else
+      Ingest.reconcile_file_chunks(repo, row.source_id, row.source_type, row.metadata, [])
+    end
+  end
+
+  defp identity_label(row) do
+    case Ingest.file_identity(row.source_type, row.metadata) do
+      {field, value} -> "#{field}=#{value}"
+      nil -> "unknown"
+    end
+  end
+
   defp chunk_attrs(row, chunk, index, parse_status, graph) do
     %{
       chunk_index: index,
@@ -170,7 +205,9 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
       chunk_key: chunk_key(row, chunk, index),
       context_breadcrumb: Breadcrumb.build(file_prefix(row), chunk.breadcrumb),
       parse_status: parse_status,
-      graph: graph
+      graph: graph,
+      # This raw row's own id — see the `chunks.ingest_generation` migration.
+      ingest_generation: row.id
     }
   end
 
