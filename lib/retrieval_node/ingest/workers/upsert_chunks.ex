@@ -1,52 +1,77 @@
 defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
   @moduledoc """
-  Terminal ingest stage: idempotently upsert the embedded staging rows into the
-  permanent `Retrieval.Chunk` table, then delete the consumed `pending_chunks`.
+  The ingest pipeline's ONE terminal stage: idempotently upsert the embedded
+  staging rows into the permanent `Retrieval.Chunk` table, then delete the
+  consumed `pending_chunks` rows. Every raw row `Ingest.Workers.ChunkFiles` reads
+  ends up here — the normal (non-empty) path via `EmbedBatch`, and the zero-chunk
+  (e.g. whitespace-only) path directly, with an empty `pending_chunk_ids` and a
+  `raw_pending_chunk_id` pointing at the still-present raw row (status
+  `"chunked_empty"`). There used to be a second terminal path — `ChunkFiles`
+  reconciled a zero-chunk file's stale chunks locally — and every one of that
+  design's races got fixed by yet another guard bolted onto one side or the
+  other. One path removes the seam those guards were patching over.
 
   Idempotent via `ON CONFLICT (source_id, chunk_key)` — re-running (a retry, a
   webhook/cron overlap, a re-sync) replaces the row rather than duplicating it.
   The insert + staging cleanup run in one transaction so a crash never leaves the
   chunk written but the staging row lingering (or vice-versa).
 
-  Also reconciles each file's chunk row set. `chunk_key` embeds the chunk's
-  INDEX (see `ChunkFiles.chunk_key/3`), so a boundary shift earlier in a file
-  (a def added/removed) re-keys every chunk after it — the old rows under the
-  stale keys would otherwise linger forever (nothing else in the pipeline
+  ## The claim: one atomic serialization point per file
+
+  Two versions of one file can be in flight at once — a retried job, an
+  hours-deep `:embed` backlog racing a same-file edit that lands later but gets
+  processed first — and this worker is unique only by `pending_chunk_ids` (or,
+  for the empty case, `raw_pending_chunk_id`), never by file. A per-file
+  invariant like "the persisted chunk set is the latest version's set" needs a
+  serialization point the pipeline never had; a `max(ingest_generation)` scan
+  followed by an upsert is a non-atomic compare-and-set with a window another
+  job's terminal stage can land in between the two halves.
+
+  `perform/1` opens its transaction by resolving this batch's file identity and
+  generation (from the staged rows themselves, or — for the empty case — from
+  the raw row `raw_pending_chunk_id` still points at) and calling
+  `Ingest.claim_file_version/4`, an atomic `INSERT ... ON CONFLICT DO UPDATE ...
+  WHERE generation < EXCLUDED.generation RETURNING id`. The row lock Postgres
+  takes to evaluate that conflict serializes concurrent terminal jobs for the
+  same file — the loser blocks on the INSERT until the winner commits, then
+  evaluates the WHERE against what the winner just persisted. `:claimed` means
+  this batch is now the file's current version — safe to upsert, reconcile, and
+  extract graph rows from; `:stale` means a same-or-newer generation already
+  landed (including a same-version retry after commit, which correctly no-ops)
+  — everything is skipped except staging cleanup. A batch with no resolvable
+  identity (an unrecognized `source_type` — see `Ingest.file_identity/2`) skips
+  the claim entirely and always proceeds: reconciliation already no-ops without
+  an identity to delete against, so there's nothing to serialize, and the
+  never-delete-on-a-guess rule holds regardless.
+
+  Also reconciles each file's chunk row set once claimed. `chunk_key` embeds the
+  chunk's INDEX (see `ChunkFiles.chunk_key/3`), so a boundary shift earlier in a
+  file (a def added/removed) re-keys every chunk after it — the old rows under
+  the stale keys would otherwise linger forever (nothing else in the pipeline
   ever revisits a key it stops producing). A file's complete new chunk set
-  always arrives in exactly ONE `UpsertChunks` job: `ChunkFiles` reads one
-  raw row and enqueues exactly one `EmbedBatch` for the chunk ids it just
-  wrote, and `EmbedBatch` enqueues exactly one `UpsertChunks` for that same
-  id set (see both workers' `perform/1`). So right after this job's own
-  upsert, it's safe to delete any existing row for that file whose
-  `chunk_key` this batch did NOT reproduce — see `reconcile_stale_chunks/2`.
-  FK cascades take care of the orphan's `entity_mentions`/`entity_edges` for
-  free once its `chunks` row is gone.
+  always arrives in exactly ONE `UpsertChunks` job — `ChunkFiles` reads one raw
+  row and produces exactly one downstream batch for it (via `EmbedBatch`, or
+  directly for the empty case) — so every staged row in a non-empty batch is
+  required to share one file identity; a batch spanning more than one is a bug
+  and raises `ArgumentError` (mirroring `Graph.upsert_from_staged/3`'s own
+  one-source-per-batch guard) rather than silently partitioning it. Right after
+  the upsert, it's safe to delete any existing row for that file whose
+  `chunk_key` this batch did NOT reproduce (empty for the zero-chunk case, which
+  deletes every existing row) — see `reconcile_file_chunks/5`. FK cascades take
+  care of the orphan's `entity_mentions`/`entity_edges` for free once its
+  `chunks` row is gone.
 
   Also persists the code-knowledge-graph rows staged on each row's `graph`
   jsonb column (`RetrievalNode.Graph.upsert_from_staged/3`), inside the same
   transaction — the chunk insert's `returning: [:id, :chunk_key]` gives Graph
   the (possibly ON CONFLICT-preserved) chunk ids it needs to link mentions.
-
-  Order-safety: two versions of one file can be in flight at once (a retried
-  job, an hours-deep `:embed` backlog), and this worker is unique only by
-  `pending_chunk_ids` — not by file — so the OLDER version's job can run
-  LAST. Each staged row carries `ingest_generation` (the raw row's own,
-  monotonic id — see `Ingest.Workers.ChunkFiles`); before touching anything,
-  `perform/1` groups the batch by file identity (`Ingest.file_identity/2`)
-  and compares each group's generation against `Ingest.max_ingest_generation/4`
-  for that file. A group whose generation is older than what's already
-  persisted is stale: it's excluded from the insert/reconcile/graph steps
-  entirely (so it can neither overwrite newer content nor delete the newer
-  chunks via reconciliation) but its staging rows are still cleaned up like
-  the rest of the batch. Legacy chunk rows (predating this column) read as
-  generation 0, so any real batch always wins over them.
   """
   use Oban.Worker,
     queue: :upsert,
     max_attempts: 5,
     unique: [
       period: {30, :minutes},
-      keys: [:pending_chunk_ids],
+      keys: [:pending_chunk_ids, :raw_pending_chunk_id],
       states: [:available, :scheduled, :executing, :retryable, :suspended]
     ]
 
@@ -56,7 +81,7 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
   alias RetrievalNode.Ingest
   alias RetrievalNode.Ingest.PendingChunks
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.Chunk
+  alias RetrievalNode.Retrieval.{Chunk, PendingChunk}
 
   # The staged `embedding` is a %Pgvector{} (opaque) that we pass straight into
   # insert_all — correct at runtime (the vector type's dump is a passthrough), but
@@ -84,25 +109,17 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
   @insert_batch_size 2_000
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"pending_chunk_ids" => ids}}) do
+  def perform(%Oban.Job{args: %{"pending_chunk_ids" => ids} = args}) do
     staged_rows = PendingChunks.fetch_many!(ids)
+    raw_pending_chunk_id = Map.get(args, "raw_pending_chunk_id")
     now = DateTime.utc_now()
 
     Ecto.Multi.new()
-    |> Ecto.Multi.run(:partition, fn repo, _ ->
-      {:ok, partition_by_generation(repo, staged_rows)}
+    |> Ecto.Multi.run(:context, fn repo, _ ->
+      {:ok, resolve_context(repo, staged_rows, raw_pending_chunk_id)}
     end)
-    |> Ecto.Multi.run(:chunks, fn repo, %{partition: %{fresh: fresh}} ->
-      {:ok, insert_batches(repo, Enum.map(fresh, &to_chunk_entry/1), now)}
-    end)
-    |> Ecto.Multi.run(:reconcile, fn repo, %{partition: %{fresh: fresh}} ->
-      {:ok, reconcile_stale_chunks(repo, fresh)}
-    end)
-    |> Ecto.Multi.run(:graph, fn repo, %{chunks: chunk_ids_by_key, partition: %{fresh: fresh}} ->
-      Graph.upsert_from_staged(repo, fresh, chunk_ids_by_key)
-    end)
-    |> Ecto.Multi.run(:cleanup, fn repo, _ ->
-      {:ok, repo.delete_all(PendingChunks.by_ids(ids))}
+    |> Ecto.Multi.merge(fn %{context: context} ->
+      claim_and_process(context, staged_rows, ids, raw_pending_chunk_id, now)
     end)
     |> Repo.transaction()
     |> case do
@@ -113,47 +130,153 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
 
         :ok
 
+      {:ok, _changes} ->
+        :ok
+
       {:error, _step, reason, _changes} ->
         {:error, reason}
     end
   end
 
-  # Splits the batch into `:fresh` rows (safe to upsert/reconcile/graph) and
-  # `:stale` rows (a file identity whose persisted generation already beats
-  # this batch's — see the moduledoc's order-safety note). A row whose
-  # identity can't be resolved always counts as fresh: the guard needs an
-  # identity to compare against, and reconciliation already no-ops for it
-  # (see `Ingest.reconcile_file_chunks/5`). Grouped by identity (not treated
-  # as one batch) because a batch can defensively span more than one file —
-  # see `reconcile_stale_chunks/2`'s own moduledoc reference.
-  defp partition_by_generation(repo, staged_rows) do
-    staged_rows
-    |> Enum.group_by(&batch_identity/1)
-    |> Enum.reduce(%{fresh: [], stale: []}, &sort_group(repo, &1, &2))
+  # Resolves the batch's file identity/generation. Non-empty batch: from the
+  # staged rows themselves (after checking they all agree on one file — see the
+  # moduledoc). Empty batch: from the raw row `raw_pending_chunk_id` points at,
+  # loaded inside the transaction (it's still present, status `"chunked_empty"`
+  # — ChunkFiles' zero-chunk path never reaps it, this worker does). A missing
+  # raw row (an idempotent retry after this worker already reaped it) or no
+  # `raw_pending_chunk_id` at all resolves to no context — every downstream step
+  # then safely no-ops.
+  defp resolve_context(_repo, [row | _] = staged_rows, _raw_pending_chunk_id) do
+    validate_single_identity!(staged_rows)
+
+    %{
+      source_id: row.source_id,
+      source_type: row.source_type,
+      metadata: row.metadata,
+      identity: Ingest.file_identity(row.source_type, row.metadata),
+      generation: staged_rows |> Enum.map(&(&1.ingest_generation || 0)) |> Enum.max()
+    }
   end
 
-  defp sort_group(_repo, {nil, rows}, acc), do: update_in(acc.fresh, &(rows ++ &1))
+  defp resolve_context(repo, [], raw_pending_chunk_id) when is_integer(raw_pending_chunk_id) do
+    case repo.get(PendingChunk, raw_pending_chunk_id) do
+      nil ->
+        empty_context()
 
-  defp sort_group(repo, {{source_id, source_type, field, value}, rows}, acc) do
-    batch_generation = rows |> Enum.map(&(&1.ingest_generation || 0)) |> Enum.max()
-    persisted = Ingest.max_ingest_generation(repo, source_id, source_type, %{field => value})
-
-    if persisted > batch_generation do
-      Logger.info(
-        "skipping stale ingest generation #{batch_generation} < #{persisted} for #{field}=#{value}"
-      )
-
-      update_in(acc.stale, &(rows ++ &1))
-    else
-      update_in(acc.fresh, &(rows ++ &1))
+      row ->
+        %{
+          source_id: row.source_id,
+          source_type: row.source_type,
+          metadata: row.metadata,
+          identity: Ingest.file_identity(row.source_type, row.metadata),
+          generation: raw_pending_chunk_id
+        }
     end
   end
 
-  defp batch_identity(row) do
-    case Ingest.file_identity(row.source_type, row.metadata) do
-      {field, value} -> {row.source_id, row.source_type, field, value}
-      nil -> nil
+  defp resolve_context(_repo, [], _raw_pending_chunk_id), do: empty_context()
+
+  defp empty_context,
+    do: %{source_id: nil, source_type: nil, metadata: nil, identity: nil, generation: nil}
+
+  # One `ChunkFiles` job's chunks always belong to one file (see the
+  # moduledoc) — a batch whose staged rows disagree on (source_id, identity)
+  # is a bug upstream, not a shape this worker should silently partition
+  # around.
+  defp validate_single_identity!(staged_rows) do
+    identities =
+      staged_rows
+      |> Enum.map(&{&1.source_id, Ingest.file_identity(&1.source_type, &1.metadata)})
+      |> Enum.uniq()
+
+    case identities do
+      [_one] ->
+        :ok
+
+      multiple ->
+        raise ArgumentError,
+              "UpsertChunks requires every staged row in a batch to share one file identity " <>
+                "(one ChunkFiles job's chunks always belong to one file) — got #{inspect(multiple)}"
     end
+  end
+
+  # No identity to claim/reconcile against (unrecognized source_type, or
+  # nothing at all to do — see resolve_context/3) — upsert whatever staged rows
+  # there are (possibly none) and clean up. Never guesses an identity to
+  # reconcile against, same rule `Ingest.reconcile_file_chunks/5` already
+  # enforces on its own.
+  defp claim_and_process(%{identity: nil}, staged_rows, ids, raw_pending_chunk_id, now) do
+    Ecto.Multi.new()
+    |> Ecto.Multi.run(:chunks, fn repo, _ ->
+      {:ok, insert_batches(repo, Enum.map(staged_rows, &to_chunk_entry/1), now)}
+    end)
+    |> Ecto.Multi.run(:graph, fn repo, %{chunks: chunk_ids_by_key} ->
+      Graph.upsert_from_staged(repo, staged_rows, chunk_ids_by_key)
+    end)
+    |> add_cleanup(ids, raw_pending_chunk_id)
+  end
+
+  defp claim_and_process(%{identity: {_field, value}} = context, staged_rows, ids, rid, now) do
+    Ecto.Multi.new()
+    |> Ecto.Multi.run(:claim, fn repo, _ ->
+      {:ok, Ingest.claim_file_version(repo, context.source_id, value, context.generation)}
+    end)
+    |> Ecto.Multi.merge(fn %{claim: claim} ->
+      merge_claim_result(claim, context, staged_rows, ids, rid, now)
+    end)
+  end
+
+  defp merge_claim_result(:stale, context, _staged_rows, ids, raw_pending_chunk_id, _now) do
+    {field, value} = context.identity
+
+    Ecto.Multi.new()
+    |> Ecto.Multi.run(:log_stale, fn _repo, _ ->
+      Logger.info("skipping stale ingest generation #{context.generation} for #{field}=#{value}")
+      {:ok, :logged}
+    end)
+    |> add_cleanup(ids, raw_pending_chunk_id)
+  end
+
+  defp merge_claim_result(:claimed, context, staged_rows, ids, raw_pending_chunk_id, now) do
+    Ecto.Multi.new()
+    |> Ecto.Multi.run(:chunks, fn repo, _ ->
+      {:ok, insert_batches(repo, Enum.map(staged_rows, &to_chunk_entry/1), now)}
+    end)
+    |> Ecto.Multi.run(:reconcile, fn repo, _ ->
+      keys = Enum.map(staged_rows, & &1.chunk_key)
+
+      {:ok,
+       Ingest.reconcile_file_chunks(
+         repo,
+         context.source_id,
+         context.source_type,
+         context.metadata,
+         keys
+       )}
+    end)
+    |> Ecto.Multi.run(:graph, fn repo, %{chunks: chunk_ids_by_key} ->
+      Graph.upsert_from_staged(repo, staged_rows, chunk_ids_by_key)
+    end)
+    |> add_cleanup(ids, raw_pending_chunk_id)
+  end
+
+  # Deletes the batch's staged chunk rows (`ids`) and, when present, the raw
+  # row `raw_pending_chunk_id` points at. The latter is a no-op (0 rows) on the
+  # normal path — ChunkFiles already reaped its raw row before EmbedBatch ever
+  # ran — and the actual reap for the zero-chunk path, where `ids` is `[]` and
+  # this is the only place that raw row gets deleted.
+  defp add_cleanup(multi, ids, raw_pending_chunk_id) do
+    Ecto.Multi.run(multi, :cleanup, fn repo, _ ->
+      {chunk_count, _} = repo.delete_all(PendingChunks.by_ids(ids))
+
+      raw_count =
+        case raw_pending_chunk_id do
+          nil -> 0
+          rid -> repo.delete_all(PendingChunks.by_ids([rid])) |> elem(0)
+        end
+
+      {:ok, chunk_count + raw_count}
+    end)
   end
 
   # Batched insert accumulates chunk_key => id across every batch (ON
@@ -178,37 +301,6 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
   defp insert_batch_size,
     do: Application.get_env(:retrieval_node, :upsert_chunks_batch_size, @insert_batch_size)
 
-  # Deletes, per (source_id, identity) group present in `staged_rows`, every
-  # existing `chunks` row for that file whose `chunk_key` this batch did NOT
-  # reproduce — see this module's moduledoc for why one batch is always one
-  # file's complete new chunk set (grouping below is defense in depth for
-  # that assumption, not a reason to trust it blindly: a batch spanning more
-  # than one file reconciles each independently rather than cross-deleting).
-  # The actual identity resolution + delete is `Ingest.reconcile_file_chunks/5`
-  # — shared with `Ingest.Workers.ChunkFiles`' zero-chunk (whitespace-only
-  # file) path, which reconciles a single file's identity the same way with
-  # an empty keep-set.
-  defp reconcile_stale_chunks(repo, staged_rows) do
-    staged_rows
-    |> Enum.group_by(&identity_group/1)
-    |> Enum.reduce(0, fn
-      {nil, _rows}, deleted ->
-        deleted
-
-      {{source_id, source_type, _value}, rows}, deleted ->
-        keys = Enum.map(rows, & &1.chunk_key)
-        metadata = hd(rows).metadata
-        deleted + Ingest.reconcile_file_chunks(repo, source_id, source_type, metadata, keys)
-    end)
-  end
-
-  defp identity_group(row) do
-    case Ingest.file_identity(row.source_type, row.metadata) do
-      {_field, value} -> {row.source_id, row.source_type, value}
-      nil -> nil
-    end
-  end
-
   defp to_chunk_entry(row) do
     %{
       source_id: row.source_id,
@@ -225,8 +317,9 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
       embedding: row.embedding,
       parse_status: to_enum(:parse_status, row.parse_status),
       secrets_status: to_enum(:secrets_status, row.secrets_status),
-      # NULL for legacy pre-column rows (never produced by the current
-      # pipeline) — treated as generation 0 by the order-safety guard.
+      # This batch's claimed generation (the raw row's own id) — cheap
+      # provenance on the permanent row. NULL for legacy pre-column rows
+      # (never produced by the current pipeline).
       ingest_generation: row.ingest_generation,
       inserted_at: {:placeholder, :now},
       updated_at: {:placeholder, :now}

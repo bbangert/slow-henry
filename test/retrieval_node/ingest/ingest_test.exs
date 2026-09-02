@@ -8,7 +8,7 @@ defmodule RetrievalNode.IngestTest do
   alias RetrievalNode.Ingest
   alias RetrievalNode.Ingest.Workers.RepoSync
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.{PendingChunk, Source, SyncState}
+  alias RetrievalNode.Retrieval.{FileVersion, PendingChunk, Source, SyncState}
 
   describe "force_full_resync_git_sources/0" do
     test "clears an existing watermark and enqueues RepoSync for each active git source" do
@@ -167,6 +167,57 @@ defmodule RetrievalNode.IngestTest do
       assert graph.entity_mentions == 0
       assert graph.entity_edges == 0
       assert graph.chunks == 0
+    end
+  end
+
+  describe "claim_file_version/4" do
+    setup do
+      source = Repo.insert!(%Source{source_type: :git_repo, name: "app", identifier: "acme/app"})
+      %{source: source}
+    end
+
+    test "first claim for a file inserts the row and returns :claimed", %{source: source} do
+      assert :claimed = Ingest.claim_file_version(Repo, source.id, "app.py", 1)
+
+      assert %FileVersion{generation: 1} =
+               Repo.get_by!(FileVersion, source_id: source.id, identity: "app.py")
+    end
+
+    test "a strictly newer generation is :claimed and updates the persisted row", %{
+      source: source
+    } do
+      assert :claimed = Ingest.claim_file_version(Repo, source.id, "app.py", 1)
+      assert :claimed = Ingest.claim_file_version(Repo, source.id, "app.py", 2)
+
+      assert %FileVersion{generation: 2} =
+               Repo.get_by!(FileVersion, source_id: source.id, identity: "app.py")
+    end
+
+    test "an older generation is :stale and leaves the persisted row untouched", %{
+      source: source
+    } do
+      assert :claimed = Ingest.claim_file_version(Repo, source.id, "app.py", 5)
+      assert :stale = Ingest.claim_file_version(Repo, source.id, "app.py", 3)
+
+      assert %FileVersion{generation: 5} =
+               Repo.get_by!(FileVersion, source_id: source.id, identity: "app.py")
+    end
+
+    test "an equal generation (a same-version retry after commit) is :stale — a clean no-op", %{
+      source: source
+    } do
+      assert :claimed = Ingest.claim_file_version(Repo, source.id, "app.py", 4)
+      assert :stale = Ingest.claim_file_version(Repo, source.id, "app.py", 4)
+
+      assert %FileVersion{generation: 4} =
+               Repo.get_by!(FileVersion, source_id: source.id, identity: "app.py")
+    end
+
+    test "different files under the same source claim independently", %{source: source} do
+      assert :claimed = Ingest.claim_file_version(Repo, source.id, "a.py", 1)
+      assert :claimed = Ingest.claim_file_version(Repo, source.id, "b.py", 1)
+
+      assert Repo.aggregate(FileVersion, :count, :id) == 2
     end
   end
 end

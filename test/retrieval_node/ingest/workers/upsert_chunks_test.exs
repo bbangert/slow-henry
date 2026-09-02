@@ -183,47 +183,29 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunksTest do
     assert chunk_keys(source, "other.py") == other_keys_before
   end
 
-  test "a batch spanning two paths (defensive) reconciles each independently", %{source: source} do
+  test "a batch spanning two file identities raises ArgumentError — one ChunkFiles job's chunks always belong to one file, so this is a bug, not something to partition around",
+       %{source: source} do
     nk1 = "repo:acme/app:f1.py"
     nk2 = "repo:acme/app:f2.py"
 
-    force_chunk_with_graph(chunk_result([{"f1 chunk a", "a", 1, 1}, {"f1 chunk b", "b", 2, 2}]))
+    force_chunk_with_graph(chunk_result([{"f1 chunk a", "a", 1, 1}]))
+    raw1 = seed_raw(source, "f1 v1", nk1, "f1.py")
+    assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw1.id})
 
-    run_pipeline(seed_raw(source, "f1 v1", nk1, "f1.py"))
+    force_chunk_with_graph(chunk_result([{"f2 chunk a", "a", 1, 1}]))
+    raw2 = seed_raw(source, "f2 v1", nk2, "f2.py")
+    assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw2.id})
 
-    force_chunk_with_graph(chunk_result([{"f2 chunk a", "a", 1, 1}, {"f2 chunk b", "b", 2, 2}]))
-
-    run_pipeline(seed_raw(source, "f2 v1", nk2, "f2.py"))
-
-    f1_keys_before = chunk_keys(source, "f1.py")
-    f2_keys_before = chunk_keys(source, "f2.py")
-    assert length(f1_keys_before) == 2
-    assert length(f2_keys_before) == 2
-
-    # Build both files' new chunk rows first, then merge their staged ids into
-    # ONE EmbedBatch -> UpsertChunks call — a batch spanning two paths never
-    # happens in production (one ChunkFiles job's chunks always go through
-    # one EmbedBatch/UpsertChunks pair, see the moduledoc), but reconciliation
-    # is grouped defensively so this still resolves correctly if it ever does.
-    force_chunk_with_graph(chunk_result([{"f1 chunk a2", "a2", 1, 1}]))
-    raw1b = seed_raw(source, "f1 v2", nk1, "f1.py")
-    assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw1b.id})
-
-    force_chunk_with_graph(chunk_result([{"f2 chunk a2", "a2", 1, 1}]))
-    raw2b = seed_raw(source, "f2 v2", nk2, "f2.py")
-    assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw2b.id})
-
+    # A batch spanning two files never happens in production (one ChunkFiles
+    # job's chunks always go through one EmbedBatch/UpsertChunks pair, see
+    # the moduledoc) — simulate it defensively by merging both files' staged
+    # ids into one UpsertChunks call.
     combined_ids = Repo.all(from p in PendingChunk, select: p.id)
     assert :ok = perform_job(EmbedBatch, %{"pending_chunk_ids" => combined_ids})
-    assert :ok = perform_job(UpsertChunks, %{"pending_chunk_ids" => combined_ids})
 
-    f1_keys_after = chunk_keys(source, "f1.py")
-    f2_keys_after = chunk_keys(source, "f2.py")
-
-    assert length(f1_keys_after) == 1
-    assert length(f2_keys_after) == 1
-    assert Enum.all?(f1_keys_after, &(&1 not in f1_keys_before))
-    assert Enum.all?(f2_keys_after, &(&1 not in f2_keys_before))
+    assert_raise ArgumentError, ~r/one file identity/, fn ->
+      perform_job(UpsertChunks, %{"pending_chunk_ids" => combined_ids})
+    end
   end
 
   test "re-running the same content is idempotent — no rows are deleted, nothing is logged", %{
@@ -306,24 +288,33 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunksTest do
       embed_jobs_before = Repo.aggregate(embed_batch_jobs(), :count, :id)
 
       # The file is now whitespace-only — zero chunks. ChunkFiles alone (no
-      # EmbedBatch/UpsertChunks step, there's nothing to embed) must still
-      # reconcile the file's now-stale chunk rows away.
+      # EmbedBatch stage, there's nothing to embed) only marks the raw row
+      # `chunked_empty` and routes it straight to UpsertChunks — the
+      # pipeline's one terminal stage, and the only place that reconciles a
+      # file's now-stale chunk rows away.
       force_chunk_with_graph(chunk_result([]))
       raw2 = seed_raw(source, "   \n\t\n  ", natural_key, "app.py")
 
-      log =
-        capture_log(fn ->
-          assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw2.id})
-        end)
-
-      assert log =~ "chunk_files reconciled 2 stale chunk row(s)"
-
-      # raw row reaped, no chunks to embed for a whitespace-only file
-      refute Repo.get(PendingChunk, raw2.id)
+      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw2.id})
+      assert Repo.get(PendingChunk, raw2.id).status == "chunked_empty"
       # no NEW EmbedBatch job — the run_pipeline call above already left one
       # (from its own, unrelated ChunkFiles step) in the jobs table, so a bare
       # refute_enqueued would false-positive on that leftover.
       assert Repo.aggregate(embed_batch_jobs(), :count, :id) == embed_jobs_before
+
+      log =
+        capture_log(fn ->
+          assert :ok =
+                   perform_job(UpsertChunks, %{
+                     "pending_chunk_ids" => [],
+                     "raw_pending_chunk_id" => raw2.id
+                   })
+        end)
+
+      assert log =~ "upsert_chunks reconciled 2 stale chunk row(s)"
+
+      # raw row reaped by UpsertChunks' own cleanup step
+      refute Repo.get(PendingChunk, raw2.id)
 
       # old chunks (and their cascaded mentions) are gone
       assert chunk_keys(source, "app.py") == []
@@ -338,14 +329,21 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunksTest do
       force_chunk_with_graph(chunk_result([]))
       raw = seed_raw(source, "   \n  ", natural_key, "empty.py")
 
+      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id})
+      assert Repo.get(PendingChunk, raw.id).status == "chunked_empty"
+      refute_enqueued(worker: EmbedBatch)
+
       log =
         capture_log(fn ->
-          assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id})
+          assert :ok =
+                   perform_job(UpsertChunks, %{
+                     "pending_chunk_ids" => [],
+                     "raw_pending_chunk_id" => raw.id
+                   })
         end)
 
       refute log =~ "reconciled"
       refute Repo.get(PendingChunk, raw.id)
-      refute_enqueued(worker: EmbedBatch)
       assert chunk_keys(source, "empty.py") == []
     end
   end

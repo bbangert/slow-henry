@@ -1,25 +1,43 @@
 defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
   @moduledoc """
   Turns one raw staging row into embeddable chunk rows: **scrub → chunk (with the
-  fallback policy) → write chunk rows → enqueue EmbedBatch → reap the raw row**.
+  fallback policy) → write chunk rows → enqueue EmbedBatch**. `UpsertChunks` is the
+  pipeline's ONE terminal stage — every raw row this worker reads ends up routed
+  through it, including the zero-chunk case below, which used to reap and
+  reconcile locally and is now just another `UpsertChunks` job with an empty chunk
+  id list. See `Ingest.Workers.UpsertChunks`' moduledoc for why one terminal path
+  (and the atomic per-file version claim it opens its transaction with) replaced
+  the two this pipeline used to have.
 
   Scrub is an in-process pre-step (fail-closed): a `{:cancel, _}` from the scrubber
   (unredactable secret, too-large, or scanner-unavailable) discards the file — and
   because the raw row still holds the un-redacted secret, we **reap it on the cancel
   path too**, never leaving plaintext in staging. Chunking falls back to the
   heuristic chunker on a parse timeout/crash (final attempt) or an unsupported
-  language, but *skips* (`{:cancel}`, after reaping) oversized/binary content. The
-  raw row is deleted once its chunk rows are written. Idempotent: a retry after the
-  raw row is gone is a no-op. `finalize/6` runs write-chunks → enqueue → reap in one
-  transaction, so a crash never redoes that work under a fresh id set.
+  language, but *skips* (`{:cancel}`, after reaping) oversized/binary content.
+
+  Normal (non-empty) path: the raw row is deleted once its chunk rows are written.
+  Idempotent: a retry after the raw row is gone is a no-op. `finalize/6` runs
+  write-chunks → enqueue EmbedBatch → reap in one transaction, so a crash never
+  redoes that work under a fresh id set.
+
+  Zero-chunk (e.g. whitespace-only) path: nothing to embed, so there's no
+  EmbedBatch stage to run — but the raw row must still reach `UpsertChunks` (it's
+  the only place that reconciles a file's chunk set, and a file that stops
+  producing chunks entirely still needs its old chunks reaped). The raw row's
+  status flips to `"chunked_empty"` and `UpsertChunks` is enqueued directly with
+  `pending_chunk_ids: []` and `raw_pending_chunk_id: row.id` — the raw row is
+  *not* reaped here; `UpsertChunks` reaps it once it's done with it (its cleanup
+  step deletes both the chunk ids in its args and the raw row id, whichever of the
+  two exist), so a crash between these two jobs leaves the raw row for the retry
+  to pick back up rather than losing the file's stale-chunk reconciliation.
 
   Every chunk row this worker writes is stamped with `ingest_generation: row.id` —
-  the raw row's own (monotonic) id. The zero-chunk (whitespace-only) reconciliation
-  path below reads that same id back as ITS generation and skips deleting a file's
-  persisted chunks when a newer version's generation already beat it there — see
-  `Ingest.max_ingest_generation/4` and `Ingest.Workers.UpsertChunks`' moduledoc for
-  why (two versions of one file can be in flight; this worker is unique only by
-  `pending_chunk_id`, not by file, so the older version's job can run last).
+  the raw row's own (monotonic) id — cheap provenance that `UpsertChunks` copies
+  onto the permanent `Chunk` row. `raw_pending_chunk_id` is also threaded onto the
+  NORMAL path's `EmbedBatch` args (which forwards it to `UpsertChunks` in turn) so
+  `UpsertChunks` always has the raw row id in hand for the empty-batch case without
+  ever needing to infer it.
   """
   use Oban.Worker,
     queue: :chunk,
@@ -30,13 +48,10 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
       states: [:available, :scheduled, :executing, :retryable, :suspended]
     ]
 
-  require Logger
-
   alias RetrievalNode.Chunking
   alias RetrievalNode.Chunking.{Breadcrumb, HeuristicImpl}
-  alias RetrievalNode.Ingest
   alias RetrievalNode.Ingest.{PendingChunks, Scrubber}
-  alias RetrievalNode.Ingest.Workers.EmbedBatch
+  alias RetrievalNode.Ingest.Workers.{EmbedBatch, UpsertChunks}
   alias RetrievalNode.Repo
 
   @source_types %{"git" => :git_repo, "jira" => :jira_project, "drive" => :drive_folder}
@@ -100,36 +115,33 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
     finalize(row, chunks, parse_status, quality_opts, [], [])
   end
 
-  # No chunks (e.g. a file that changed to whitespace-only) — nothing to embed,
-  # but this file may have had chunks from a PRIOR ingest (and their cascaded
-  # entity_mentions/entity_edges) that are now orphaned: nothing else in the
-  # pipeline ever revisits a file that stops producing chunks entirely (see
-  # UpsertChunks' moduledoc — its own reconciliation only runs when a batch of
-  # NEW chunks arrives). Reconcile this file's identity against an empty
-  # keep-set (deletes every existing chunk row for it) and reap the raw row
-  # atomically, via the same `Ingest.reconcile_file_chunks/5` UpsertChunks
-  # uses — so "delete old chunks" and "reap raw" either both happen or
-  # neither does. A harmless no-op when the file has no prior chunks (first
-  # ingest) or no resolvable identity (see `Ingest.file_identity/2`).
+  # No chunks (e.g. a file that changed to whitespace-only) — nothing to embed
+  # or claim a version for here. Mark the raw row `chunked_empty` (it still
+  # carries this file's identity/generation) and route it through
+  # `UpsertChunks` directly, the same terminal stage the normal path reaches
+  # via EmbedBatch — that's the only place a version is claimed and a file's
+  # chunk set reconciled, so a file that stops producing chunks entirely
+  # still gets its stale chunks (from a prior ingest) reaped there, in the
+  # same atomic, order-safe way as any other version. `raw_pending_chunk_id`
+  # (not `pending_chunk_id` — this staging table also holds already-chunked
+  # rows) is how `UpsertChunks` finds this row for an otherwise-empty batch.
   defp finalize(row, [], _parse_status, _opts, _entities, _references) do
     Ecto.Multi.new()
-    |> Ecto.Multi.run(:reconcile, fn repo, _ -> {:ok, reconcile_or_skip_stale(repo, row)} end)
-    |> Ecto.Multi.run(:reap, fn repo, _ ->
-      {:ok, repo.delete_all(PendingChunks.by_ids([row.id]))}
+    |> Ecto.Multi.run(:mark_empty, fn repo, _ ->
+      case repo.update_all(PendingChunks.by_ids([row.id]),
+             set: [status: "chunked_empty", updated_at: DateTime.utc_now()]
+           ) do
+        {1, _} -> {:ok, :marked}
+        {0, _} -> {:error, :raw_row_missing}
+      end
+    end)
+    |> Oban.insert(:upsert, fn _changes ->
+      UpsertChunks.new(%{"pending_chunk_ids" => [], "raw_pending_chunk_id" => row.id})
     end)
     |> Repo.transaction()
     |> case do
-      {:ok, %{reconcile: reconciled}} ->
-        if reconciled > 0 do
-          Logger.info(
-            "chunk_files reconciled #{reconciled} stale chunk row(s) for a whitespace-only file"
-          )
-        end
-
-        :ok
-
-      {:error, _step, reason, _changes} ->
-        {:error, reason}
+      {:ok, _} -> :ok
+      {:error, _step, reason, _changes} -> {:error, reason}
     end
   end
 
@@ -157,7 +169,10 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
       )
     end)
     |> Oban.insert(:embed, fn %{chunks: rows} ->
-      EmbedBatch.new(%{"pending_chunk_ids" => Enum.map(rows, & &1.id)})
+      EmbedBatch.new(%{
+        "pending_chunk_ids" => Enum.map(rows, & &1.id),
+        "raw_pending_chunk_id" => row.id
+      })
     end)
     |> Ecto.Multi.run(:reap, fn repo, _ ->
       {:ok, repo.delete_all(PendingChunks.by_ids([row.id]))}
@@ -166,35 +181,6 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
     |> case do
       {:ok, _} -> :ok
       {:error, _step, reason, _changes} -> {:error, reason}
-    end
-  end
-
-  # Generation guard for the zero-chunk (whitespace-only) reconciliation path:
-  # this raw row's generation is its own `id` (bigserial ⇒ monotonic — see the
-  # `chunks.ingest_generation` migration). If a NEWER version of this file
-  # already has chunks persisted, this (older, delayed) whitespace-only run
-  # must NOT delete them — a stale ChunkFiles retry/backlog job racing behind
-  # the newer version's UpsertChunks would otherwise wipe out real content.
-  # Skip the delete but still let the raw row get reaped (the `:reap` step
-  # runs regardless).
-  defp reconcile_or_skip_stale(repo, row) do
-    persisted = Ingest.max_ingest_generation(repo, row.source_id, row.source_type, row.metadata)
-
-    if persisted > row.id do
-      Logger.info(
-        "skipping stale ingest generation #{row.id} < #{persisted} for #{identity_label(row)}"
-      )
-
-      0
-    else
-      Ingest.reconcile_file_chunks(repo, row.source_id, row.source_type, row.metadata, [])
-    end
-  end
-
-  defp identity_label(row) do
-    case Ingest.file_identity(row.source_type, row.metadata) do
-      {field, value} -> "#{field}=#{value}"
-      nil -> "unknown"
     end
   end
 

@@ -147,7 +147,7 @@ defmodule RetrievalNode.Ingest.Workers.OrderSafetyTest do
         assert :ok = run_rest_of_pipeline(raw1)
       end)
 
-    assert log =~ "skipping stale ingest generation #{raw1.id} < #{raw2.id} for path=app.py"
+    assert log =~ "skipping stale ingest generation #{raw1.id} for path=app.py"
 
     # v2's chunk is untouched — same row, same content, same generation.
     assert [chunk_after] = persisted_chunks(source, "app.py")
@@ -173,18 +173,30 @@ defmodule RetrievalNode.Ingest.Workers.OrderSafetyTest do
     assert :ok = run_pipeline(raw2)
     assert [v2_chunk] = persisted_chunks(source, "app.py")
 
-    # The delayed v1 whitespace-only ChunkFiles job finally runs.
+    # The delayed v1 whitespace-only ChunkFiles job finally runs — it only
+    # marks the raw row `chunked_empty` and routes it straight to
+    # UpsertChunks (there's no EmbedBatch stage for zero chunks); the stale-
+    # generation check — and any reconciliation — now happens there, not in
+    # ChunkFiles.
     force_chunk_with_graph(chunk_result([]))
+    assert :ok = run_chunk_files(raw1)
+    assert Repo.get(PendingChunk, raw1.id).status == "chunked_empty"
 
     log =
       capture_log(fn ->
-        assert :ok = run_chunk_files(raw1)
+        assert :ok =
+                 perform_job(UpsertChunks, %{
+                   "pending_chunk_ids" => [],
+                   "raw_pending_chunk_id" => raw1.id
+                 })
       end)
 
-    assert log =~ "skipping stale ingest generation #{raw1.id} < #{raw2.id} for path=app.py"
-    refute log =~ "chunk_files reconciled"
+    assert log =~ "skipping stale ingest generation #{raw1.id} for path=app.py"
+    refute log =~ "reconciled"
 
-    # v2's chunk survives untouched; v1's raw row is still reaped.
+    # v2's chunk survives untouched; v1's raw row is still reaped (by
+    # UpsertChunks' cleanup step, since ChunkFiles never reaps a
+    # chunked_empty row itself).
     assert [chunk_after] = persisted_chunks(source, "app.py")
     assert chunk_after.id == v2_chunk.id
     refute Repo.get(PendingChunk, raw1.id)
@@ -203,21 +215,27 @@ defmodule RetrievalNode.Ingest.Workers.OrderSafetyTest do
     raw2 = seed_raw(source, "   \n  ", natural_key, "app.py")
     assert raw2.id > raw1.id
 
+    assert :ok = run_chunk_files(raw2)
+    assert Repo.get(PendingChunk, raw2.id).status == "chunked_empty"
+
     log =
       capture_log(fn ->
-        assert :ok = run_chunk_files(raw2)
+        assert :ok =
+                 perform_job(UpsertChunks, %{
+                   "pending_chunk_ids" => [],
+                   "raw_pending_chunk_id" => raw2.id
+                 })
       end)
 
     refute log =~ "skipping stale"
-    assert log =~ "chunk_files reconciled 1 stale chunk row(s)"
+    assert log =~ "upsert_chunks reconciled 1 stale chunk row(s)"
 
     assert persisted_chunks(source, "app.py") == []
     refute Repo.get(PendingChunk, raw2.id)
   end
 
-  test "same-generation retry proceeds normally (idempotent), not treated as stale", %{
-    source: source
-  } do
+  test "same-generation retry after commit is a clean skip — not re-upserted, but staging is still cleaned up",
+       %{source: source} do
     natural_key = "repo:acme/app:app.py"
 
     force_chunk_with_graph(chunk_result([{"v1 content", "a", 1, 1}]))
@@ -264,12 +282,20 @@ defmodule RetrievalNode.Ingest.Workers.OrderSafetyTest do
         assert :ok = perform_job(UpsertChunks, %{"pending_chunk_ids" => ids})
       end)
 
-    refute log =~ "skipping stale"
+    # The claim's WHERE is `generation < EXCLUDED.generation` — a retry
+    # carrying the SAME generation that already committed does not satisfy
+    # it, so this is :stale and correctly skips the upsert entirely (the
+    # content is presumed identical — the row was already written once).
+    assert log =~ "skipping stale ingest generation #{raw.id} for path=app.py"
 
+    # the original row is untouched — same id, same content.
     assert [after_retry] = persisted_chunks(source, "app.py")
+    assert after_retry.id == original.id
     assert after_retry.chunk_key == original.chunk_key
     assert after_retry.content == "v1 content"
     assert after_retry.ingest_generation == raw.id
+
+    # the retried staging row was still cleaned up despite the stale skip.
     assert Repo.aggregate(PendingChunk, :count, :id) == 0
   end
 end

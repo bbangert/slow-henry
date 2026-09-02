@@ -49,7 +49,7 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   alias RetrievalNode.Ingest.{GitMirror, PendingChunks}
   alias RetrievalNode.Ingest.Workers.ChunkFiles
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.{Chunk, Source, SyncState}
+  alias RetrievalNode.Retrieval.{Chunk, FileVersion, Source, SyncState}
 
   @lang_by_ext %{
     "py" => "python",
@@ -112,6 +112,14 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
     from(c in Chunk,
       where: c.source_id == ^source.id and fragment("?->>'path'", c.metadata) in ^paths
     )
+    |> Repo.delete_all()
+
+    # Tidiness, not correctness: a stale `file_versions` row left behind for a
+    # deleted path is harmless — a re-added file with the same path claims a
+    # higher generation regardless (see `Ingest.claim_file_version/4`) — but
+    # there's no reason to let the table grow unbounded with rows for files
+    # that no longer exist.
+    from(fv in FileVersion, where: fv.source_id == ^source.id and fv.identity in ^paths)
     |> Repo.delete_all()
 
     :ok

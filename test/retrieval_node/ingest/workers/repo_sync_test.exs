@@ -8,7 +8,7 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
 
   alias RetrievalNode.Ingest.Workers.{ChunkFiles, RepoSync}
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source, SyncState}
+  alias RetrievalNode.Retrieval.{Chunk, FileVersion, PendingChunk, Source, SyncState}
 
   setup do
     root = Path.join(System.tmp_dir!(), "reposync-#{System.unique_integer([:positive])}")
@@ -107,6 +107,9 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
       metadata: %{"path" => "gone.py"}
     })
 
+    # Simulate a version already having been claimed for gone.py too.
+    Repo.insert!(%FileVersion{source_id: ctx.source.id, identity: "gone.py", generation: 1})
+
     File.rm!(Path.join(ctx.src, "gone.py"))
     File.write!(Path.join(ctx.src, "keep.py"), "def k(): pass\n")
     git!(ctx.src, ["add", "-A"])
@@ -114,6 +117,8 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
 
     assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
     assert Repo.aggregate(from(c in Chunk, where: c.chunk_key == "k1"), :count, :id) == 0
+
+    refute Repo.get_by(FileVersion, source_id: ctx.source.id, identity: "gone.py")
   end
 
   test "a modified file is re-enqueued, NOT treated as a deletion", ctx do

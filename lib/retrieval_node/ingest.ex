@@ -12,7 +12,7 @@ defmodule RetrievalNode.Ingest do
   alias RetrievalNode.Graph.{Entity, EntityEdge, EntityMention}
   alias RetrievalNode.Ingest.Workers.RepoSync
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source, SyncState}
+  alias RetrievalNode.Retrieval.{Chunk, FileVersion, PendingChunk, Source, SyncState}
 
   @type repo_entry :: %{
           repo: String.t(),
@@ -254,11 +254,12 @@ defmodule RetrievalNode.Ingest do
   persisted chunks). FK cascades take care of the orphan's
   `entity_mentions`/`entity_edges` for free once its `chunks` row is gone.
 
-  Runs against `repo` (the caller's transaction/sandbox connection — see
-  `Ingest.Workers.UpsertChunks` and `Ingest.Workers.ChunkFiles`, both of which
-  call this inside an `Ecto.Multi`). Returns the number of rows deleted; `0`
-  (never an error) when `source_type`/`metadata` resolve no identity —
-  reconciliation never guesses an identity to delete against.
+  Runs against `repo` (the caller's transaction/sandbox connection —
+  `Ingest.Workers.UpsertChunks` is the pipeline's single terminal stage and
+  calls this inside its `Ecto.Multi`, after `claim_file_version/4` has
+  confirmed this batch is the file's current version). Returns the number of
+  rows deleted; `0` (never an error) when `source_type`/`metadata` resolve no
+  identity — reconciliation never guesses an identity to delete against.
   """
   @spec reconcile_file_chunks(Ecto.Repo.t(), binary(), String.t(), map() | nil, [String.t()]) ::
           non_neg_integer()
@@ -270,40 +271,73 @@ defmodule RetrievalNode.Ingest do
   end
 
   @doc """
-  The highest `ingest_generation` already persisted among a file's existing
-  `chunks` rows (identity resolved the same way as `reconcile_file_chunks/5`).
-  NULL generations (rows written before the column existed) and "no chunks
-  yet for this identity" both read as `0` — a real batch (generation >= 1,
-  `pending_chunks` is `bigserial`) always beats either.
+  Atomically claims `generation` as the current version of file `identity`
+  under `source_id` in `file_versions` — the ingest pipeline's single
+  serialization point for per-file invariants (see
+  `Ingest.Workers.UpsertChunks`, the pipeline's one terminal stage). One
+  statement:
 
-  `source_type`/`metadata` resolving no identity also reads as `0` — the
-  order-safety guard has nothing to compare against, so it never blocks a
-  batch it can't place.
+      INSERT INTO file_versions (id, source_id, identity, generation, inserted_at, updated_at)
+      VALUES (...)
+      ON CONFLICT (source_id, identity) DO UPDATE
+        SET generation = EXCLUDED.generation, updated_at = EXCLUDED.updated_at
+        WHERE file_versions.generation < EXCLUDED.generation
+      RETURNING id
 
-  Shared by `Ingest.Workers.UpsertChunks`' stale-batch guard and
-  `Ingest.Workers.ChunkFiles`' zero-chunk reconciliation guard: both must
-  check this BEFORE deleting/overwriting anything for the file, so an
-  in-flight OLDER version's terminal job can't clobber a newer one that
-  already landed (see both workers' moduledocs).
+  Postgres takes the conflicting row's lock to evaluate the `ON CONFLICT`
+  clause, so two terminal jobs racing for the same `(source_id, identity)`
+  serialize right here — the loser blocks on this INSERT until the winner's
+  transaction commits, then evaluates the `WHERE` against whatever the
+  winner just persisted. Returns `:claimed` (1 row returned) when
+  `generation` is strictly newer than what's persisted — including the very
+  first claim for a file, since a missing row never blocks the initial
+  insert. Returns `:stale` (0 rows) when `generation` is the same (a
+  same-version retry after commit — a duplicate delivery of a job whose
+  version already landed, correctly a no-op) or older (a genuinely
+  out-of-order job that lost the race).
+
+  MUST be called inside the caller's own transaction — the row lock this
+  takes is only meaningful held across the reconciliation work it guards;
+  claiming outside a transaction (or in one that commits before the guarded
+  work runs) defeats the whole point.
   """
-  @spec max_ingest_generation(Ecto.Repo.t(), binary(), String.t(), map() | nil) ::
-          non_neg_integer()
-  def max_ingest_generation(repo, source_id, source_type, metadata) do
-    case file_identity(source_type, metadata) do
-      nil -> 0
-      {field, value} -> persisted_max_generation(repo, source_id, field, value)
-    end
-  end
+  @spec claim_file_version(Ecto.Repo.t(), binary(), String.t(), integer()) :: :claimed | :stale
+  def claim_file_version(repo, source_id, identity, generation) do
+    now = DateTime.utc_now()
 
-  defp persisted_max_generation(repo, source_id, field, value) do
-    repo.one(
-      from(c in Chunk,
-        where:
-          c.source_id == ^source_id and
-            fragment("?->>?", c.metadata, ^field) == ^value,
-        select: coalesce(max(c.ingest_generation), 0)
+    # The DO UPDATE's WHERE clause compares against EXCLUDED (the row this
+    # statement is trying to insert) via fragment, exactly like the on_conflict
+    # query form Ecto.Repo.insert_all/3 documents for conditional upserts —
+    # confirmed against the actual generated SQL (see the claim_file_version
+    # tests' capture_log assertions).
+    on_conflict =
+      from(f in FileVersion,
+        update: [
+          set: [
+            generation: fragment("EXCLUDED.generation"),
+            updated_at: fragment("EXCLUDED.updated_at")
+          ]
+        ],
+        where: fragment("EXCLUDED.generation > ?", f.generation)
       )
-    )
+
+    entry = %{
+      id: Ecto.UUID.generate(),
+      source_id: source_id,
+      identity: identity,
+      generation: generation,
+      inserted_at: now,
+      updated_at: now
+    }
+
+    {count, _} =
+      repo.insert_all(FileVersion, [entry],
+        on_conflict: on_conflict,
+        conflict_target: [:source_id, :identity],
+        returning: [:id]
+      )
+
+    if count > 0, do: :claimed, else: :stale
   end
 
   # `metadata->>?` binds the jsonb key as an ordinary text parameter — unlike

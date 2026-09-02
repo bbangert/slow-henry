@@ -4,8 +4,12 @@ defmodule RetrievalNode.Retrieval.PendingChunk do
   OUT of Oban args (Iron Law: args are IDs only). A `*Sync` worker inserts `raw`
   rows carrying source provenance; `ChunkFiles` scrubs + splits a raw row into N
   chunk rows (adding `chunk_key`/`context_breadcrumb`/`parse_status`); `EmbedBatch`
-  fills `embedding`; `UpsertChunks` maps the chunk rows 1:1 into permanent
-  `Retrieval.Chunk` rows and deletes the consumed staging rows.
+  fills `embedding`; `UpsertChunks` — the pipeline's one terminal stage — maps the
+  chunk rows 1:1 into permanent `Retrieval.Chunk` rows and deletes the consumed
+  staging rows. A `raw` row that produces zero chunks (e.g. whitespace-only
+  content) never gets chunk-row children; `ChunkFiles` instead flips its own
+  `status` to `"chunked_empty"` in place and routes it to `UpsertChunks` directly
+  (see `Ingest.Workers.ChunkFiles`' moduledoc) — `UpsertChunks` reaps that row too.
 
   Carries the full set of `Chunk` provenance/derived fields so `UpsertChunks` needs
   no data from job args. Uses a `bigserial` primary key (throwaway staging).
