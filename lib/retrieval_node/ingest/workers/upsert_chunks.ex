@@ -85,8 +85,11 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
 
   # The staged `embedding` is a %Pgvector{} (opaque) that we pass straight into
   # insert_all — correct at runtime (the vector type's dump is a passthrough), but
-  # dialyzer sees an opaque term crossing into Ecto.Multi. Silence just that.
-  @dialyzer {:no_opaque, perform: 1}
+  # dialyzer sees an opaque term crossing into Ecto.Multi. Silence just that, in
+  # every function that builds a Multi over the staged rows (the claim redesign
+  # split that construction out of perform/1).
+  @dialyzer {:no_opaque,
+             [perform: 1, claim_and_process: 5, merge_claim_result: 6, add_cleanup: 3]}
 
   @replace_on_conflict [
     :content,
