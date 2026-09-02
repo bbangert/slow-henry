@@ -83,6 +83,9 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunksTest do
     |> Enum.sort()
   end
 
+  defp embed_batch_jobs,
+    do: from(j in Oban.Job, where: j.worker == ^Oban.Worker.to_string(EmbedBatch))
+
   test "reconciles a file's chunk set: fewer/shifted chunks on re-ingest leaves only the new key set for that path",
        %{source: source} do
     natural_key = "repo:acme/app:app.py"
@@ -264,5 +267,86 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunksTest do
 
     assert keys_after == keys_before
     assert ids_after == ids_before
+  end
+
+  describe "whitespace-only re-ingest (zero chunks) reconciliation" do
+    # Test env sets Logger level: :warning, which drops :info messages before
+    # capture_log ever sees them — capture_log's own :level option only
+    # narrows, never widens, the global level. Bump it for ChunkFiles' :info
+    # reconciliation log (same reason/pattern as GraphGcTest); this module is
+    # already async: false so the mutation can't bleed into concurrent tests.
+    setup do
+      prev = Logger.level()
+      Logger.configure(level: :info)
+      on_exit(fn -> Logger.configure(level: prev) end)
+      :ok
+    end
+
+    test "a file that changes to whitespace-only sheds its previously persisted chunks and their cascaded entity_mentions",
+         %{source: source} do
+      natural_key = "repo:acme/app:app.py"
+
+      force_chunk_with_graph(
+        chunk_result(
+          [
+            {"def a():\n    return 1\n", "a", 1, 2},
+            {"def b():\n    return 1\n", "b", 4, 5}
+          ],
+          [
+            %{qualified_name: "a", kind: :function, line: 1},
+            %{qualified_name: "b", kind: :function, line: 4}
+          ]
+        )
+      )
+
+      run_pipeline(seed_raw(source, "v1", natural_key, "app.py"))
+      assert length(chunk_keys(source, "app.py")) == 2
+      assert Repo.aggregate(EntityMention, :count, :id) == 2
+
+      embed_jobs_before = Repo.aggregate(embed_batch_jobs(), :count, :id)
+
+      # The file is now whitespace-only — zero chunks. ChunkFiles alone (no
+      # EmbedBatch/UpsertChunks step, there's nothing to embed) must still
+      # reconcile the file's now-stale chunk rows away.
+      force_chunk_with_graph(chunk_result([]))
+      raw2 = seed_raw(source, "   \n\t\n  ", natural_key, "app.py")
+
+      log =
+        capture_log(fn ->
+          assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw2.id})
+        end)
+
+      assert log =~ "chunk_files reconciled 2 stale chunk row(s)"
+
+      # raw row reaped, no chunks to embed for a whitespace-only file
+      refute Repo.get(PendingChunk, raw2.id)
+      # no NEW EmbedBatch job — the run_pipeline call above already left one
+      # (from its own, unrelated ChunkFiles step) in the jobs table, so a bare
+      # refute_enqueued would false-positive on that leftover.
+      assert Repo.aggregate(embed_batch_jobs(), :count, :id) == embed_jobs_before
+
+      # old chunks (and their cascaded mentions) are gone
+      assert chunk_keys(source, "app.py") == []
+      assert Repo.aggregate(EntityMention, :count, :id) == 0
+    end
+
+    test "a whitespace-only FIRST ingest (no prior chunks) is a harmless no-op", %{
+      source: source
+    } do
+      natural_key = "repo:acme/app:empty.py"
+
+      force_chunk_with_graph(chunk_result([]))
+      raw = seed_raw(source, "   \n  ", natural_key, "empty.py")
+
+      log =
+        capture_log(fn ->
+          assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id})
+        end)
+
+      refute log =~ "reconciled"
+      refute Repo.get(PendingChunk, raw.id)
+      refute_enqueued(worker: EmbedBatch)
+      assert chunk_keys(source, "empty.py") == []
+    end
   end
 end

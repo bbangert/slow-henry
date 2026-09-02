@@ -103,6 +103,7 @@ defmodule Mix.Tasks.Rn.Seed do
     Mix.Task.run("app.config")
 
     Application.put_env(:retrieval_node, :embedding_serving_start, false)
+    Application.put_env(:retrieval_node, :reranking_serving_start, false)
 
     oban_config = Application.get_env(:retrieval_node, Oban, [])
 

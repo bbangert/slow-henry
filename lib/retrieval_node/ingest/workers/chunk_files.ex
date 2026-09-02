@@ -22,8 +22,11 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
       states: [:available, :scheduled, :executing, :retryable, :suspended]
     ]
 
+  require Logger
+
   alias RetrievalNode.Chunking
   alias RetrievalNode.Chunking.{Breadcrumb, HeuristicImpl}
+  alias RetrievalNode.Ingest
   alias RetrievalNode.Ingest.{PendingChunks, Scrubber}
   alias RetrievalNode.Ingest.Workers.EmbedBatch
   alias RetrievalNode.Repo
@@ -89,10 +92,39 @@ defmodule RetrievalNode.Ingest.Workers.ChunkFiles do
     finalize(row, chunks, parse_status, quality_opts, [], [])
   end
 
-  # No chunks (e.g. whitespace-only file) — nothing to embed; just reap the raw row.
+  # No chunks (e.g. a file that changed to whitespace-only) — nothing to embed,
+  # but this file may have had chunks from a PRIOR ingest (and their cascaded
+  # entity_mentions/entity_edges) that are now orphaned: nothing else in the
+  # pipeline ever revisits a file that stops producing chunks entirely (see
+  # UpsertChunks' moduledoc — its own reconciliation only runs when a batch of
+  # NEW chunks arrives). Reconcile this file's identity against an empty
+  # keep-set (deletes every existing chunk row for it) and reap the raw row
+  # atomically, via the same `Ingest.reconcile_file_chunks/5` UpsertChunks
+  # uses — so "delete old chunks" and "reap raw" either both happen or
+  # neither does. A harmless no-op when the file has no prior chunks (first
+  # ingest) or no resolvable identity (see `Ingest.file_identity/2`).
   defp finalize(row, [], _parse_status, _opts, _entities, _references) do
-    reap(row)
-    :ok
+    Ecto.Multi.new()
+    |> Ecto.Multi.run(:reconcile, fn repo, _ ->
+      {:ok, Ingest.reconcile_file_chunks(repo, row.source_id, row.source_type, row.metadata, [])}
+    end)
+    |> Ecto.Multi.run(:reap, fn repo, _ ->
+      {:ok, repo.delete_all(PendingChunks.by_ids([row.id]))}
+    end)
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{reconcile: reconciled}} ->
+        if reconciled > 0 do
+          Logger.info(
+            "chunk_files reconciled #{reconciled} stale chunk row(s) for a whitespace-only file"
+          )
+        end
+
+        :ok
+
+      {:error, _step, reason, _changes} ->
+        {:error, reason}
+    end
   end
 
   defp finalize(row, chunks, parse_status, opts, entities, references) do

@@ -36,11 +36,10 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
       states: [:available, :scheduled, :executing, :retryable, :suspended]
     ]
 
-  import Ecto.Query
-
   require Logger
 
   alias RetrievalNode.Graph
+  alias RetrievalNode.Ingest
   alias RetrievalNode.Ingest.PendingChunks
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.Chunk
@@ -122,26 +121,16 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
   defp insert_batch_size,
     do: Application.get_env(:retrieval_node, :upsert_chunks_batch_size, @insert_batch_size)
 
-  # Per-source-type identity field a stale chunk row is grouped/scoped by —
-  # the same field each Sync worker's own file-level deletion already keys
-  # on: RepoSync.delete_removed/2 -> metadata->>"path", DriveSync.delete_removed/2
-  # -> metadata->>"doc_id". JiraSync has no removal path today, but
-  # metadata->>"issue_key" is a Jira row's equivalent stable per-issue
-  # identity (see JiraSync.raw_row/2). A row whose source_type isn't one of
-  # these three, or whose identity field is missing/blank, is skipped —
-  # reconciliation never guesses an identity to delete against.
-  @identity_metadata_field %{
-    "git_repo" => "path",
-    "drive_folder" => "doc_id",
-    "jira_project" => "issue_key"
-  }
-
   # Deletes, per (source_id, identity) group present in `staged_rows`, every
   # existing `chunks` row for that file whose `chunk_key` this batch did NOT
   # reproduce — see this module's moduledoc for why one batch is always one
   # file's complete new chunk set (grouping below is defense in depth for
   # that assumption, not a reason to trust it blindly: a batch spanning more
   # than one file reconciles each independently rather than cross-deleting).
+  # The actual identity resolution + delete is `Ingest.reconcile_file_chunks/5`
+  # — shared with `Ingest.Workers.ChunkFiles`' zero-chunk (whitespace-only
+  # file) path, which reconciles a single file's identity the same way with
+  # an empty keep-set.
   defp reconcile_stale_chunks(repo, staged_rows) do
     staged_rows
     |> Enum.group_by(&identity_group/1)
@@ -149,46 +138,18 @@ defmodule RetrievalNode.Ingest.Workers.UpsertChunks do
       {nil, _rows}, deleted ->
         deleted
 
-      {{source_id, field, value}, rows}, deleted ->
-        deleted + delete_stale(repo, source_id, field, value, rows)
+      {{source_id, source_type, _value}, rows}, deleted ->
+        keys = Enum.map(rows, & &1.chunk_key)
+        metadata = hd(rows).metadata
+        deleted + Ingest.reconcile_file_chunks(repo, source_id, source_type, metadata, keys)
     end)
   end
 
   defp identity_group(row) do
-    with field when is_binary(field) <- Map.get(@identity_metadata_field, row.source_type),
-         value when is_binary(value) and value != "" <- Map.get(row.metadata || %{}, field) do
-      {row.source_id, field, value}
-    else
-      _ -> nil
+    case Ingest.file_identity(row.source_type, row.metadata) do
+      {_field, value} -> {row.source_id, row.source_type, value}
+      nil -> nil
     end
-  end
-
-  # `metadata->>?` binds the jsonb key as an ordinary text parameter — unlike
-  # a column/table name, `->>`'s right-hand side isn't a SQL identifier, so
-  # one query shape covers all three known identity fields instead of one
-  # hand-written fragment per field name (verified against the generated SQL;
-  # this is not the identifier-interpolation footgun it might look like).
-  #
-  # `chunk_key not in ^keys` compiles to `NOT (chunk_key = ANY($1))` — the
-  # whole key list rides in as ONE array-typed bind parameter, not one bind
-  # per key (confirmed via Ecto.Adapters.SQL.to_sql/3), so this is exempt
-  # from the 65,535-bind-parameter ceiling that makes insert_batches/3 above
-  # batch its insert_all calls: unlike insert_all, `in`/`not in` against a
-  # pinned list never expands into one param per element.
-  defp delete_stale(repo, source_id, field, value, rows) do
-    keys = Enum.map(rows, & &1.chunk_key)
-
-    {count, _} =
-      repo.delete_all(
-        from(c in Chunk,
-          where:
-            c.source_id == ^source_id and
-              fragment("?->>?", c.metadata, ^field) == ^value and
-              c.chunk_key not in ^keys
-        )
-      )
-
-    count
   end
 
   defp to_chunk_entry(row) do

@@ -43,6 +43,8 @@ defmodule RetrievalNode.Graph.EntityEdge do
     |> foreign_key_constraint(:source_entity_id)
     |> foreign_key_constraint(:target_entity_id)
     |> foreign_key_constraint(:chunk_id)
-    |> unique_constraint([:source_entity_id, :target_entity_id, :kind, :chunk_id])
+    |> unique_constraint([:source_entity_id, :target_entity_id, :kind, :chunk_id],
+      name: :entity_edges_source_target_kind_chunk_index
+    )
   end
 end

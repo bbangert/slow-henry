@@ -88,7 +88,22 @@ defmodule RetrievalNode.Graph.SchemaTest do
       end
     end
 
-    test "duplicate (source_entity_id, target_entity_id, kind, chunk_id) on entity_edges raises" do
+    test "duplicate (source_entity_id, target_entity_id, kind, chunk_id) via EntityEdge.changeset/2 surfaces as a changeset error, not Ecto.ConstraintError" do
+      source = source_fixture()
+      chunk = chunk_fixture(source)
+      a = entity_fixture(source)
+      b = entity_fixture(source, %{qualified_name: "PaymentProcessor.charge"})
+
+      attrs = %{source_entity_id: a.id, target_entity_id: b.id, kind: :calls, chunk_id: chunk.id}
+
+      assert {:ok, _edge} = %EntityEdge{} |> EntityEdge.changeset(attrs) |> Repo.insert()
+
+      assert {:error, changeset} = %EntityEdge{} |> EntityEdge.changeset(attrs) |> Repo.insert()
+      refute changeset.valid?
+      assert %{source_entity_id: ["has already been taken"]} = errors_on(changeset)
+    end
+
+    test "duplicate (source_entity_id, target_entity_id, kind, chunk_id) via a raw Repo.insert! (bypassing the changeset) still raises Ecto.ConstraintError" do
       source = source_fixture()
       chunk = chunk_fixture(source)
       a = entity_fixture(source)
