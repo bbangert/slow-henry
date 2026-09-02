@@ -14,8 +14,10 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   ## Deletion is a tombstone claim, not a row delete
 
   `delete_removed/2` never deletes a `file_versions` row — it claims a fresh
-  generation for the deleted path through the exact same `Ingest.claim_file_version/4`
-  compare-and-set `Ingest.Workers.UpsertChunks` claims through, then deletes the
+  generation for the deleted path through `Ingest.tombstone_file/4`, the same
+  helper `Ingest.Workers.DriveSync.delete_removed/2` uses for removed Drive
+  docs, which claims through the exact same `Ingest.claim_file_version/4`
+  compare-and-set `Ingest.Workers.UpsertChunks` claims through and deletes the
   path's `chunks` only if that claim wins (`:claimed`). Deleting the guard row
   instead (the previous design) left a hole: this job advances its watermark
   after enqueueing `ChunkFiles` jobs, not after their downstream `UpsertChunks`
@@ -144,26 +146,17 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   # Each deleted path claims its own fresh generation through the same
   # compare-and-set `Ingest.Workers.UpsertChunks` claims through — see the
   # moduledoc's "Deletion is a tombstone claim" section for why a guard-row
-  # delete is unsafe here. The generation draw and the claim run in one
-  # transaction: `claim_file_version/4` must be called inside the caller's own
-  # transaction (its own @doc), and the draw only needs to happen-before the
-  # claim, not be transactional itself (`next_ingest_generation/1`'s @doc).
+  # delete is unsafe here. `Ingest.tombstone_file/4` runs the draw, the claim,
+  # and the conditional delete inside one transaction (`claim_file_version/4`
+  # must be called inside the caller's own transaction — its own @doc).
   defp delete_one_path(source, path) do
     Repo.transaction(fn ->
-      generation = Ingest.next_ingest_generation(Repo)
-
-      case Ingest.claim_file_version(Repo, source.id, path, generation) do
-        :claimed ->
-          from(c in Chunk,
-            where: c.source_id == ^source.id and fragment("?->>'path'", c.metadata) == ^path
-          )
-          |> Repo.delete_all()
-
-        :stale ->
-          # A newer version's terminal job already claimed a higher generation
-          # for this path — its chunks must stay untouched.
-          :ok
-      end
+      Ingest.tombstone_file(Repo, source.id, path, fn repo ->
+        from(c in Chunk,
+          where: c.source_id == ^source.id and fragment("?->>'path'", c.metadata) == ^path
+        )
+        |> repo.delete_all()
+      end)
     end)
 
     :ok

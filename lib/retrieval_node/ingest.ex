@@ -271,21 +271,52 @@ defmodule RetrievalNode.Ingest do
   end
 
   @doc """
+  SHA-256 hex digest (lowercase) of a file's `identity` — the actual unique
+  key `file_versions` claims against (see `claim_file_version/4` and the
+  `20260902150001_hash_file_version_identity` migration this backfills from).
+  A git path (or any identity) is unbounded text; hashing it down to a fixed
+  64-char digest before it ever reaches a B-tree unique index avoids the
+  ~2.7 KB index-tuple limit that an unbounded `identity` column could exceed
+  — the same failure class as the `entities.qualified_name` incident, where
+  every claim for an over-long identity would fail forever (and the terminal
+  job would retry into discard).
+
+  MUST stay byte-identical to the migration's SQL backfill —
+  `encode(sha256(convert_to(identity, 'UTF8')), 'hex')` — since existing rows'
+  `identity_hash` was computed there, not here; `identity` is UTF-8 text on
+  both sides, so hashing it as UTF-8 bytes here matches (see the
+  `identity_hash/1` test that asserts the two computations agree, via
+  `Repo.query!/2`, for both an ASCII and a non-ASCII identity).
+  """
+  @spec identity_hash(String.t()) :: String.t()
+  def identity_hash(identity) when is_binary(identity) do
+    :crypto.hash(:sha256, identity) |> Base.encode16(case: :lower)
+  end
+
+  @doc """
   Atomically claims `generation` as the current version of file `identity`
   under `source_id` in `file_versions` — the ingest pipeline's single
   serialization point for per-file invariants (see
   `Ingest.Workers.UpsertChunks`, the pipeline's one terminal stage). One
   statement:
 
-      INSERT INTO file_versions (id, source_id, identity, generation, inserted_at, updated_at)
+      INSERT INTO file_versions (id, source_id, identity, identity_hash, generation, inserted_at, updated_at)
       VALUES (...)
-      ON CONFLICT (source_id, identity) DO UPDATE
+      ON CONFLICT (source_id, identity_hash) DO UPDATE
         SET generation = EXCLUDED.generation, updated_at = EXCLUDED.updated_at
         WHERE file_versions.generation < EXCLUDED.generation
       RETURNING id
 
+  The unique/conflict key is `(source_id, identity_hash)`, NOT
+  `(source_id, identity)` — `identity` is unbounded text (an arbitrary git
+  path, Drive doc id, etc.) that could exceed PostgreSQL's ~2.7 KB B-tree
+  index-tuple limit and make every claim for that file fail; `identity_hash`
+  (see `identity_hash/1`) is a fixed-size digest that can't. `identity` is
+  still written on every claim and kept as the human-readable value for
+  inspection — nothing reads it as a uniqueness key.
+
   Postgres takes the conflicting row's lock to evaluate the `ON CONFLICT`
-  clause, so two terminal jobs racing for the same `(source_id, identity)`
+  clause, so two terminal jobs racing for the same `(source_id, identity_hash)`
   serialize right here — the loser blocks on this INSERT until the winner's
   transaction commits, then evaluates the `WHERE` against whatever the
   winner just persisted. Returns `:claimed` (1 row returned) when
@@ -325,6 +356,7 @@ defmodule RetrievalNode.Ingest do
       id: Ecto.UUID.generate(),
       source_id: source_id,
       identity: identity,
+      identity_hash: identity_hash(identity),
       generation: generation,
       inserted_at: now,
       updated_at: now
@@ -333,7 +365,7 @@ defmodule RetrievalNode.Ingest do
     {count, _} =
       repo.insert_all(FileVersion, [entry],
         on_conflict: on_conflict,
-        conflict_target: [:source_id, :identity],
+        conflict_target: [:source_id, :identity_hash],
         returning: [:id]
       )
 
@@ -365,6 +397,46 @@ defmodule RetrievalNode.Ingest do
       repo.query!("SELECT nextval(pg_get_serial_sequence('pending_chunks', 'id'))")
 
     value
+  end
+
+  @doc """
+  Handles one file's removal as a tombstone claim rather than a guard-row
+  delete — the shared protocol behind both `Ingest.Workers.RepoSync.delete_removed/2`
+  and `Ingest.Workers.DriveSync.delete_removed/2` (see the former's moduledoc,
+  "Deletion is a tombstone claim", for why deleting the `file_versions` row
+  outright is unsafe: a still-in-flight pre-deletion terminal job could then
+  mistake the row's absence for "no version has ever claimed this identity"
+  and resurrect the very chunks this deletion just removed).
+
+  Draws a fresh generation (`next_ingest_generation/1`, from the same
+  `pending_chunks.id` sequence a raw row's own generation comes from — see
+  that function's @doc for why that ordering guarantee is what makes this
+  safe) and claims it for `identity` under `source_id` via
+  `claim_file_version/4`. `delete_fun.(repo)` — the caller's own chunk
+  deletion, scoped however that source type identifies a file (a git path, a
+  Drive doc id, ...) — runs ONLY when the claim wins (`:claimed`); a losing
+  claim (`:stale`) means a newer version already committed and this
+  deletion must leave its chunks untouched, exactly like `Ingest.Workers.UpsertChunks`'
+  own stale-claim skip.
+
+  MUST be called inside the caller's own transaction, same requirement as
+  `claim_file_version/4` itself (the row lock the claim takes is only
+  meaningful held across `delete_fun`'s work). Always returns `:ok` — the
+  claimed-vs-stale branch is fully resolved here, so callers never need to
+  inspect it themselves.
+  """
+  @spec tombstone_file(Ecto.Repo.t(), binary(), String.t(), (Ecto.Repo.t() -> any())) :: :ok
+  def tombstone_file(repo, source_id, identity, delete_fun) when is_function(delete_fun, 1) do
+    generation = next_ingest_generation(repo)
+
+    case claim_file_version(repo, source_id, identity, generation) do
+      :claimed -> delete_fun.(repo)
+      # A newer version's terminal job already claimed a higher generation
+      # for this identity — its chunks must stay untouched.
+      :stale -> :ok
+    end
+
+    :ok
   end
 
   # `metadata->>?` binds the jsonb key as an ordinary text parameter — unlike

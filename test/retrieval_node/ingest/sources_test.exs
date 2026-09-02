@@ -2,10 +2,21 @@ defmodule RetrievalNode.Ingest.SourcesTest do
   use RetrievalNode.DataCase, async: false
   use Oban.Testing, repo: RetrievalNode.Repo
 
+  alias RetrievalNode.Ingest
   alias RetrievalNode.Ingest.{Drive, Jira}
-  alias RetrievalNode.Ingest.Workers.{ChunkFiles, DriveSync, JiraSync, RepoSync, SyncScheduler}
+
+  alias RetrievalNode.Ingest.Workers.{
+    ChunkFiles,
+    DriveSync,
+    EmbedBatch,
+    JiraSync,
+    RepoSync,
+    SyncScheduler,
+    UpsertChunks
+  }
+
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source, SyncState}
+  alias RetrievalNode.Retrieval.{Chunk, FileVersion, PendingChunk, Source, SyncState}
 
   describe "Jira client (pure)" do
     test "build_jql adds a resolutiondate watermark clause when present" do
@@ -282,6 +293,162 @@ defmodule RetrievalNode.Ingest.SourcesTest do
       end)
 
       assert {:snooze, 60} = perform_job(DriveSync, %{"source_id" => source.id})
+    end
+
+    test "a removal claims a tombstone at a higher generation and removes the doc's permanent chunks" do
+      source =
+        Repo.insert!(%Source{source_type: :drive_folder, name: "folder", identifier: "root"})
+
+      Repo.insert!(%SyncState{source_id: source.id, cursor: %{"start_page_token" => "tok-0"}})
+
+      Repo.insert!(
+        Chunk.upsert_changeset(%Chunk{}, %{
+          source_id: source.id,
+          source_type: :drive_folder,
+          chunk_key: "old-key",
+          content_hash: "h",
+          content: "old",
+          context_breadcrumb: "Design Doc",
+          metadata: %{"doc_id" => "d1"}
+        })
+      )
+
+      # Simulate a version already having been claimed for d1 too.
+      Repo.insert!(%FileVersion{
+        source_id: source.id,
+        identity: "d1",
+        identity_hash: Ingest.identity_hash("d1"),
+        generation: 1
+      })
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        Req.Test.json(conn, %{
+          "newStartPageToken" => "tok-1",
+          "changes" => [%{"fileId" => "d1", "removed" => true}]
+        })
+      end)
+
+      assert :ok = perform_job(DriveSync, %{"source_id" => source.id})
+
+      assert Repo.aggregate(Chunk, :count, :id) == 0
+
+      # The file_versions row is NEVER deleted — deletion is a tombstone
+      # claim, not a guard-row delete. The claimed generation is strictly
+      # greater than the prior one.
+      tombstone = Repo.get_by!(FileVersion, source_id: source.id, identity: "d1")
+      assert tombstone.generation > 1
+    end
+
+    test "THE HOLE: a delayed pre-deletion UpsertChunks job is stale, not a resurrection" do
+      source =
+        Repo.insert!(%Source{source_type: :drive_folder, name: "folder", identifier: "root"})
+
+      Repo.insert!(%SyncState{source_id: source.id, cursor: %{"start_page_token" => "tok-0"}})
+
+      # v1's raw row is staged and ChunkFiles enqueued, but NOT yet run — an
+      # hours-deep backlog stalls it right here.
+      Req.Test.stub(__MODULE__, fn conn ->
+        if String.ends_with?(conn.request_path, "/export") do
+          Plug.Conn.send_resp(conn, 200, "# Design Doc\n\nv1 body")
+        else
+          Req.Test.json(conn, %{
+            "newStartPageToken" => "tok-1",
+            "changes" => [
+              %{
+                "fileId" => "d1",
+                "file" => %{
+                  "id" => "d1",
+                  "name" => "Design Doc",
+                  "mimeType" => "application/vnd.google-apps.document"
+                }
+              }
+            ]
+          })
+        end
+      end)
+
+      assert :ok = perform_job(DriveSync, %{"source_id" => source.id})
+      raw1 = Repo.one!(from p in PendingChunk, where: p.status == "raw")
+
+      # The doc is removed and re-synced BEFORE v1's pipeline ever runs.
+      Req.Test.stub(__MODULE__, fn conn ->
+        Req.Test.json(conn, %{
+          "newStartPageToken" => "tok-2",
+          "changes" => [%{"fileId" => "d1", "removed" => true}]
+        })
+      end)
+
+      assert :ok = perform_job(DriveSync, %{"source_id" => source.id})
+
+      # The tombstone claim landed for d1, at a generation greater than
+      # raw1's id (same pending_chunks id sequence the deletion drew from).
+      tombstone = Repo.get_by!(FileVersion, source_id: source.id, identity: "d1")
+      assert tombstone.generation > raw1.id
+
+      # v1's stalled pipeline finally runs to completion.
+      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw1.id})
+      ids = Repo.all(from p in PendingChunk, select: p.id)
+      assert :ok = perform_job(EmbedBatch, %{"pending_chunk_ids" => ids})
+      ids = Repo.all(from p in PendingChunk, where: p.id in ^ids, select: p.id)
+      assert :ok = perform_job(UpsertChunks, %{"pending_chunk_ids" => ids})
+
+      # No chunk was resurrected for d1, and staging is fully drained — the
+      # stale claim still cleans up its own staging rows.
+      assert Repo.aggregate(from(c in Chunk, where: c.source_id == ^source.id), :count, :id) == 0
+      assert Repo.aggregate(PendingChunk, :count, :id) == 0
+
+      # The tombstone's generation is untouched by the stale claim.
+      assert Repo.get_by!(FileVersion, source_id: source.id, identity: "d1").generation ==
+               tombstone.generation
+    end
+
+    test "a removal that loses to an already-higher committed generation leaves that version's chunks untouched" do
+      source =
+        Repo.insert!(%Source{source_type: :drive_folder, name: "folder", identifier: "root"})
+
+      Repo.insert!(%SyncState{source_id: source.id, cursor: %{"start_page_token" => "tok-0"}})
+
+      # Simulate a newer version of "newer-doc" that already committed at a
+      # generation higher than anything this deletion's tombstone draw could
+      # produce.
+      future_generation = Ingest.next_ingest_generation(Repo) + 1_000_000
+
+      Repo.insert!(
+        Chunk.upsert_changeset(%Chunk{}, %{
+          source_id: source.id,
+          source_type: :drive_folder,
+          chunk_key: "future-key",
+          content_hash: "h",
+          content: "future content",
+          context_breadcrumb: "Design Doc",
+          metadata: %{"doc_id" => "newer-doc"},
+          ingest_generation: future_generation
+        })
+      )
+
+      Repo.insert!(%FileVersion{
+        source_id: source.id,
+        identity: "newer-doc",
+        identity_hash: Ingest.identity_hash("newer-doc"),
+        generation: future_generation
+      })
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        Req.Test.json(conn, %{
+          "newStartPageToken" => "tok-1",
+          "changes" => [%{"fileId" => "newer-doc", "removed" => true}]
+        })
+      end)
+
+      assert :ok = perform_job(DriveSync, %{"source_id" => source.id})
+
+      # The deletion's claim lost (:stale) — the newer chunk is untouched and
+      # the tombstone's generation is unchanged.
+      assert Repo.aggregate(from(c in Chunk, where: c.chunk_key == "future-key"), :count, :id) ==
+               1
+
+      assert Repo.get_by!(FileVersion, source_id: source.id, identity: "newer-doc").generation ==
+               future_generation
     end
   end
 

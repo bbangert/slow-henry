@@ -1,7 +1,9 @@
 defmodule RetrievalNode.Ingest.Workers.GraphGc do
   @moduledoc """
   Periodic sweep for graph rows stranded by the ingest pipeline's file-deletion
-  paths. Two direct-deletion paths exist today: `RepoSync.delete_removed/2`
+  paths. Two removal paths exist today, both going through the same
+  `Ingest.tombstone_file/4` claim-then-conditionally-delete helper (see
+  `RepoSync`'s moduledoc, "Deletion is a tombstone claim"): `RepoSync.delete_removed/2`
   deletes a removed path's `chunks` by `metadata->>"path"`, and
   `DriveSync.delete_removed/2` deletes a removed Doc's `chunks` by
   `metadata->>"doc_id"` (not a filesystem path — Drive files are identified by

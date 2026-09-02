@@ -5,6 +5,21 @@ defmodule RetrievalNode.Ingest.Workers.DriveSync do
   markdown, staged as a raw `pending_chunks` row, and enqueued for `ChunkFiles`;
   removed/unshared files have their permanent `chunks` pruned. Advances the cursor.
   A 429 returns `{:snooze, seconds}`.
+
+  ## Deletion is a tombstone claim, not a row delete
+
+  `delete_removed/2` mirrors `Ingest.Workers.RepoSync.delete_removed/2` exactly
+  (see that moduledoc's "Deletion is a tombstone claim" section for the full
+  race it closes): each removed doc id claims its own fresh generation via
+  `Ingest.tombstone_file/4` — the same claim-then-conditionally-delete helper
+  RepoSync uses — rather than deleting its `chunks` unconditionally. A
+  still-in-flight pre-deletion `UpsertChunks` job for that doc loses the race
+  (`:stale`) instead of resurrecting the deleted Doc's chunks, and a deletion
+  that runs after a newer version already committed a higher generation loses
+  too, leaving that version's chunks untouched. `file_versions` rows are
+  therefore never deleted for a Drive source's whole lifetime either — a
+  removed doc's row stays as a tombstone recording the highest generation ever
+  claimed for it.
   """
   use Oban.Worker,
     queue: :sync,
@@ -17,6 +32,7 @@ defmodule RetrievalNode.Ingest.Workers.DriveSync do
 
   import Ecto.Query
 
+  alias RetrievalNode.Ingest
   alias RetrievalNode.Ingest.{Drive, PendingChunks}
   alias RetrievalNode.Ingest.Workers.ChunkFiles
   alias RetrievalNode.Repo
@@ -88,11 +104,24 @@ defmodule RetrievalNode.Ingest.Workers.DriveSync do
   defp delete_removed(_source, []), do: :ok
 
   defp delete_removed(source, doc_ids) do
-    # One DELETE with an IN over the extracted JSONB doc_id — not one per removal.
-    from(c in Chunk,
-      where: c.source_id == ^source.id and fragment("?->>'doc_id'", c.metadata) in ^doc_ids
-    )
-    |> Repo.delete_all()
+    Enum.each(doc_ids, &delete_one_doc(source, &1))
+    :ok
+  end
+
+  # Mirrors RepoSync.delete_one_path/2 — each removed doc id claims its own
+  # fresh generation through `Ingest.tombstone_file/4` (draw + claim + the
+  # conditional delete all inside one transaction) rather than an
+  # unconditional delete. See the moduledoc's "Deletion is a tombstone claim"
+  # section.
+  defp delete_one_doc(source, doc_id) do
+    Repo.transaction(fn ->
+      Ingest.tombstone_file(Repo, source.id, doc_id, fn repo ->
+        from(c in Chunk,
+          where: c.source_id == ^source.id and fragment("?->>'doc_id'", c.metadata) == ^doc_id
+        )
+        |> repo.delete_all()
+      end)
+    end)
 
     :ok
   end

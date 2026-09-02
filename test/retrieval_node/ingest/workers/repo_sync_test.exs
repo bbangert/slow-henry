@@ -110,7 +110,12 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     })
 
     # Simulate a version already having been claimed for gone.py too.
-    Repo.insert!(%FileVersion{source_id: ctx.source.id, identity: "gone.py", generation: 1})
+    Repo.insert!(%FileVersion{
+      source_id: ctx.source.id,
+      identity: "gone.py",
+      identity_hash: Ingest.identity_hash("gone.py"),
+      generation: 1
+    })
 
     File.rm!(Path.join(ctx.src, "gone.py"))
     File.write!(Path.join(ctx.src, "keep.py"), "def k(): pass\n")
@@ -231,6 +236,7 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
       Repo.insert!(%FileVersion{
         source_id: ctx.source.id,
         identity: "newer.py",
+        identity_hash: Ingest.identity_hash("newer.py"),
         generation: future_generation
       })
 

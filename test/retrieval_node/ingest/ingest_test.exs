@@ -219,5 +219,34 @@ defmodule RetrievalNode.IngestTest do
 
       assert Repo.aggregate(FileVersion, :count, :id) == 2
     end
+
+    test "a claim with a ~5,000-byte identity succeeds — the failure this replaces", %{
+      source: source
+    } do
+      long_identity = "src/" <> String.duplicate("very-long-directory-name/", 190) <> "file.py"
+      assert byte_size(long_identity) > 4_500
+
+      assert :claimed = Ingest.claim_file_version(Repo, source.id, long_identity, 1)
+
+      assert %FileVersion{generation: 1} =
+               Repo.get_by!(FileVersion, source_id: source.id, identity: long_identity)
+    end
+  end
+
+  describe "identity_hash/1" do
+    test "matches the SQL backfill's encoding for an ASCII identity" do
+      assert_identity_hash_matches_sql("src/app.py")
+    end
+
+    test "matches the SQL backfill's encoding for a non-ASCII identity" do
+      assert_identity_hash_matches_sql("docs/résumé-日本語.md")
+    end
+
+    defp assert_identity_hash_matches_sql(identity) do
+      %Postgrex.Result{rows: [[sql_hash]]} =
+        Repo.query!("SELECT encode(sha256(convert_to($1, 'UTF8')), 'hex')", [identity])
+
+      assert Ingest.identity_hash(identity) == sql_hash
+    end
   end
 end
