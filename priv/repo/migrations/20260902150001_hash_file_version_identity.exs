@@ -13,8 +13,15 @@ defmodule RetrievalNode.Repo.Migrations.HashFileVersionIdentity do
   #
   # Backfills the digest for existing rows in SQL (sha256 over the UTF-8
   # bytes, lowercase hex — the same encoding `Ingest.identity_hash/1` uses),
-  # then swaps the unique index. Reversible: `identity` values are still
-  # unique for every row that exists, so the old index can be recreated.
+  # then swaps the unique index.
+  #
+  # IRREVERSIBLE, deliberately. Two reasons no `down/0` can be honest here:
+  # (1) recreating the old (source_id, identity) unique index would fail as
+  # soon as any identity past the ~2.7 KB index-tuple limit exists — and
+  # accepting those is the whole point of this change; (2) even a bounded
+  # substitute key would not satisfy the pre-migration code's
+  # `ON CONFLICT (source_id, identity)`, which requires that exact unique
+  # index, so a rolled-back schema could not run the old claim anyway.
   def up do
     alter table(:file_versions) do
       add :identity_hash, :string, size: 64, null: true
@@ -34,11 +41,10 @@ defmodule RetrievalNode.Repo.Migrations.HashFileVersionIdentity do
   end
 
   def down do
-    drop unique_index(:file_versions, [:source_id, :identity_hash])
-    create unique_index(:file_versions, [:source_id, :identity])
-
-    alter table(:file_versions) do
-      remove :identity_hash
-    end
+    raise Ecto.MigrationError,
+          "20260902150001_hash_file_version_identity is irreversible: restoring the " <>
+            "unbounded (source_id, identity) unique index fails once any identity exceeds " <>
+            "PostgreSQL's index-tuple limit, and the pre-migration claim code requires exactly " <>
+            "that index for its ON CONFLICT target — roll forward instead"
   end
 end
