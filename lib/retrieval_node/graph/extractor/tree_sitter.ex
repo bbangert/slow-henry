@@ -65,6 +65,12 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   #   :module_like -> :module
   #   :function_like -> :function, UNLESS the immediately-enclosing container
   #                      is :class_like -> :method
+  #   :method_like -> :method, always -- used only for go's method_declaration
+  #                    (see the dedicated handle_definition/7 clause below):
+  #                    a go method is never nested inside its receiver type's
+  #                    AST node, so the :function_like container-based rule
+  #                    above can't fire for it the way it does for every
+  #                    other language's methods.
   @definition_kinds %{
     "python" => %{
       "function_definition" => :function_like,
@@ -143,6 +149,14 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # turns :function_like nested in a :module_like container into :function —
   # same rule that gives rust's mod_item-nested functions :function, not
   # :method). alias/import/use/require are the import forms.
+  #
+  # defimpl is named differently from defmodule/defprotocol (see
+  # handle_elixir_definition/7's dedicated "defimpl" clause and
+  # elixir_defimpl_name/3): its real generated module name is
+  # `<Protocol>.<ForType>` (Elixir protocol semantics), not the first alias
+  # in its argument list alone — reusing the first-alias-only naming that
+  # defmodule/defprotocol get would make every defimpl of the same protocol,
+  # and the defprotocol itself, collapse onto one shared "Sized" entity.
   @elixir_module_forms ~w(defmodule defprotocol defimpl)
   @elixir_function_forms ~w(def defp defmacro defmacrop defguard defguardp)
   @elixir_def_forms @elixir_module_forms ++ @elixir_function_forms
@@ -224,10 +238,98 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   # --- definitions -----------------------------------------------------
 
+  # Go names a method by its receiver type, not by nesting (a
+  # method_declaration is a top-level tree node -- its receiver lives in a
+  # separate `receiver:` field, never inside the receiver type's own AST
+  # node the way a method sits inside a class body in every other
+  # class-like language here). Without this, `func (A) Run()` and `func (B)
+  # Run()` both name an entity bare "Run", colliding into one. Resolving the
+  # receiver type gives `<ReceiverType>.<name>` (:method_like forces entity
+  # kind :method regardless of container_kind -- the usual
+  # function-nested-in-a-class-like-container rule can never fire here,
+  # since go methods are never nested that way). When the receiver shape is
+  # unresolvable (should not happen for valid go, but tree-sitter recovers
+  # from invalid syntax with unexpected shapes), this falls back to the
+  # bare, unqualified :function behavior from before this fix rather than
+  # crashing.
+  defp handle_definition(
+         child,
+         "method_declaration" = kind,
+         source,
+         "go" = language,
+         lang_ctx,
+         state,
+         acc
+       ) do
+    category = Map.fetch!(lang_ctx.def_kinds, kind)
+    name = name_field(child, language, kind, source)
+
+    case name && go_receiver_type_name(child, source) do
+      nil ->
+        handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
+
+      receiver_type ->
+        qualified_name = receiver_type <> "." <> name
+
+        handle_definition_category(
+          child,
+          :method_like,
+          qualified_name,
+          source,
+          language,
+          lang_ctx,
+          state,
+          acc
+        )
+    end
+  end
+
   defp handle_definition(child, kind, source, language, lang_ctx, state, acc) do
     category = Map.fetch!(lang_ctx.def_kinds, kind)
     name = name_field(child, language, kind, source)
     handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
+  end
+
+  # `receiver:` -> `parameter_list` -> exactly one `parameter_declaration`
+  # (go permits no more; empirically verified) whose `type:` field names the
+  # receiver type. That field is either a bare `type_identifier` (`func (a
+  # A) Run()`), a `pointer_type` wrapping one (`func (a *A) Run()` -- its
+  # type_identifier is a plain positional child there, not a field itself,
+  # empirically verified), or a `generic_type` (`func (g Generic[T])
+  # Run()`) whose own `type:` field is the base type_identifier (type
+  # arguments discarded -- qualified by the generic type's base name only).
+  # Any other shape returns nil so the caller falls back to bare naming.
+  defp go_receiver_type_name(method_node, source) do
+    with receiver_node when not is_nil(receiver_node) <-
+           TS.node_child_by_field_name(method_node, "receiver"),
+         [param_decl] <- named_children(receiver_node),
+         type_node when not is_nil(type_node) <- TS.node_child_by_field_name(param_decl, "type") do
+      go_unwrap_receiver_type(type_node, source)
+    else
+      _ -> nil
+    end
+  end
+
+  defp go_unwrap_receiver_type(type_node, source) do
+    case TS.node_kind(type_node) do
+      "type_identifier" ->
+        slice(source, type_node)
+
+      "pointer_type" ->
+        case named_children(type_node) do
+          [inner] -> go_unwrap_receiver_type(inner, source)
+          _ -> nil
+        end
+
+      "generic_type" ->
+        case TS.node_child_by_field_name(type_node, "type") do
+          nil -> nil
+          inner -> go_unwrap_receiver_type(inner, source)
+        end
+
+      _ ->
+        nil
+    end
   end
 
   # Shared by the kind-table-driven languages (handle_definition/7 above) and
@@ -348,6 +450,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp entity_kind_for(:class_like, _container), do: :class
   defp entity_kind_for(:module_like, _container), do: :module
+  defp entity_kind_for(:method_like, _container), do: :method
   defp entity_kind_for(:function_like, :class_like), do: :method
   defp entity_kind_for(:function_like, _container), do: :function
 
@@ -425,6 +528,39 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
+  # defimpl's generated module name (`<Protocol>.<ForType>`, or
+  # `<Protocol>.<EnclosingModule>` for the implicit-for nested form) is
+  # ABSOLUTE — Elixir does not prefix it by whatever module it happens to be
+  # lexically written inside, unlike every other definition form below
+  # (defmodule/defprotocol/def/etc, which nest normally under
+  # `state.scope`). Scope is reset to [] just for this call so
+  # handle_definition_category's `state.scope ++ [name]` join doesn't
+  # double-prepend the enclosing module on top of itself — it's already
+  # folded into `name` via elixir_defimpl_name/3's `state.class_qname`
+  # fallback for the no-`for:` case.
+  defp handle_elixir_definition(
+         child,
+         "defimpl" = _target_text,
+         source,
+         language,
+         lang_ctx,
+         state,
+         acc
+       ) do
+    name = elixir_defimpl_name(child, state, source)
+
+    handle_definition_category(
+      child,
+      :module_like,
+      name,
+      source,
+      language,
+      lang_ctx,
+      %{state | scope: []},
+      acc
+    )
+  end
+
   defp handle_elixir_definition(child, target_text, source, language, lang_ctx, state, acc) do
     category = if target_text in @elixir_module_forms, do: :module_like, else: :function_like
     name = elixir_definition_name(child, category, source)
@@ -457,6 +593,84 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
           [] -> nil
           [first | _] -> elixir_def_name_from(first, source)
         end
+    end
+  end
+
+  # `defimpl Sized, for: BitString do ... end` -> "Sized.BitString", so each
+  # implementation's defs get their own qualified namespace instead of
+  # colliding with the protocol and with every other impl of it.
+  # `elixir_definition_name(call_node, :module_like, source)` above already
+  # resolves the protocol name (first `alias` in `arguments`) — reused here
+  # rather than re-walking the same node. `for:` is found among `keywords`'
+  # pairs by its key text (the keyword token's span always starts "for:",
+  # regardless of surrounding whitespace — empirically verified). Its value
+  # is either a bare `alias` (`for: BitString`) or a `list` of them (`for:
+  # [A, B]`, resolved best-effort to the first — true per-target fanout
+  # would need to emit N separate entity trees from one AST node, deliberately
+  # out of scope here). No `for:` at all is valid only when defimpl is
+  # nested directly inside a defmodule body (Elixir then implicitly targets
+  # the enclosing module) — `state.class_qname` (the nearest enclosing
+  # class-like/module-like qname, tracked by handle_definition_category/8 on
+  # every entry) already names exactly that enclosing module; when unset
+  # (e.g. an unsupported/invalid top-level no-`for:` defimpl) this falls
+  # back to the bare protocol name rather than crashing.
+  defp elixir_defimpl_name(call_node, state, source) do
+    case elixir_arguments_node(call_node) do
+      nil ->
+        nil
+
+      args_node ->
+        protocol_name = elixir_definition_name(call_node, :module_like, source)
+        impl_type_name = elixir_defimpl_for_type(args_node, source) || state.class_qname
+
+        case {protocol_name, impl_type_name} do
+          {nil, _} -> nil
+          {proto, nil} -> proto
+          {proto, type} -> proto <> "." <> type
+        end
+    end
+  end
+
+  defp elixir_defimpl_for_type(args_node, source) do
+    args_node
+    |> named_children()
+    |> Enum.find(&(TS.node_kind(&1) == "keywords"))
+    |> case do
+      nil ->
+        nil
+
+      keywords_node ->
+        keywords_node
+        |> named_children()
+        |> Enum.find_value(&elixir_defimpl_for_pair_value(&1, source))
+    end
+  end
+
+  defp elixir_defimpl_for_pair_value(pair_node, source) do
+    with key_node when not is_nil(key_node) <- TS.node_child_by_field_name(pair_node, "key"),
+         true <- String.starts_with?(slice(source, key_node), "for:"),
+         value_node when not is_nil(value_node) <- TS.node_child_by_field_name(pair_node, "value") do
+      elixir_defimpl_type_name(value_node, source)
+    else
+      _ -> nil
+    end
+  end
+
+  # `for: BitString` -> a bare `alias`. `for: [A, B]` -> a `list` of them,
+  # resolved to the first (see elixir_defimpl_name/3's moduledoc-adjacent
+  # comment above for why full fanout is out of scope).
+  defp elixir_defimpl_type_name(value_node, source) do
+    case TS.node_kind(value_node) do
+      "alias" -> slice(source, value_node)
+      "list" -> elixir_defimpl_list_first_alias(value_node, source)
+      _ -> nil
+    end
+  end
+
+  defp elixir_defimpl_list_first_alias(list_node, source) do
+    case named_children(list_node) do
+      [first | _] -> if TS.node_kind(first) == "alias", do: slice(source, first)
+      [] -> nil
     end
   end
 

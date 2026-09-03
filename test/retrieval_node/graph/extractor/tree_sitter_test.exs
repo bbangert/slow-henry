@@ -189,17 +189,19 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
     }
     """
 
-    test "entities: struct (class-like via nested type_spec name) and top-level functions" do
+    test "entities: struct (class-like via nested type_spec name), receiver-qualified method, top-level function" do
       %{entities: entities} = extract(@src, "go")
 
       assert %{qualified_name: "Point", kind: :class} = find(entities, "Point")
       assert %{qualified_name: "main", kind: :function} = find(entities, "main")
 
-      # Go methods are declared via a receiver, not nested inside their type's
-      # AST node, so the "immediately-enclosing container is class-like"
-      # :method rule never fires for Go: Distance is top-level in the tree and
-      # comes out :function, not :method.
-      assert %{qualified_name: "Distance", kind: :function} = find(entities, "Distance")
+      # Distance is qualified by its receiver type ("Point.Distance", not
+      # bare "Distance") and comes out :method -- resolved from the
+      # receiver's `type:` field, not from AST nesting (a go method is never
+      # nested inside its receiver type's own node the way a method sits
+      # inside a class body in every other class-like language here).
+      assert %{qualified_name: "Point.Distance", kind: :method} = find(entities, "Point.Distance")
+      refute Enum.any?(entities, &(&1.qualified_name == "Distance"))
     end
 
     test "qualified-callee resolution: fmt.Println() -> \"Println\", scoped per call site" do
@@ -207,7 +209,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       calls = Enum.filter(refs, &(&1.kind == :call and &1.name == "Println"))
 
       assert length(calls) == 2
-      assert Enum.any?(calls, &(&1.from == "Distance"))
+      assert Enum.any?(calls, &(&1.from == "Point.Distance"))
       assert Enum.any?(calls, &(&1.from == "main"))
     end
 
@@ -215,6 +217,52 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       %{references: refs} = extract(@src, "go")
 
       assert Enum.any?(refs, &(&1.kind == :import and &1.name == "fmt" and &1.from == nil))
+    end
+
+    test "same-named methods on different receiver types no longer collapse into one entity" do
+      %{entities: entities, references: refs} =
+        extract(
+          """
+          package main
+
+          type A struct{}
+          type B struct{}
+
+          func (a A) Run() {
+          \ta.helper()
+          }
+
+          func (a A) helper() {
+          }
+
+          func (b B) Run() {
+          }
+          """,
+          "go"
+        )
+
+      assert %{qualified_name: "A.Run", kind: :method} = find(entities, "A.Run")
+      assert %{qualified_name: "B.Run", kind: :method} = find(entities, "B.Run")
+
+      assert %{name: "helper", kind: :call, from: "A.Run"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+    end
+
+    test "pointer receiver is unwrapped to its underlying type: func (p *P) Run() -> \"P.Run\"" do
+      %{entities: entities} =
+        extract(
+          """
+          package main
+
+          type P struct{}
+
+          func (p *P) Run() {
+          }
+          """,
+          "go"
+        )
+
+      assert %{qualified_name: "P.Run", kind: :method} = find(entities, "P.Run")
     end
   end
 
@@ -660,6 +708,67 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       %{references: refs} = extract("alias Foo.{Bar, Baz}\n", "elixir")
 
       assert Enum.any?(refs, &(&1.kind == :import and &1.name == "Foo"))
+    end
+
+    test "defimpl is scoped by its for: type: impls don't collapse onto the protocol or each other" do
+      %{entities: entities, references: refs} =
+        extract(
+          """
+          defprotocol Sized do
+            def size(t)
+          end
+
+          defimpl Sized, for: BitString do
+            def size(s), do: byte_size(s)
+          end
+
+          defimpl Sized, for: Map do
+            def size(m), do: map_size(m)
+          end
+          """,
+          "elixir"
+        )
+
+      assert %{qualified_name: "Sized", kind: :module} = find(entities, "Sized")
+
+      assert %{qualified_name: "Sized.BitString", kind: :module} =
+               find(entities, "Sized.BitString")
+
+      assert %{qualified_name: "Sized.Map", kind: :module} = find(entities, "Sized.Map")
+
+      assert %{qualified_name: "Sized.BitString.size", kind: :function} =
+               find(entities, "Sized.BitString.size")
+
+      assert %{qualified_name: "Sized.Map.size", kind: :function} =
+               find(entities, "Sized.Map.size")
+
+      assert %{name: "byte_size", kind: :call, from: "Sized.BitString.size"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "byte_size"))
+    end
+
+    test "defimpl nested directly inside a defmodule (no for:) is scoped to the enclosing module" do
+      %{entities: entities} =
+        extract(
+          """
+          defprotocol Sized do
+            def size(t)
+          end
+
+          defmodule Outer do
+            defimpl Sized do
+              def size(_), do: 1
+            end
+          end
+          """,
+          "elixir"
+        )
+
+      assert %{qualified_name: "Sized.Outer", kind: :module} = find(entities, "Sized.Outer")
+
+      assert %{qualified_name: "Sized.Outer.size", kind: :function} =
+               find(entities, "Sized.Outer.size")
+
+      refute Enum.any?(entities, &(&1.qualified_name == "Outer.Sized"))
     end
   end
 
