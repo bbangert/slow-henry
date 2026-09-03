@@ -770,6 +770,47 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
 
       refute Enum.any?(entities, &(&1.qualified_name == "Outer.Sized"))
     end
+
+    test "defimpl Sized, for: [BitString, Map] fans out to one implementation per listed type" do
+      %{entities: entities, references: refs} =
+        extract(
+          """
+          defprotocol Sized do
+            def size(t)
+          end
+
+          defimpl Sized, for: [BitString, Map] do
+            def size(x), do: helper(x)
+          end
+          """,
+          "elixir"
+        )
+
+      assert %{qualified_name: "Sized.BitString", kind: :module} =
+               find(entities, "Sized.BitString")
+
+      assert %{qualified_name: "Sized.Map", kind: :module} = find(entities, "Sized.Map")
+
+      assert %{qualified_name: "Sized.BitString.size", kind: :function} =
+               find(entities, "Sized.BitString.size")
+
+      assert %{qualified_name: "Sized.Map.size", kind: :function} =
+               find(entities, "Sized.Map.size")
+
+      # The shared defimpl body is walked once per listed type, so the
+      # `helper` call is attributed to BOTH generated implementations, not
+      # just the first (the round-12 bug this fixes silently kept only
+      # Sized.BitString and dropped Sized.Map entirely).
+      assert Enum.any?(
+               refs,
+               &(&1.kind == :call and &1.name == "helper" and &1.from == "Sized.BitString.size")
+             )
+
+      assert Enum.any?(
+               refs,
+               &(&1.kind == :call and &1.name == "helper" and &1.from == "Sized.Map.size")
+             )
+    end
   end
 
   describe "oversized symbols" do

@@ -131,7 +131,9 @@ defmodule RetrievalNode.Graph do
   shorter than a full batch (see `delete_orphaned_batch/1` for why this is
   no longer "deletes fewer than a batch" — the recheck it does can now
   legitimately delete less than it selected). Returns the total number of
-  entities deleted.
+  entities deleted. Raises `ArgumentError` if `:batch_size` is not a positive
+  integer — a non-positive batch never returns fewer candidates than itself,
+  which would otherwise recurse forever on an empty batch.
 
   Each batch selects and deletes inside one transaction, locking candidates
   against a concurrent `UpsertChunks` upsert (queue concurrency 5) landing a
@@ -141,7 +143,26 @@ defmodule RetrievalNode.Graph do
   @spec gc_orphaned_entities(keyword()) :: non_neg_integer()
   def gc_orphaned_entities(opts \\ []) do
     batch_size = Keyword.get(opts, :batch_size, @gc_batch_size)
+    validate_positive_batch_size!(batch_size)
     gc_batches(batch_size, 0)
+  end
+
+  # Shared entry-point guard for every batch_size this module uses to drive a
+  # batching loop, whether it arrives via a caller's opts
+  # (gc_orphaned_entities/1) or via Application config (insert_batch_size/0):
+  # a non-positive value can never advance such a loop correctly. For
+  # gc_batches/2, batch_size <= 0 makes the candidate SELECT's `limit`
+  # return [] every round, so `candidate_count < batch_size` (0 < 0, or
+  # anything < a negative) is always false and the loop recurses on the same
+  # empty batch forever. For insert_all_batched/4's
+  # `Enum.chunk_every(entries, batch_size)`, a non-positive batch_size raises
+  # FunctionClauseError instead of hanging — still worth rejecting here, at
+  # the point the value enters the module, so the failure is a clear
+  # ArgumentError rather than an opaque clause-mismatch deep in Enum.
+  defp validate_positive_batch_size!(n) when is_integer(n) and n > 0, do: :ok
+
+  defp validate_positive_batch_size!(other) do
+    raise ArgumentError, "batch_size must be a positive integer, got: #{inspect(other)}"
   end
 
   defp gc_batches(batch_size, total) do
@@ -1084,8 +1105,11 @@ defmodule RetrievalNode.Graph do
     end)
   end
 
-  defp insert_batch_size,
-    do: Application.get_env(:retrieval_node, :graph_insert_batch_size, @insert_batch_size)
+  defp insert_batch_size do
+    size = Application.get_env(:retrieval_node, :graph_insert_batch_size, @insert_batch_size)
+    validate_positive_batch_size!(size)
+    size
+  end
 
   # Ecto.Enum's dump values are looked up rather than String.to_existing_atom/1
   # (same reasoning as UpsertChunks.to_enum/2): atom interning is load-order

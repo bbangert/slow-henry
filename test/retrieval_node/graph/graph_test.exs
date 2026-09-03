@@ -814,6 +814,41 @@ defmodule RetrievalNode.GraphTest do
     end
   end
 
+  describe "insert_all_batched/4 batch size validation" do
+    # insert_all_batched/4 has no batch_size argument of its own — every
+    # call reads it via insert_batch_size/0's Application config lookup
+    # (:graph_insert_batch_size, defaulting to @insert_batch_size). Nothing
+    # in the public API exposes it as a per-call option the way
+    # gc_orphaned_entities/1 exposes :batch_size, but ops/test config can
+    # still set it to a bad value, and insert_batch_size/0 is the entry
+    # point where that value enters the module — so it gets the same guard.
+    # Without the guard, Enum.chunk_every/2 (what insert_all_batched/4 feeds
+    # the configured size into) raises a bare FunctionClauseError on a
+    # non-positive count rather than hanging — this pins the clearer
+    # ArgumentError instead.
+    test "a non-positive :graph_insert_batch_size raises ArgumentError instead of a bare FunctionClauseError",
+         %{source: source} do
+      Application.put_env(:retrieval_node, :graph_insert_batch_size, 0)
+      on_exit(fn -> Application.delete_env(:retrieval_node, :graph_insert_batch_size) end)
+
+      staged_row = %{
+        source_id: source.id,
+        lang: "python",
+        chunk_key: "irrelevant-chunk-key",
+        natural_key: "nk-batch-size",
+        metadata: %{"path" => "a.py"},
+        graph: %{
+          "entities" => [%{"qualified_name" => "a", "kind" => "function"}],
+          "references" => []
+        }
+      }
+
+      assert_raise ArgumentError, ~r/batch_size/, fn ->
+        Graph.upsert_from_staged(Repo, [staged_row], %{})
+      end
+    end
+  end
+
   describe "gc_orphaned_entities/1" do
     # The lock-and-recheck fix in delete_orphaned_batch/1 (candidate select
     # FOR UPDATE SKIP LOCKED, then a DELETE that rechecks the zero-mention
@@ -916,6 +951,18 @@ defmodule RetrievalNode.GraphTest do
 
       assert Graph.gc_orphaned_entities(batch_size: 1) == 3
       assert Repo.aggregate(Entity, :count, :id) == 0
+    end
+
+    test "batch_size: 0 raises ArgumentError instead of recursing forever on an empty candidate batch" do
+      assert_raise ArgumentError, ~r/batch_size/, fn ->
+        Graph.gc_orphaned_entities(batch_size: 0)
+      end
+    end
+
+    test "batch_size: -5 raises ArgumentError instead of recursing forever" do
+      assert_raise ArgumentError, ~r/batch_size/, fn ->
+        Graph.gc_orphaned_entities(batch_size: -5)
+      end
     end
   end
 

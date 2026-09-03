@@ -152,11 +152,15 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   #
   # defimpl is named differently from defmodule/defprotocol (see
   # handle_elixir_definition/7's dedicated "defimpl" clause and
-  # elixir_defimpl_name/3): its real generated module name is
-  # `<Protocol>.<ForType>` (Elixir protocol semantics), not the first alias
-  # in its argument list alone — reusing the first-alias-only naming that
-  # defmodule/defprotocol get would make every defimpl of the same protocol,
-  # and the defprotocol itself, collapse onto one shared "Sized" entity.
+  # elixir_defimpl_names/3): its real generated module name is
+  # `<Protocol>.<ForType>` (Elixir protocol semantics), not the protocol name
+  # alone — reusing the plain protocol naming that defmodule/defprotocol get
+  # would make every defimpl of the same protocol, and the defprotocol
+  # itself, collapse onto one shared "Sized" entity. `for: [A, B]` names MORE
+  # than one type at once — Elixir generates one full implementation per
+  # listed type — so elixir_defimpl_names/3 returns one `<Protocol>.<ForType>`
+  # per listed alias, and the "defimpl" clause below walks the impl body once
+  # per name.
   @elixir_module_forms ~w(defmodule defprotocol defimpl)
   @elixir_function_forms ~w(def defp defmacro defmacrop defguard defguardp)
   @elixir_def_forms @elixir_module_forms ++ @elixir_function_forms
@@ -533,11 +537,27 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # ABSOLUTE — Elixir does not prefix it by whatever module it happens to be
   # lexically written inside, unlike every other definition form below
   # (defmodule/defprotocol/def/etc, which nest normally under
-  # `state.scope`). Scope is reset to [] just for this call so
+  # `state.scope`). Scope is reset to [] for every pass below so
   # handle_definition_category's `state.scope ++ [name]` join doesn't
   # double-prepend the enclosing module on top of itself — it's already
-  # folded into `name` via elixir_defimpl_name/3's `state.class_qname`
+  # folded into `name` via elixir_defimpl_names/3's `state.class_qname`
   # fallback for the no-`for:` case.
+  #
+  # `for: [A, B]` generates one full implementation PER listed type — real
+  # Elixir semantics, not a fanout approximation — so
+  # elixir_defimpl_names/3 returns one qualified name per target and this
+  # walks `child`'s body once per name, threading `acc` through so each pass
+  # sees the entities/references the previous pass already collected. Each
+  # pass is independent (same defimpl body, different `<Protocol>.<ForType>`
+  # scope), so `Sized.BitString.size` and `Sized.Map.size` both end up
+  # holding their own copy of whatever the shared body defines/references,
+  # same as if the two impls had been written out separately. The cap check
+  # before each pass (mirroring walk_nodes/6's own check before
+  # process_child/6) is what stops the fanout once @max_items is reached,
+  # instead of unconditionally emitting one more full body walk per
+  # remaining listed type. A single-alias `for:`, or no `for:` at all, always
+  # resolves to exactly one name, so this loop runs its body exactly once —
+  # unchanged behavior for those cases.
   defp handle_elixir_definition(
          child,
          "defimpl" = _target_text,
@@ -547,24 +567,60 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
          state,
          acc
        ) do
-    name = elixir_defimpl_name(child, state, source)
+    defimpl_state = %{state | scope: []}
 
-    handle_definition_category(
-      child,
-      :module_like,
-      name,
-      source,
-      language,
-      lang_ctx,
-      %{state | scope: []},
-      acc
-    )
+    case elixir_defimpl_names(child, state, source) do
+      [] ->
+        # Neither a protocol name nor a for:/class_qname target could be
+        # resolved (e.g. malformed arguments) — still walk the body once,
+        # unscoped, same as handle_definition_category's own nil-name branch
+        # does for every other definition kind, instead of silently dropping
+        # whatever the body contains.
+        handle_definition_category(
+          child,
+          :module_like,
+          nil,
+          source,
+          language,
+          lang_ctx,
+          defimpl_state,
+          acc
+        )
+
+      names ->
+        walk_defimpl_names(names, child, source, language, lang_ctx, defimpl_state, acc)
+    end
   end
 
   defp handle_elixir_definition(child, target_text, source, language, lang_ctx, state, acc) do
     category = if target_text in @elixir_module_forms, do: :module_like, else: :function_like
     name = elixir_definition_name(child, category, source)
     handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
+  end
+
+  # One handle_definition_category/8 pass per name in `names` — see the
+  # "defimpl" clause of handle_elixir_definition/7 above for why there can be
+  # more than one. The at_cap? check before each pass mirrors walk_nodes/6's
+  # own check before process_child/6, and is what stops the fanout once
+  # @max_items is hit.
+  defp walk_defimpl_names(names, child, source, language, lang_ctx, defimpl_state, acc) do
+    Enum.reduce_while(names, acc, fn name, acc ->
+      if at_cap?(acc) do
+        {:halt, acc}
+      else
+        {:cont,
+         handle_definition_category(
+           child,
+           :module_like,
+           name,
+           source,
+           language,
+           lang_ctx,
+           defimpl_state,
+           acc
+         )}
+      end
+    end)
   end
 
   defp elixir_definition_name(call_node, :module_like, source) do
@@ -596,82 +652,91 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
-  # `defimpl Sized, for: BitString do ... end` -> "Sized.BitString", so each
+  # `defimpl Sized, for: BitString do ... end` -> ["Sized.BitString"], so each
   # implementation's defs get their own qualified namespace instead of
-  # colliding with the protocol and with every other impl of it.
+  # colliding with the protocol and with every other impl of it. `for: [A,
+  # B]` returns one qualified name PER listed type — `["Sized.A",
+  # "Sized.B"]` — since Elixir generates one full implementation per type
+  # listed there; the caller (handle_elixir_definition/7's "defimpl" clause)
+  # walks the impl body once per returned name.
   # `elixir_definition_name(call_node, :module_like, source)` above already
   # resolves the protocol name (first `alias` in `arguments`) — reused here
   # rather than re-walking the same node. `for:` is found among `keywords`'
   # pairs by its key text (the keyword token's span always starts "for:",
   # regardless of surrounding whitespace — empirically verified). Its value
-  # is either a bare `alias` (`for: BitString`) or a `list` of them (`for:
-  # [A, B]`, resolved best-effort to the first — true per-target fanout
-  # would need to emit N separate entity trees from one AST node, deliberately
-  # out of scope here). No `for:` at all is valid only when defimpl is
-  # nested directly inside a defmodule body (Elixir then implicitly targets
-  # the enclosing module) — `state.class_qname` (the nearest enclosing
-  # class-like/module-like qname, tracked by handle_definition_category/8 on
-  # every entry) already names exactly that enclosing module; when unset
-  # (e.g. an unsupported/invalid top-level no-`for:` defimpl) this falls
-  # back to the bare protocol name rather than crashing.
-  defp elixir_defimpl_name(call_node, state, source) do
-    case elixir_arguments_node(call_node) do
-      nil ->
-        nil
-
-      args_node ->
-        protocol_name = elixir_definition_name(call_node, :module_like, source)
-        impl_type_name = elixir_defimpl_for_type(args_node, source) || state.class_qname
-
-        case {protocol_name, impl_type_name} do
-          {nil, _} -> nil
-          {proto, nil} -> proto
-          {proto, type} -> proto <> "." <> type
-        end
+  # is either a bare `alias` (`for: BitString`, one target) or a `list` of
+  # them (`for: [A, B]`, one target per listed alias). No `for:` at all is
+  # valid only when defimpl is nested directly inside a defmodule body
+  # (Elixir then implicitly targets the enclosing module) — `state.class_qname`
+  # (the nearest enclosing class-like/module-like qname, tracked by
+  # handle_definition_category/8 on every entry) already names exactly that
+  # enclosing module; when unset (e.g. an unsupported/invalid top-level
+  # no-`for:` defimpl) this falls back to the bare protocol name rather than
+  # crashing. Returns `[]` only when even the protocol name itself can't be
+  # resolved (malformed arguments) — the caller still walks the body once,
+  # unscoped, in that case.
+  defp elixir_defimpl_names(call_node, state, source) do
+    with args_node when not is_nil(args_node) <- elixir_arguments_node(call_node),
+         protocol_name when not is_nil(protocol_name) <-
+           elixir_definition_name(call_node, :module_like, source) do
+      elixir_defimpl_target_names(protocol_name, args_node, state.class_qname, source)
+    else
+      nil -> []
     end
   end
 
-  defp elixir_defimpl_for_type(args_node, source) do
+  defp elixir_defimpl_target_names(protocol_name, args_node, class_qname, source) do
+    case elixir_defimpl_for_types(args_node, source) do
+      [] -> elixir_defimpl_fallback_names(protocol_name, class_qname)
+      types -> Enum.map(types, &(protocol_name <> "." <> &1))
+    end
+  end
+
+  defp elixir_defimpl_fallback_names(protocol_name, nil), do: [protocol_name]
+  defp elixir_defimpl_fallback_names(protocol_name, type), do: [protocol_name <> "." <> type]
+
+  defp elixir_defimpl_for_types(args_node, source) do
     args_node
     |> named_children()
     |> Enum.find(&(TS.node_kind(&1) == "keywords"))
     |> case do
       nil ->
-        nil
+        []
 
       keywords_node ->
         keywords_node
         |> named_children()
-        |> Enum.find_value(&elixir_defimpl_for_pair_value(&1, source))
+        |> Enum.find_value([], &elixir_defimpl_for_pair_values(&1, source))
     end
   end
 
-  defp elixir_defimpl_for_pair_value(pair_node, source) do
+  defp elixir_defimpl_for_pair_values(pair_node, source) do
     with key_node when not is_nil(key_node) <- TS.node_child_by_field_name(pair_node, "key"),
          true <- String.starts_with?(slice(source, key_node), "for:"),
          value_node when not is_nil(value_node) <- TS.node_child_by_field_name(pair_node, "value") do
-      elixir_defimpl_type_name(value_node, source)
+      elixir_defimpl_type_names(value_node, source)
     else
       _ -> nil
     end
   end
 
-  # `for: BitString` -> a bare `alias`. `for: [A, B]` -> a `list` of them,
-  # resolved to the first (see elixir_defimpl_name/3's moduledoc-adjacent
-  # comment above for why full fanout is out of scope).
-  defp elixir_defimpl_type_name(value_node, source) do
+  # `for: BitString` -> a bare `alias`, one target type: `[name]`. `for: [A,
+  # B]` -> a `list` of them, ALL returned (see elixir_defimpl_names/3's
+  # comment above for how the caller turns each into its own
+  # `<Protocol>.<ForType>` pass instead of collapsing to one).
+  defp elixir_defimpl_type_names(value_node, source) do
     case TS.node_kind(value_node) do
-      "alias" -> slice(source, value_node)
-      "list" -> elixir_defimpl_list_first_alias(value_node, source)
-      _ -> nil
+      "alias" -> [slice(source, value_node)]
+      "list" -> elixir_defimpl_list_alias_names(value_node, source)
+      _ -> []
     end
   end
 
-  defp elixir_defimpl_list_first_alias(list_node, source) do
-    case named_children(list_node) do
-      [first | _] -> if TS.node_kind(first) == "alias", do: slice(source, first)
-      [] -> nil
-    end
+  defp elixir_defimpl_list_alias_names(list_node, source) do
+    list_node
+    |> named_children()
+    |> Enum.filter(&(TS.node_kind(&1) == "alias"))
+    |> Enum.map(&slice(source, &1))
   end
 
   # `arguments` (like `do_block`) is a plain positional child in this
