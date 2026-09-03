@@ -102,6 +102,28 @@ defmodule RetrievalNode.Search do
       end)
       |> Enum.unzip()
 
+    score_and_rank(query_text, rows, contents, top_k)
+  end
+
+  # Public (not `defp`) and @doc false purely so SearchTest can exercise the
+  # empty-candidates guard directly — the scenario it guards (every
+  # candidate's content row vanishing between the HybridQuery read in
+  # hybrid_search/2 and the content fetch in rerank_hits/3 above) isn't
+  # cleanly reproducible through the public API without racing a delete
+  # against this function's own Repo call. Not part of this context's public
+  # API.
+  #
+  # `rows` and `contents` are always the same length here (built together by
+  # rerank_hits/3's Enum.unzip), so an empty `contents` means every candidate
+  # was dropped. The real NxServingImpl backing Reranking.rerank_scores/2
+  # forwards its passages list straight to Nx.Serving.batched_run, which
+  # raises on an empty batch — so this returns before calling it rather than
+  # handing it `[]`.
+  @doc false
+  @spec score_and_rank(String.t(), [map()], [String.t()], pos_integer()) :: [hit]
+  def score_and_rank(_query_text, _rows, [] = _contents, _top_k), do: []
+
+  def score_and_rank(query_text, rows, contents, top_k) do
     scores = Reranking.rerank_scores(query_text, contents)
 
     rows

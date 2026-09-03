@@ -86,6 +86,20 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       "function_declaration" => :function_like,
       "generator_function_declaration" => :function_like,
       "method_definition" => :function_like,
+      # Interface members (`interface Shape { area(): number }`) parse as
+      # their own node kind, distinct from `method_definition` (a concrete
+      # class body method) -- `method_signature` has a "name" field and,
+      # nested directly inside `interface_declaration` (already :class_like
+      # above), comes out :method via the usual
+      # function-nested-in-class-like rule. `abstract_method_signature`
+      # (an abstract class's unimplemented member, e.g. `abstract area():
+      # number;`) is added alongside it for the same reason, though its
+      # enclosing node kind is `abstract_class_declaration`, which this table
+      # does not list as :class_like -- an abstract method therefore still
+      # surfaces as a bare, unscoped :function rather than `<Class>.<method>`
+      # until that container is tracked too; deliberately out of scope here.
+      "method_signature" => :function_like,
+      "abstract_method_signature" => :function_like,
       "class_declaration" => :class_like,
       "interface_declaration" => :class_like,
       "type_alias_declaration" => :class_like,
@@ -288,10 +302,126 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
+  # Go's `type_declaration` covers both `type Foo struct{}` (one `type_spec`
+  # child) and a grouped `type ( A struct{}; B struct{} )` block (several
+  # `type_spec` children directly under the same `type_declaration` -- the
+  # parens are pure syntax, with no wrapping AST node of their own;
+  # empirically verified). Treating the whole `type_declaration` as ONE
+  # entity (the pre-fix behavior, via `name_field/4`'s dedicated
+  # "type_declaration" clause finding only the FIRST type_spec) silently
+  # dropped every additional grouped type after the first: their subtrees
+  # still got walked, but folded under the first spec's scope instead of
+  # becoming their own entities. Each `type_spec` now gets its own
+  # `handle_definition_category/8` pass -- scoped under the `type_spec`
+  # node itself, not the shared `type_declaration`, so each spec's own
+  # subtree (its `type:` field) is what gets walked as that entity's body.
+  # A single `type Foo struct{}` has exactly one type_spec, so this loop
+  # runs its body exactly once -- unchanged behavior for that case.
+  defp handle_definition(
+         child,
+         "type_declaration" = kind,
+         source,
+         "go" = language,
+         lang_ctx,
+         state,
+         acc
+       ) do
+    category = Map.fetch!(lang_ctx.def_kinds, kind)
+
+    child
+    |> named_children()
+    |> Enum.filter(&(TS.node_kind(&1) == "type_spec"))
+    |> Enum.reduce_while(acc, fn spec, acc ->
+      if at_cap?(acc) do
+        {:halt, acc}
+      else
+        name = name_field(spec, language, "type_spec", source)
+
+        {:cont,
+         handle_definition_category(spec, category, name, source, language, lang_ctx, state, acc)}
+      end
+    end)
+  end
+
+  # Rust's `impl_item` covers both an inherent impl (`impl Foo { ... }`, no
+  # "trait:" field -- `name_field/4`'s dedicated "impl_item" clause below
+  # already names this bare `<Type>` correctly) and a trait impl (`impl
+  # Display for Foo { fn fmt ... }`, "trait:" field present). Two different
+  # traits impl'd for the same type both defining same-named methods (`impl
+  # Display for Foo { fn fmt }` and `impl Debug for Foo { fn fmt }`) used to
+  # collide on one bare "Foo" entity, both producing "Foo.fmt". When a
+  # "trait:" field is present, the entity (and everything nested under it,
+  # e.g. its methods) is scoped `<Type>.<Trait>` instead -- disambiguating
+  # same-named trait methods across different traits without needing full
+  # type resolution. `rust_trait_name/2` resolves the trait field's rightmost
+  # type identifier for the generic (`impl<T> From<T> for Foo<T>` ->
+  # "From") and path (`impl std::fmt::Display for Foo` -> "Display") shapes,
+  # in addition to the plain `impl Display for Foo` case.
+  defp handle_definition(
+         child,
+         "impl_item" = kind,
+         source,
+         "rust" = language,
+         lang_ctx,
+         state,
+         acc
+       ) do
+    category = Map.fetch!(lang_ctx.def_kinds, kind)
+    type_name = name_field(child, language, kind, source)
+
+    name =
+      case type_name && TS.node_child_by_field_name(child, "trait") do
+        nil ->
+          type_name
+
+        trait_node ->
+          case rust_trait_name(trait_node, source) do
+            nil -> type_name
+            trait_name -> type_name <> "." <> trait_name
+          end
+      end
+
+    handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
+  end
+
   defp handle_definition(child, kind, source, language, lang_ctx, state, acc) do
     category = Map.fetch!(lang_ctx.def_kinds, kind)
     name = name_field(child, language, kind, source)
     handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
+  end
+
+  # Resolves a rust `impl_item`'s "trait:" field to the trait's own bare
+  # name -- the rightmost type identifier, regardless of how the trait path
+  # is written. A plain trait reference IS the type_identifier already
+  # (`Display`). A generic trait reference (`From<T>`) is a `generic_type`
+  # wrapping a "type:" field, recursed into (drops the type arguments,
+  # qualified by the trait's base name only -- same convention as
+  # `go_unwrap_receiver_type/2`'s generic-receiver handling). A
+  # module-qualified trait reference (`std::fmt::Display`) is a
+  # `scoped_type_identifier` whose "name:" field is already the rightmost
+  # segment directly, no recursion needed. All three shapes empirically
+  # verified. Any other/unresolvable shape returns nil so the caller falls
+  # back to the bare `<Type>` scope rather than crashing.
+  defp rust_trait_name(trait_node, source) do
+    case TS.node_kind(trait_node) do
+      "type_identifier" ->
+        slice(source, trait_node)
+
+      "generic_type" ->
+        case TS.node_child_by_field_name(trait_node, "type") do
+          nil -> nil
+          inner -> rust_trait_name(inner, source)
+        end
+
+      "scoped_type_identifier" ->
+        case TS.node_child_by_field_name(trait_node, "name") do
+          nil -> nil
+          name_node -> slice(source, name_node)
+        end
+
+      _ ->
+        nil
+    end
   end
 
   # `receiver:` -> `parameter_list` -> exactly one `parameter_declaration`
@@ -1118,10 +1248,40 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     |> Enum.reject(&is_nil/1)
   end
 
+  # Rust's `use_declaration` "argument:" field is one of (empirically
+  # verified, all under one `use_declaration`):
+  #   * `identifier` / `scoped_identifier` -- a single plain path
+  #     (`use std::collections::HashMap;`). `scoped_identifier`'s own source
+  #     text already IS the full dotted path (its "path:"/"name:" fields
+  #     nest recursively but are never decomposed here) -- sliced whole, same
+  #     as before this fix.
+  #   * `use_list` / `scoped_use_list` -- a path prefix plus a brace-list of
+  #     items (`use std::{fs, io};`), each item recursively any of these same
+  #     shapes (`use std::{fs::File, io::{self, Read}}` nests a
+  #     `scoped_use_list` inside the outer `use_list`). One concrete path is
+  #     emitted per leaf item instead of the old single-ref-for-the-whole-tree
+  #     best effort.
+  #   * `use_as_clause` -- an alias (`use std::io::Result as IoResult;`,
+  #     "path:"/"alias:" fields) -- the ORIGINAL "path:" is emitted, the
+  #     alias is discarded, consistent with every other language's aliased-
+  #     import handling in this module.
+  #   * `use_wildcard` -- a glob (`use std::io::*;`, one positional child, no
+  #     field name) -- the prefix path is emitted (`std::io`), not the glob
+  #     itself.
+  #   * bare `self` -- inside a list, refers to the enclosing prefix itself
+  #     (`io::{self, Read}` imports `io` via the first item), not a literal
+  #     "self" segment.
+  # `rust_use_paths/3` walks this recursively, threading the accumulated
+  # prefix down; every language-specific line above traces back to one of
+  # its clauses.
   defp import_refs(node, source, "rust") do
     case TS.node_child_by_field_name(node, "argument") do
-      nil -> []
-      arg_node -> [{slice(source, arg_node), line(node)}]
+      nil ->
+        []
+
+      arg_node ->
+        ln = line(node)
+        arg_node |> rust_use_paths(nil, source) |> Enum.map(&{&1, ln})
     end
   end
 
@@ -1138,6 +1298,67 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp import_refs(_node, _source, _language), do: []
+
+  defp rust_use_paths(node, prefix, source) do
+    case TS.node_kind(node) do
+      "use_list" -> rust_use_list_paths(node, prefix, source)
+      "scoped_use_list" -> rust_scoped_use_list_paths(node, prefix, source)
+      "use_as_clause" -> rust_use_as_clause_paths(node, prefix, source)
+      "use_wildcard" -> rust_use_wildcard_paths(node, prefix, source)
+      _ -> [rust_use_path_text(node, prefix, source)]
+    end
+  end
+
+  defp rust_use_list_paths(node, prefix, source) do
+    node |> named_children() |> Enum.flat_map(&rust_use_paths(&1, prefix, source))
+  end
+
+  defp rust_scoped_use_list_paths(node, prefix, source) do
+    path_node = TS.node_child_by_field_name(node, "path")
+    list_node = TS.node_child_by_field_name(node, "list")
+
+    if path_node && list_node do
+      rust_use_paths(list_node, rust_use_path_text(path_node, prefix, source), source)
+    else
+      []
+    end
+  end
+
+  defp rust_use_as_clause_paths(node, prefix, source) do
+    case TS.node_child_by_field_name(node, "path") do
+      nil -> []
+      path_node -> rust_use_paths(path_node, prefix, source)
+    end
+  end
+
+  # `use_wildcard` always wraps exactly one child in valid rust (a path, or
+  # bare `self` meaning "the accumulated prefix", per `rust_use_path_text/3`
+  # below) -- the `_` branch is a defensive fallback for a shape that should
+  # not happen but which tree-sitter's error recovery could still produce.
+  # `List.wrap/1` turns a resolved prefix into a single-element list, or a
+  # nil prefix (no path to fall back to) into `[]` rather than crashing.
+  defp rust_use_wildcard_paths(node, prefix, source) do
+    case named_children(node) do
+      [inner] -> [rust_use_path_text(inner, prefix, source)]
+      _ -> List.wrap(prefix)
+    end
+  end
+
+  # Resolves one path-shaped node (identifier / scoped_identifier / bare
+  # `self`) to concrete text, joined onto the accumulated `prefix` with
+  # "::". Bare `self` means "the prefix itself" (`io::{self, ...}` imports
+  # `io`), not the literal text "self" -- falls back to the literal only when
+  # there is no accumulated prefix to substitute (an unqualified top-level
+  # `self`, not reachable from valid rust `use` syntax but handled rather
+  # than crashing).
+  defp rust_use_path_text(node, prefix, source) do
+    if TS.node_kind(node) == "self" do
+      prefix || "self"
+    else
+      text = slice(source, node)
+      if prefix, do: prefix <> "::" <> text, else: text
+    end
+  end
 
   # `import_statement`'s optional `import_clause` holds, in source order: a
   # bare default identifier (no field name), then either `named_imports`
@@ -1266,16 +1487,13 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   # Go's `type_declaration` (the chunk-boundary kind wrapping struct/interface/
   # alias decls) has no "name" field of its own — empirically the name lives
-  # one level down, on its `type_spec` child. Rust's `impl_item` likewise has
-  # no "name" field; the closest analog is the "type" field (the type being
-  # impl'd). Every other definition kind exposes "name" directly.
-  defp name_field(node, "go", "type_declaration", source) do
-    case Enum.find(named_children(node), &(TS.node_kind(&1) == "type_spec")) do
-      nil -> nil
-      spec -> name_field(spec, "go", "type_spec", source)
-    end
-  end
-
+  # one level down, on its `type_spec` child(ren); the dedicated
+  # handle_definition/7 clause above calls this with each `type_spec`
+  # directly (kind "type_spec"), which falls through to the generic clause
+  # below since a type_spec's own "name" field is directly reachable. Rust's
+  # `impl_item` likewise has no "name" field; the closest analog is the
+  # "type" field (the type being impl'd). Every other definition kind
+  # exposes "name" directly.
   defp name_field(node, "rust", "impl_item", source) do
     case TS.node_child_by_field_name(node, "type") do
       nil -> nil

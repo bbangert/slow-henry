@@ -21,6 +21,7 @@ defmodule RetrievalNode.Bench.RerankEval do
   alias RetrievalNode.Reranking
   alias RetrievalNode.Reranking.{NxServingImpl, Serving}
   alias RetrievalNode.Search
+  alias RetrievalNode.Search.HybridQuery
 
   @default_queries_path "priv/bench/queries.jsonl"
   @modes [false, true]
@@ -33,7 +34,14 @@ defmodule RetrievalNode.Bench.RerankEval do
     * `:queries_path` — JSONL query file (default `#{@default_queries_path}`,
       the same shared query set `mix rn.bench` uses)
     * `:top_k` — result count for `Search.hybrid_search/2` and the MRR/Hit@k
-      cutoff (default 10)
+      cutoff (default 10). Normalized once via `HybridQuery.clamp_top_k/1`
+      before either mode runs, and the NORMALIZED value (not the raw option)
+      is what `:top_k` in the returned result reports — both modes are
+      measured at the same clamped cutoff, so the report describes what was
+      actually run (a caller-supplied 0 measures at the clamp's default 20,
+      not "0"; a caller-supplied 1_000 measures at the clamp's max 100, not
+      "1000" — either raw value in the report would misdescribe Hit@5 in
+      particular).
 
   Returns `{:ok, result}` or `{:skipped, reason}` — never raises for an unmet
   precondition (empty corpus, unwarmed embedding serving, unwarmed reranking
@@ -42,7 +50,7 @@ defmodule RetrievalNode.Bench.RerankEval do
   @spec run(keyword()) :: section
   def run(opts \\ []) do
     queries_path = Keyword.get(opts, :queries_path, @default_queries_path)
-    top_k = Keyword.get(opts, :top_k, 10)
+    top_k = opts |> Keyword.get(:top_k, 10) |> HybridQuery.clamp_top_k()
 
     cond do
       not Runner.corpus_seeded?() ->

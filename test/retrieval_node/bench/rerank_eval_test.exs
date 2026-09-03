@@ -106,5 +106,19 @@ defmodule RetrievalNode.Bench.RerankEvalTest do
       assert {:skipped, reason} = RerankEval.run(queries_path: path)
       assert reason =~ "corpus not seeded"
     end
+
+    test "top_k is normalized once via HybridQuery.clamp_top_k/1 and the NORMALIZED value is reported" do
+      source = source_fixture("repo-b")
+      _chunk = chunk_fixture(source, repo: "repo-b")
+      path = write_queries!([%{"query" => "q", "relevant" => [%{"repo" => "repo-b"}]}])
+
+      # Above the clamp's max (100) -> reported as the clamped max, not the
+      # raw 1_000 that was passed in.
+      assert {:ok, %{top_k: 100}} = RerankEval.run(queries_path: path, top_k: 1_000)
+
+      # Not a positive integer -> clamp_top_k/1 falls back to its own
+      # default (20), not RerankEval's own default (10) and not "0".
+      assert {:ok, %{top_k: 20}} = RerankEval.run(queries_path: path, top_k: 0)
+    end
   end
 end

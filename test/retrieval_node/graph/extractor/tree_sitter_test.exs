@@ -264,6 +264,28 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
 
       assert %{qualified_name: "P.Run", kind: :method} = find(entities, "P.Run")
     end
+
+    test "grouped type declaration: each type_spec is its own entity, not just the first" do
+      %{entities: entities} =
+        extract(
+          """
+          package main
+
+          type (
+          \tA struct{}
+          \tB struct{}
+          )
+
+          func (b B) Run() {
+          }
+          """,
+          "go"
+        )
+
+      assert %{qualified_name: "A", kind: :class} = find(entities, "A")
+      assert %{qualified_name: "B", kind: :class} = find(entities, "B")
+      assert %{qualified_name: "B.Run", kind: :method} = find(entities, "B.Run")
+    end
   end
 
   describe "ruby" do
@@ -432,6 +454,12 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       %{entities: entities} = extract(@src, "typescript")
 
       assert %{qualified_name: "Shape", kind: :class} = find(entities, "Shape")
+
+      # An interface member (`method_signature`) is a definition node too --
+      # nested directly inside the class-like interface, it comes out
+      # :method via the same rule a concrete class method does.
+      assert %{qualified_name: "Shape.area", kind: :method} = find(entities, "Shape.area")
+
       assert %{qualified_name: "Circle", kind: :class} = find(entities, "Circle")
       assert %{qualified_name: "Circle.area", kind: :method} = find(entities, "Circle.area")
       assert %{qualified_name: "Circle.helper", kind: :method} = find(entities, "Circle.helper")
@@ -531,7 +559,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
                Enum.find(refs, &(&1.kind == :call and &1.name == "helper_fn"))
     end
 
-    test "import: use_declaration argument text" do
+    test "import: use_declaration argument text (plain path)" do
       %{references: refs} = extract(@src, "rust")
 
       assert Enum.any?(
@@ -539,6 +567,75 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
                &(&1.kind == :import and &1.name == "std::collections::HashMap" and
                    &1.from == nil)
              )
+    end
+
+    test "import: use-list emits one ref per concrete path, including deeply nested groups" do
+      %{references: refs} = extract("use std::{fs::File, io::{self, Read}};\n", "rust")
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert "std::fs::File" in names
+      # bare `self` inside a nested list resolves to the prefix itself, not
+      # a literal "self" segment
+      assert "std::io" in names
+      assert "std::io::Read" in names
+      assert length(names) == 3
+    end
+
+    test "import: use-as-clause records the ORIGINAL path, not the alias" do
+      %{references: refs} = extract("use std::io::Result as IoResult;\n", "rust")
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert names == ["std::io::Result"]
+      refute "IoResult" in names
+    end
+
+    test "import: use-wildcard records the prefix path, not the glob" do
+      %{references: refs} = extract("use std::io::*;\n", "rust")
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert names == ["std::io"]
+    end
+
+    test "trait impls are scoped <Type>.<Trait>: same-named methods on different traits no longer collapse" do
+      %{entities: entities, references: refs} =
+        extract(
+          """
+          struct Foo;
+
+          impl std::fmt::Display for Foo {
+              fn fmt(&self) {
+                  self.helper()
+              }
+          }
+
+          impl Debug for Foo {
+              fn fmt(&self) {}
+          }
+
+          impl Foo {
+              fn helper(&self) {}
+          }
+          """,
+          "rust"
+        )
+
+      # path trait (`std::fmt::Display`) resolves to its rightmost segment
+      assert %{qualified_name: "Foo.Display", kind: :class} = find(entities, "Foo.Display")
+
+      assert %{qualified_name: "Foo.Display.fmt", kind: :method} =
+               find(entities, "Foo.Display.fmt")
+
+      assert %{qualified_name: "Foo.Debug", kind: :class} = find(entities, "Foo.Debug")
+      assert %{qualified_name: "Foo.Debug.fmt", kind: :method} = find(entities, "Foo.Debug.fmt")
+
+      refute Enum.any?(entities, &(&1.qualified_name == "Foo.fmt"))
+
+      # the inherent impl (no trait: field) keeps the bare <Type> scope
+      assert %{qualified_name: "Foo", kind: :class} = find(entities, "Foo")
+      assert %{qualified_name: "Foo.helper", kind: :method} = find(entities, "Foo.helper")
+
+      assert %{name: "Foo.Display.helper", kind: :call, from: "Foo.Display.fmt"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "Foo.Display.helper"))
     end
   end
 

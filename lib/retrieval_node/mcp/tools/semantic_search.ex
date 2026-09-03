@@ -5,9 +5,10 @@ defmodule RetrievalNode.MCP.Tools.SemanticSearch do
   score}` — **not** full content; expand a hit with `get_file`.
 
   Optional `rerank: true` reranks the top RRF candidates with a cross-encoder
-  for higher precision at the cost of latency (off by default). When active,
-  each result also carries `fused_score` — the original RRF score — alongside
-  the rerank `score`, for comparing the two ranking modes.
+  (experimental; adds latency and is off by default — the corpus relevance
+  eval found no measurable gain over plain RRF fusion). When active, each
+  result also carries `fused_score` — the original RRF score — alongside the
+  rerank `score`, for comparing the two ranking modes.
 
   Optional `graph: true` fuses a third ranking leg that matches the query's
   significant terms against code-graph entities (functions/classes/modules
@@ -31,7 +32,8 @@ defmodule RetrievalNode.MCP.Tools.SemanticSearch do
 
     field(:rerank, :boolean,
       description:
-        "Rerank top candidates with a cross-encoder for higher precision (slower; default off)"
+        "Experimental: rerank top candidates with a cross-encoder (adds latency; the corpus " <>
+          "eval showed no relevance gain over plain search; default off)"
     )
 
     field(:graph, :boolean,
