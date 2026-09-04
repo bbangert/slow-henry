@@ -1,14 +1,30 @@
 defmodule RetrievalNode.Ingest.Workers.RepoSync do
   @moduledoc """
-  Watermark-driven "discover work" job for a git source. Ensures the bare mirror is
-  current, takes the `diff --raw` (`changed_entries`) between the stored
-  `last_sha` and `HEAD`, then for each added/modified file inserts a raw
-  `pending_chunks` row and enqueues a `ChunkFiles` job; files the diff marks
-  **deleted** have their permanent `chunks` removed. Deletion is decided by the diff
-  status, not by whether `show` can read the blob, so an unreadable-but-present file
-  is skipped rather than wrongly pruned. The watermark is advanced last (only after
-  enqueues succeed), so a crash re-discovers the same work (the `ChunkFiles`/
-  `UpsertChunks` idempotency makes re-processing harmless).
+  Watermark-driven "discover work" job for a git source. Append-only: ensures
+  the bare mirror is current, takes the `diff --raw` (`changed_entries`)
+  between the stored `last_sha` and `HEAD`, and stages one `pending_chunks`
+  row per changed file — a content row for an added/modified path, a
+  **deletion entry** (`status: "deleted"`, no content) for a removed one.
+  This job never touches `chunks`: `Ingest.SourceOwner` is the only process
+  that does, and it applies these rows in arrival order (see its moduledoc).
+
+  A present file whose new content is binary (`Chunking.binary_content?/1`)
+  also stages a deletion entry, keyed on the same identity, instead of a
+  content row — `PendingChunks.insert_raw_all/1`'s own binary guard would
+  otherwise silently drop it, leaving any previously-indexed chunks for that
+  file stuck in the index forever. A deletion entry reconciles them away when
+  the owner applies it (a never-indexed binary file then reconciles zero
+  rows — harmless).
+
+  Staging the rows and advancing the watermark happen in ONE `Repo.transaction`
+  — a plain write (`SyncState.changeset`), not a compare-and-set: this job's
+  own `unique` window makes it the sole writer of its source's cursor, so
+  nothing else could have changed it out from under a stale read. After
+  commit, `Ingest.SourceOwner.notify/1` wakes (or starts) the owner that
+  actually applies the batch. Even when `HEAD` is unchanged (`new_sha ==
+  last_sha`), `notify/1` still fires — cheap, and it's what lets a previously
+  failure-marked row get another look on every cron tick without this job
+  needing to know anything about failure state.
 
   Two edge cases short-circuit before any staging happens:
 
@@ -32,13 +48,12 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
       states: [:available, :scheduled, :executing, :retryable, :suspended]
     ]
 
-  import Ecto.Query
   require Logger
 
-  alias RetrievalNode.Ingest.{GitMirror, PendingChunks}
-  alias RetrievalNode.Ingest.Workers.ChunkFiles
+  alias RetrievalNode.Chunking
+  alias RetrievalNode.Ingest.{GitMirror, PendingChunks, SourceOwner}
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.{Chunk, Source, SyncState}
+  alias RetrievalNode.Retrieval.{Source, SyncState}
 
   @lang_by_ext %{
     "py" => "python",
@@ -62,6 +77,7 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
     with {:ok, _path} <- GitMirror.ensure_mirror(slug, source.identifier),
          {:ok, new_sha} <- GitMirror.head_sha(slug) do
       if new_sha == last_sha do
+        SourceOwner.notify(source.id)
         :ok
       else
         sync_changes(source, slug, last_sha, new_sha, sync_state)
@@ -83,53 +99,63 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
       # never mistaken for a deletion and pruned.
       {deleted, present} = Enum.split_with(entries, fn {status, _} -> status == :deleted end)
 
-      delete_removed(source, Enum.map(deleted, &elem(&1, 1)))
+      deletion_rows =
+        Enum.map(deleted, fn {_status, path} -> deletion_row(source, slug, path) end)
 
-      with :ok <- enqueue_changed(source, slug, Enum.map(present, &elem(&1, 1)), new_sha) do
-        advance_watermark(sync_state, new_sha)
-        :ok
+      with {:ok, content_rows} <-
+             build_rows(source, slug, Enum.map(present, &elem(&1, 1)), new_sha) do
+        stage_and_advance(source, sync_state, new_sha, deletion_rows ++ content_rows)
       end
     end
   end
 
-  defp delete_removed(_source, []), do: :ok
+  defp deletion_row(source, slug, path) do
+    %{
+      source: "git",
+      source_id: source.id,
+      source_type: "git_repo",
+      repo: slug,
+      natural_key: "repo:#{source.id}:#{path}",
+      metadata: %{"path" => path},
+      status: "deleted"
+    }
+  end
 
-  defp delete_removed(source, paths) do
-    # One DELETE with an IN over the extracted JSONB path — not one query per path.
-    from(c in Chunk,
-      where: c.source_id == ^source.id and fragment("?->>'path'", c.metadata) in ^paths
-    )
-    |> Repo.delete_all()
+  # Stages this batch's rows AND advances the watermark to new_sha in ONE
+  # transaction — insert_raw_all/1's own transaction nests inside (joins)
+  # this one, so the whole thing is atomic: either every row this sync
+  # discovered is durable AND the cursor reflects it, or (on any error)
+  # neither happened and the next cron tick re-discovers the same diff.
+  defp stage_and_advance(source, sync_state, new_sha, rows) do
+    {:ok, :ok} =
+      Repo.transaction(
+        fn ->
+          if rows != [], do: PendingChunks.insert_raw_all(rows)
+          advance_watermark!(sync_state, new_sha)
+          :ok
+        end,
+        timeout: PendingChunks.insert_timeout()
+      )
 
+    SourceOwner.notify(source.id)
     :ok
   end
 
-  defp enqueue_changed(_source, _slug, [], _new_sha), do: :ok
-
-  defp enqueue_changed(source, slug, paths, new_sha) do
-    with {:ok, rows} <- build_rows(source, slug, paths, new_sha) do
-      {:ok, ids} = PendingChunks.insert_raw_all(rows)
-      enqueue_chunk_files(ids)
-    end
+  defp advance_watermark!(sync_state, new_sha) do
+    sync_state
+    |> SyncState.changeset(%{
+      cursor: Map.put(sync_state.cursor || %{}, "last_sha", new_sha),
+      status: :idle,
+      last_synced_at: DateTime.utc_now()
+    })
+    |> Repo.update!()
   end
 
-  # Surface a failed enqueue ({:error, _}) so perform errors and the watermark isn't
-  # advanced past staged rows that never got a ChunkFiles job. A unique overlap comes
-  # back {:ok, conflict?} and is fine.
-  defp enqueue_chunk_files(ids) do
-    Enum.reduce_while(ids, :ok, fn id, :ok ->
-      case Oban.insert(ChunkFiles.new(%{"pending_chunk_id" => id})) do
-        {:ok, _job} -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-  end
-
-  # Build raw rows, halting on any *unexpected* show error so the job retries
-  # (watermark not advanced) rather than silently dropping the file forever. Known
-  # non-indexable/deterministic-per-file cases are skipped instead — the file
-  # exists (or, for a gitlink that slipped through, "exists" in a sense `show`
-  # can't read), there's nothing a retry would fix.
+  # Build content rows, halting on any *unexpected* show error so the job retries
+  # (nothing staged, watermark not advanced) rather than silently dropping the
+  # file forever. Known non-indexable/deterministic-per-file cases are skipped
+  # instead — the file exists (or, for a gitlink that slipped through, "exists"
+  # in a sense `show` can't read), there's nothing a retry would fix.
   defp build_rows(source, slug, paths, new_sha) do
     Enum.reduce_while(paths, {:ok, []}, fn path, {:ok, acc} ->
       case raw_row(source, slug, path, new_sha) do
@@ -143,18 +169,25 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   defp raw_row(source, slug, path, new_sha) do
     case GitMirror.show(slug, path, new_sha) do
       {:ok, content} ->
-        {:ok,
-         %{
-           source: "git",
-           source_id: source.id,
-           source_type: "git_repo",
-           repo: slug,
-           lang: lang_for(path),
-           natural_key: "repo:#{source.id}:#{path}",
-           content_hash: sha256(content),
-           raw_content: content,
-           metadata: %{"path" => path, "ref" => new_sha}
-         }}
+        if Chunking.binary_content?(content) do
+          # The file is present but its new content can't be staged as text —
+          # a deletion entry reconciles away whatever chunks it had under its
+          # old (text) content instead of leaving them indexed forever.
+          {:ok, deletion_row(source, slug, path)}
+        else
+          {:ok,
+           %{
+             source: "git",
+             source_id: source.id,
+             source_type: "git_repo",
+             repo: slug,
+             lang: lang_for(path),
+             natural_key: "repo:#{source.id}:#{path}",
+             content_hash: sha256(content),
+             raw_content: content,
+             metadata: %{"path" => path, "ref" => new_sha}
+           }}
+        end
 
       {:error, :file_too_large} ->
         :skip
@@ -174,16 +207,6 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
       {:error, reason} ->
         {:error, reason}
     end
-  end
-
-  defp advance_watermark(sync_state, new_sha) do
-    sync_state
-    |> SyncState.changeset(%{
-      cursor: Map.put(sync_state.cursor || %{}, "last_sha", new_sha),
-      status: :idle,
-      last_synced_at: DateTime.utc_now()
-    })
-    |> Repo.update!()
   end
 
   defp get_or_create_sync_state(source_id) do

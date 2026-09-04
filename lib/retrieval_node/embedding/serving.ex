@@ -10,15 +10,16 @@ defmodule RetrievalNode.Embedding.Serving do
 
   ## One serving for query and batch
 
-  A single serving handles both interactive query embeds (batch of 1) and bulk
-  `EmbedBatch` indexing jobs (batch of N): `Nx.Serving` already batches
-  concurrent `batched_run/2` calls within `batch_timeout`, so a second process
-  would only duplicate the ~1.2 GB model in RAM. The one tension — a large bulk
-  batch delaying a concurrent query — is bounded by the `:embed` Oban queue
-  running at concurrency 1 with per-job batches capped at tens of texts. If
-  measurement ever shows query p99 creeping up during ingest, the escape hatch is
-  a second named serving sharing the compiled model with its own batch queue; not
-  built in v1.
+  A single serving handles both interactive query embeds (batch of 1) and the
+  bulk `Embedding.embed_batch/1` calls `Ingest.FileIngest.apply/2` makes while
+  indexing a file (batch of N): `Nx.Serving` already batches concurrent
+  `batched_run/2` calls within `batch_timeout`, so a second process would only
+  duplicate the ~1.2 GB model in RAM. The one tension — a large bulk batch
+  delaying a concurrent query — is bounded by each source having at most one
+  `Ingest.SourceOwner` process applying files at a time, one file's chunks per
+  call. If measurement ever shows query p99 creeping up during ingest, the
+  escape hatch is a second named serving sharing the compiled model with its
+  own batch queue; not built in v1.
 
   ## Warmup
 

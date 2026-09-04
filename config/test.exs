@@ -38,8 +38,23 @@ config :retrieval_node, :chunking, call_timeout_ms: 100
 # via Oban.Testing (perform_job / assert_enqueued).
 config :retrieval_node, Oban, testing: :manual
 
-# Model-free embedding so the ingest pipeline (EmbedBatch) is testable without
-# downloading nomic-embed-text or compiling EXLA.
+# Discovery-worker tests (RepoSync/DriveSync/JiraSync) must not spawn real
+# Ingest.SourceOwner processes that then race the DataCase sandbox — a
+# *Sync job's post-commit SourceOwner.notify/1 is a no-op under this flag.
+# Owner tests (source_owner_test.exs) start owners explicitly (start_supervised
+# / DynamicSupervisor.start_child) and drive SourceOwner.drain/1 synchronously,
+# which bypasses this gate entirely; the "notify/1 coalescing" describe block
+# opts back in locally where it needs notify/1 itself under test.
+config :retrieval_node, :source_owner_notify, false
+
+# Ingest.Supervisor's boot-time resume Task is otherwise also gated on Oban's
+# testing: :manual (see Ingest.Supervisor.ingest_vm?/0), which already covers
+# the test env above — setting this explicitly is belt-and-suspenders and
+# documents the intent independently of that second gate.
+config :retrieval_node, :ingest_resume_on_boot, false
+
+# Model-free embedding so the ingest pipeline (Ingest.FileIngest) is testable
+# without downloading nomic-embed-text or compiling EXLA.
 config :retrieval_node, embedding_impl: RetrievalNode.Embedding.StubImpl
 
 # Never start the real Nx.Serving sub-tree in test — it would load the ~1.2 GB
