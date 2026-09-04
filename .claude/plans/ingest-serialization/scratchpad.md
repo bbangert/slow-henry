@@ -117,3 +117,42 @@ Decisions log + dead ends. Plan: `plan.md`. Inventory: `ingest-inventory.md`.
   merges. PR #15 closed as superseded; this branch carries #15's commits, so
   its PR targets `main`. Phases 0–3 (+ the 4.2/4.3/4.4 probes) ship together
   because they were never split; 4.1's soak concludes after merge.
+
+## 2026-09-04 — PR #16 closed (16k lines); rebuilt as < 2k-line slices
+
+Ben: "absolutely no PR over 2k LoC, absolutely no continuation until a PR has
+been merged." #16 was 16,359 additions because this branch was stacked on #15
+(15.2k) and the PR targeted main. This branch (`feat/ingest-serialization`)
+stays as the REFERENCE for the finished design; each slice below is rebuilt
+from `main` in its own worktree (`git worktree add /workspaces/slow-henry-<n>`
+— never in `/workspaces/slow-henry`, the dev node hot-loads that tree), tests
+run with `PGPORT=5433 MIX_TEST_PARTITION=<n>` so a fresh test DB is built from
+that slice's migrations. Measure `git diff --shortstat main` before opening.
+
+Ordered slices (each merged before the next starts; sizes are additions):
+
+1. `feat/ingest-file-core` — `Ingest.FileIngest` core + additive migration
+   `20260903120001` + `reconcile_file_chunks`/`file_identity` + tests. ~1.0k.
+   Not wired; main's ChunkFiles/EmbedBatch/UpsertChunks untouched. OPENED.
+2. `feat/ingest-source-owner` — SourceRegistry/SourceSupervisor/SourceOwner,
+   `Ingest.Supervisor`, discovery append+notify (deletion rows, cursor in the
+   same txn), delete the three workers + their queues, drain/mark functions in
+   PendingChunks, test toggles; ~1.6k. If over: move the drop migration and
+   the admin task to slice 3.
+3. `feat/ingest-cleanup` — drop per-stage `pending_chunks` columns, admin
+   resync/status task (`full` => true, `--source`), resume-on-boot gate, docs.
+4. `feat/reranking` — cross-encoder serving/warmer/supervisor, Search rerank,
+   MCP flag, healthz, tests. ~1.1k. Independent of 1–3.
+5. `feat/graph-schema` — graph tables migration, Entity/Mention/Edge schemas,
+   `Graph.upsert_from_staged` + gc, schema tests. graph_test.exs (1.3k) must be
+   split between 5 and 8.
+6. `feat/graph-extractor-core` — Extractor behaviour + TreeSitter extractor
+   for two languages + tests. ~1.2k.
+7. `feat/graph-extractor-langs` — remaining languages + tests. ~1.2k.
+8. `feat/graph-ingest-wiring` — `Chunking.chunk_with_graph`, FileIngest staged
+   rows + `Graph.upsert_from_staged`, GraphGc worker, force re-derive, tests.
+9. `feat/graph-search` — HybridQuery entity leg, `related_code` MCP tool,
+   bench/rerank_eval tasks, tests. ~1.5k.
+
+The 3.8k lines of `.claude/plans/arcana-adoption/**` reviews/research from #15
+never ride along in a code PR; docs-only PR if Ben wants them kept.
