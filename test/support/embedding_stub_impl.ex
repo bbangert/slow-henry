@@ -1,10 +1,10 @@
 defmodule RetrievalNode.Embedding.StubImpl do
   @moduledoc """
   Deterministic, model-free embedding implementation for tests. Lets the ingest
-  pipeline (EmbedBatch) and any embedding-dependent code run without loading
-  nomic-embed-text or EXLA. Vectors are a stable function of the input text (so
-  a test can assert two identical texts embed identically) and 384-dim to match
-  the real impl.
+  pipeline (EmbedBatch, Ingest.FileIngest) and any embedding-dependent code run
+  without loading nomic-embed-text or EXLA. Vectors are a stable function of
+  the input text (so a test can assert two identical texts embed identically)
+  and 384-dim to match the real impl.
   """
   @behaviour RetrievalNode.Embedding
 
