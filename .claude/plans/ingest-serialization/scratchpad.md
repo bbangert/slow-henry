@@ -156,3 +156,27 @@ Ordered slices (each merged before the next starts; sizes are additions):
 
 The 3.8k lines of `.claude/plans/arcana-adoption/**` reviews/research from #15
 never ride along in a code PR; docs-only PR if Ben wants them kept.
+
+## API Failure — 2026-09-04 05:03
+
+Turn ended due to API error. Check progress.md for last completed task.
+Resume with: /phx:work --continue
+
+## Slice-2 requirement (from PR #17 Copilot round 5, 2026-09-04)
+
+- text→binary transition leaves stale chunks: `PendingChunks.insert_raw_all/1`'s
+  binary guard drops a NUL / invalid-UTF-8 row BEFORE it reaches
+  `FileIngest.apply/2`, so a file that was indexed as text and later becomes
+  binary never gets its old chunks reconciled away — they stay searchable.
+- `apply/2` already handles it IF given a row (the `:binary_content` branch and
+  the `status:"deleted"` clause both reconcile with an empty keep-set). The gap
+  is the staging seam.
+- Could NOT fix in PR #17 (slice 1): `insert_raw_all/1` is shared with the still
+  live ChunkFiles/EmbedBatch/UpsertChunks pipeline, which doesn't understand a
+  `status:"deleted"` row — repurposing the guard there would poison the old path.
+- SLICE 2 fix: when discovery (RepoSync/DriveSync) detects a file became binary
+  (guard would drop it), stage an IDENTITY-ONLY deletion/unindexable marker
+  instead of dropping, so the owner reconciles the file's stale chunks. Revisit
+  the binary guard once the old pipeline is deleted. Add a test that drives the
+  real staging seam (not just a forced `:binary_content` on ordinary text).
+- PR #17 thread PRRT_kwDOTXolXc6fYVwR left OPEN as the tracked cross-slice item.
