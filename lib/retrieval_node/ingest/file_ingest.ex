@@ -83,9 +83,17 @@ defmodule RetrievalNode.Ingest.FileIngest do
   # --- 1. deletion entry ----------------------------------------------------
 
   def apply(%PendingChunk{status: "deleted"} = row, _opts) do
-    case reconcile_and_reap(row, []) do
-      {:ok, reconciled} -> {:ok, %{action: :deleted, reconciled: reconciled}}
-      {:error, reason} -> {:error, reason}
+    # A deletion whose identity can't be resolved has no chunks it could
+    # reconcile away — reaping its row anyway would report success while the
+    # old chunks stay indexed forever. Reject it instead, so the row survives
+    # for diagnosis/retry rather than vanishing.
+    if resolvable_identity?(row) do
+      case reconcile_and_reap(row, []) do
+        {:ok, reconciled} -> {:ok, %{action: :deleted, reconciled: reconciled}}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:error, :no_file_identity}
     end
   end
 
@@ -95,31 +103,33 @@ defmodule RetrievalNode.Ingest.FileIngest do
     force = Keyword.get(opts, :force, row.force)
     on_parse_crash = Keyword.get(opts, :on_parse_crash, :error)
 
-    if not force and unchanged?(row) do
-      PendingChunks.delete_by_ids([row.id])
-      {:skipped, :unchanged}
-    else
-      scrub_and_chunk(row, on_parse_crash)
+    cond do
+      # Same guard as the deletion path: a content row we can't identify can't
+      # have its stale chunks reconciled, so refuse it rather than write an
+      # unreconcilable file. (Not reachable for a well-formed *Sync row, which
+      # always carries a path/doc_id/issue_key — it's a fail-closed backstop.)
+      not resolvable_identity?(row) ->
+        {:error, :no_file_identity}
+
+      not force and unchanged?(row) ->
+        PendingChunks.delete_by_ids([row.id])
+        {:skipped, :unchanged}
+
+      true ->
+        scrub_and_chunk(row, on_parse_crash)
     end
   end
+
+  defp resolvable_identity?(row),
+    do: not is_nil(Ingest.file_identity(row.source_type, row.metadata))
 
   # A file whose previous version produced zero chunks has no `chunks` row to
   # match against here — it's simply re-applied (cheap: it'll produce zero
   # chunks again, or the DB will tell us it now produces some).
   defp unchanged?(row) do
-    case Ingest.file_identity(row.source_type, row.metadata) do
-      nil ->
-        false
-
-      {field, value} ->
-        Repo.exists?(
-          from(c in Chunk,
-            where:
-              c.source_id == ^row.source_id and
-                fragment("?->>?", c.metadata, ^field) == ^value and
-                c.file_hash == ^row.content_hash
-          )
-        )
+    case Ingest.file_chunks_query(row.source_id, row.source_type, row.metadata) do
+      nil -> false
+      query -> Repo.exists?(where(query, [c], c.file_hash == ^row.content_hash))
     end
   end
 
@@ -133,7 +143,9 @@ defmodule RetrievalNode.Ingest.FileIngest do
         record_audit(row, result.findings)
         # Scrubber returns secrets_status as an atom; the Chunk column is an enum
         # whose dump value is the string form to_enum/2 resolves below.
-        opts = [scrub_mode: result.scrub_mode, secrets_status: to_string(result.secrets_status)]
+        # Only `secrets_status` is carried forward — it lands on each chunk row.
+        # `result.scrub_mode` is deliberately dropped: nothing downstream reads it.
+        opts = [secrets_status: to_string(result.secrets_status)]
         chunk_and_index(row, result.redacted_content, opts, on_parse_crash)
 
       {:cancel, reason} ->
@@ -254,7 +266,10 @@ defmodule RetrievalNode.Ingest.FileIngest do
     {reused_entries, to_embed} =
       Enum.split_with(built, fn entry ->
         case Map.get(existing, entry.chunk_key) do
-          %{content_hash: hash} -> hash == entry.content_hash
+          # Reuse only when the text is unchanged AND the stored row actually
+          # HAS an embedding — Chunk.embedding is nullable, and reusing a nil
+          # would persist an unembedded chunk and skip embedding it.
+          %{content_hash: hash, embedding: emb} -> hash == entry.content_hash and not is_nil(emb)
           nil -> false
         end
       end)
@@ -283,14 +298,12 @@ defmodule RetrievalNode.Ingest.FileIngest do
   end
 
   defp load_existing_chunks(row) do
-    case Ingest.file_identity(row.source_type, row.metadata) do
+    case Ingest.file_chunks_query(row.source_id, row.source_type, row.metadata) do
       nil ->
         %{}
 
-      {field, value} ->
-        Chunk
-        |> where([c], c.source_id == ^row.source_id)
-        |> where([c], fragment("?->>?", c.metadata, ^field) == ^value)
+      query ->
+        query
         |> select([c], {c.chunk_key, %{content_hash: c.content_hash, embedding: c.embedding}})
         |> Repo.all()
         |> Map.new()

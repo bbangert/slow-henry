@@ -82,9 +82,10 @@ defmodule RetrievalNode.Ingest do
   @doc """
   Resolves a file's stable identity `{field, value}` from its `source_type`
   and staged `metadata`, or `nil` when `source_type` isn't a known identity
-  carrier or the field is missing/blank. Used by `reconcile_file_chunks/5` and
-  by `Ingest.FileIngest`'s own unchanged-content skip and embedding-reuse
-  lookups (both need to find a file's existing chunks by this same identity).
+  carrier or the field is missing/blank. `field` is one of the LITERAL jsonb
+  keys `"path"` / `"doc_id"` / `"issue_key"` (never caller-supplied), which is
+  what lets `file_chunks_query/3` emit a literal-key `->>` the expression
+  indexes can use.
   """
   @spec file_identity(String.t(), map() | nil) :: {String.t(), String.t()} | nil
   def file_identity(source_type, metadata) do
@@ -95,6 +96,40 @@ defmodule RetrievalNode.Ingest do
       _ -> nil
     end
   end
+
+  @doc """
+  Builds an `Ecto.Query` selecting every `chunks` row for ONE file — scoped by
+  `source_id` plus the file's identity (`file_identity/2`) — or `nil` when the
+  row carries no resolvable identity. `Ingest.FileIngest` layers `select`/
+  `exists?`/`delete_all` on top for its unchanged-content skip, embedding-reuse
+  load, and chunk-set reconciliation, so all three share one indexable shape.
+
+  The identity predicate is emitted with a LITERAL jsonb key per source type
+  (`metadata->>'path'`, not `metadata->>$n`): a parameterized key can't use an
+  expression index, so the literal is what makes the
+  `chunks_file_identity_*_idx` indexes (see the staging migration) actually
+  fire instead of a per-source seq scan. The key is never caller-supplied — it
+  comes only from the fixed `@identity_metadata_field` allowlist.
+  """
+  @spec file_chunks_query(binary(), String.t(), map() | nil) :: Ecto.Query.t() | nil
+  def file_chunks_query(source_id, source_type, metadata) do
+    case file_identity(source_type, metadata) do
+      nil ->
+        nil
+
+      {field, value} ->
+        scope_by_identity(from(c in Chunk, where: c.source_id == ^source_id), field, value)
+    end
+  end
+
+  defp scope_by_identity(query, "path", value),
+    do: where(query, [c], fragment("?->>'path'", c.metadata) == ^value)
+
+  defp scope_by_identity(query, "doc_id", value),
+    do: where(query, [c], fragment("?->>'doc_id'", c.metadata) == ^value)
+
+  defp scope_by_identity(query, "issue_key", value),
+    do: where(query, [c], fragment("?->>'issue_key'", c.metadata) == ^value)
 
   @doc """
   Deletes every existing `chunks` row for one file (identified by
@@ -114,34 +149,18 @@ defmodule RetrievalNode.Ingest do
   @spec reconcile_file_chunks(Ecto.Repo.t(), binary(), String.t(), map() | nil, [String.t()]) ::
           non_neg_integer()
   def reconcile_file_chunks(repo, source_id, source_type, metadata, keep_chunk_keys) do
-    case file_identity(source_type, metadata) do
-      nil -> 0
-      {field, value} -> delete_stale_chunks(repo, source_id, field, value, keep_chunk_keys)
+    case file_chunks_query(source_id, source_type, metadata) do
+      nil ->
+        0
+
+      query ->
+        # `chunk_key not in ^keep_chunk_keys` compiles to `NOT (chunk_key =
+        # ANY($1))` — the whole key list rides in as ONE array-typed bind
+        # parameter, so this is exempt from the 65,535-bind ceiling that
+        # batches bulk inserts. An empty `keep_chunk_keys` matches every row
+        # for the identity (deletes the file's whole chunk set) — deliberate.
+        {count, _} = repo.delete_all(where(query, [c], c.chunk_key not in ^keep_chunk_keys))
+        count
     end
-  end
-
-  # `metadata->>?` binds the jsonb key as an ordinary text parameter — unlike
-  # a column/table name, `->>`'s right-hand side isn't a SQL identifier, so
-  # one query shape covers all three known identity fields instead of one
-  # hand-written fragment per field name.
-  #
-  # `chunk_key not in ^keep_chunk_keys` compiles to `NOT (chunk_key = ANY($1))`
-  # — the whole key list rides in as ONE array-typed bind parameter, not one
-  # bind per key, so this is exempt from the 65,535-bind-parameter ceiling
-  # that makes bulk inserts elsewhere batch. An empty `keep_chunk_keys`
-  # matches `NOT (chunk_key = ANY('{}'))`, i.e. every row for that identity —
-  # deliberate, see `reconcile_file_chunks/5`.
-  defp delete_stale_chunks(repo, source_id, field, value, keep_chunk_keys) do
-    {count, _} =
-      repo.delete_all(
-        from(c in Chunk,
-          where:
-            c.source_id == ^source_id and
-              fragment("?->>?", c.metadata, ^field) == ^value and
-              c.chunk_key not in ^keep_chunk_keys
-        )
-      )
-
-    count
   end
 end

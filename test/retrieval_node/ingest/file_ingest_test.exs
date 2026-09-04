@@ -413,4 +413,51 @@ defmodule RetrievalNode.Ingest.FileIngestTest do
     assert vector_a_after == vector_a_before
     refute vector_b_after == vector_b_before
   end
+
+  test "embedding reuse skips a stored chunk whose embedding is nil (re-embeds it)", %{
+    source: source
+  } do
+    natural_key = "repo:acme/app:nilemb.py"
+
+    force_chunk(chunk_result([{"chunk a stable text", "a", 1, 1}]))
+    raw1 = seed_raw(source, "v1", natural_key, "nilemb.py")
+    assert {:ok, %{embedded: 1, reused: 0}} = FileIngest.apply(raw1, [])
+
+    # Simulate a prior row persisted without an embedding (Chunk.embedding is
+    # nullable) — reuse must NOT copy the nil forward; it must re-embed.
+    [chunk] = chunks_for(source, "nilemb.py")
+    Repo.update_all(from(c in Chunk, where: c.id == ^chunk.id), set: [embedding: nil])
+
+    force_chunk(chunk_result([{"chunk a stable text", "a", 1, 1}]))
+    raw2 = seed_raw(source, "v2", natural_key, "nilemb.py")
+    assert {:ok, %{embedded: 1, reused: 0}} = FileIngest.apply(raw2, [])
+
+    [chunk_after] = chunks_for(source, "nilemb.py")
+    refute is_nil(chunk_after.embedding)
+  end
+
+  describe "unresolvable file identity" do
+    test "a deletion entry with blank identity is rejected and its row survives", %{
+      source: source
+    } do
+      # A deletion carrying no path can't be reconciled — apply/2 must reject it
+      # (leaving the row for diagnosis) rather than reap it and report success.
+      deletion = seed_deletion(source, "repo:acme/app:mystery", "gone.py")
+      {:ok, _} = Repo.update(Ecto.Changeset.change(deletion, metadata: %{}))
+      deletion = Repo.get!(PendingChunk, deletion.id)
+
+      assert {:error, :no_file_identity} = FileIngest.apply(deletion, [])
+      assert Repo.get(PendingChunk, deletion.id)
+    end
+
+    test "a content row with blank identity is rejected and its row survives", %{source: source} do
+      force_chunk(chunk_result([{"chunk a", "a", 1, 1}]))
+      raw = seed_raw(source, "v1", "repo:acme/app:mystery.py", "mystery.py")
+      {:ok, _} = Repo.update(Ecto.Changeset.change(raw, metadata: %{}))
+      raw = Repo.get!(PendingChunk, raw.id)
+
+      assert {:error, :no_file_identity} = FileIngest.apply(raw, [])
+      assert Repo.get(PendingChunk, raw.id)
+    end
+  end
 end

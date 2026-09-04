@@ -39,6 +39,24 @@ defmodule RetrievalNode.Ingest.PendingChunksTest do
     assert Repo.aggregate(PendingChunk, :count, :id) == 0
   end
 
+  test "the content_hash CHECK rejects a raw row with no hash (only 'deleted' may omit it)" do
+    # content_hash is nullable now (deletion entries carry none), but the
+    # migration's CHECK keeps the old invariant for content rows — insert_all
+    # bypasses the changeset, so the DB is the last line of defence against a
+    # hash-less raw row poisoning staging.
+    assert_raise Postgrex.Error, ~r/content_hash_required_unless_deleted/, fn ->
+      PendingChunks.insert_raw_all([raw_attrs(%{content_hash: nil})])
+    end
+
+    assert Repo.aggregate(PendingChunk, :count, :id) == 0
+  end
+
+  test "a 'deleted' row is allowed to omit content_hash" do
+    deletion = raw_attrs(%{status: "deleted", content_hash: nil, raw_content: nil})
+    assert {:ok, [_id]} = PendingChunks.insert_raw_all([deletion])
+    assert Repo.aggregate(PendingChunk, :count, :id) == 1
+  end
+
   test "insert_raw_all skips a row whose raw_content has a NUL byte (never reaches Postgres)" do
     good = raw_attrs()
 
