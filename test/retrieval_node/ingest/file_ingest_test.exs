@@ -480,6 +480,17 @@ defmodule RetrievalNode.Ingest.FileIngestTest do
       assert {:error, :no_file_identity} = FileIngest.apply(raw, [])
       assert Repo.get(PendingChunk, raw.id)
     end
+
+    test "a whitespace-only identity is treated as blank, not resolvable", %{source: source} do
+      # "   " matches no real chunk path — accepting it would let a deletion
+      # reconcile zero rows yet report success, orphaning the file's chunks.
+      deletion = seed_deletion(source, "repo:acme/app:blank", "gone.py")
+      {:ok, _} = Repo.update(Ecto.Changeset.change(deletion, metadata: %{"path" => "   "}))
+      deletion = Repo.get!(PendingChunk, deletion.id)
+
+      assert {:error, :no_file_identity} = FileIngest.apply(deletion, [])
+      assert Repo.get(PendingChunk, deletion.id)
+    end
   end
 
   describe "source-specific identity (drive folder, jira project)" do

@@ -89,8 +89,14 @@ defmodule RetrievalNode.Ingest do
   """
   @spec file_identity(String.t(), map() | nil) :: {String.t(), String.t()} | nil
   def file_identity(source_type, metadata) do
+    # A whitespace-only value is treated as blank: it matches no real chunk's
+    # identity, so accepting it would let a deletion reconcile zero rows, reap
+    # its tombstone, and report success while the old chunks stay indexed. The
+    # value returned for matching is the original (untrimmed) — a legitimate
+    # identity keeps its exact text.
     with field when is_binary(field) <- Map.get(@identity_metadata_field, source_type),
-         value when is_binary(value) and value != "" <- Map.get(metadata || %{}, field) do
+         value when is_binary(value) <- Map.get(metadata || %{}, field),
+         true <- String.trim(value) != "" do
       {field, value}
     else
       _ -> nil
