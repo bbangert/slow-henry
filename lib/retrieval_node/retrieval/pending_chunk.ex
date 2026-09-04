@@ -89,7 +89,9 @@ defmodule RetrievalNode.Retrieval.PendingChunk do
   @doc "Changeset for a freshly-discovered raw row (`*Sync` workers)."
   def raw_changeset(pending_chunk, attrs) do
     pending_chunk
-    |> cast(attrs, [:raw_content | @provenance])
+    # `:force` is castable here too so the single-row API can stage a forced
+    # re-derive; `insert_raw_all/1`'s bulk path already passes it through.
+    |> cast(attrs, [:raw_content, :force | @provenance])
     |> put_change(:status, "raw")
     # source_id/source_type are provenance the downstream pipeline (UpsertChunks)
     # assumes exists — require them so a raw row can't be staged without them.

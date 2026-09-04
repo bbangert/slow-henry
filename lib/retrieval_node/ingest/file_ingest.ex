@@ -7,7 +7,7 @@ defmodule RetrievalNode.Ingest.FileIngest do
   `apply/2` has no process concerns of its own: no queue, no retry, no notion
   of "this source" beyond the one row it's given.
 
-  **Raises on bugs.** The write transaction (`reconcile_and_reap/2`, `write/7`)
+  **Raises on bugs.** The write transaction (`reconcile_and_reap/3`, `write/7`)
   does not catch exceptions — a constraint violation rolls the transaction
   back and Ecto re-raises, and that exception is left to propagate. This
   module has no opinion about what a caller should do with a bug; deciding
@@ -88,7 +88,7 @@ defmodule RetrievalNode.Ingest.FileIngest do
     # old chunks stay indexed forever. Reject it instead, so the row survives
     # for diagnosis/retry rather than vanishing.
     if resolvable_identity?(row) do
-      case reconcile_and_reap(row, []) do
+      case reconcile_and_reap(row, [], []) do
         {:ok, reconciled} -> {:ok, %{action: :deleted, reconciled: reconciled}}
         {:error, reason} -> {:error, reason}
       end
@@ -140,16 +140,18 @@ defmodule RetrievalNode.Ingest.FileIngest do
   defp scrub_and_chunk(row, on_parse_crash) do
     case Scrubber.scrub(row.raw_content, Map.fetch!(@source_types, row.source)) do
       {:ok, result} ->
-        record_audit(row, result.findings)
         # Scrubber returns secrets_status as an atom; the Chunk column is an enum
         # whose dump value is the string form to_enum/2 resolves below.
-        # Only `secrets_status` is carried forward — it lands on each chunk row.
-        # `result.scrub_mode` is deliberately dropped: nothing downstream reads it.
-        opts = [secrets_status: to_string(result.secrets_status)]
+        # `secrets_status` lands on each chunk row; `findings` are recorded INSIDE
+        # the terminal transaction (see `record_audit/2`) so the audit rows commit
+        # atomically with the row's deletion and never survive a failed/retried
+        # ingest. `result.scrub_mode` is dropped: nothing downstream reads it.
+        opts = [secrets_status: to_string(result.secrets_status), findings: result.findings]
         chunk_and_index(row, result.redacted_content, opts, on_parse_crash)
 
       {:cancel, reason} ->
-        unindexable(row, reason)
+        # A cancel produced no redacted result, so there are no findings to log.
+        unindexable(row, reason, [])
     end
   end
 
@@ -164,7 +166,7 @@ defmodule RetrievalNode.Ingest.FileIngest do
         heuristic_fallback(row, content, "heuristic_fallback", opts)
 
       {:error, err} when err in [:too_large, :binary_content] ->
-        unindexable(row, err)
+        unindexable(row, err, Keyword.get(opts, :findings, []))
 
       {:error, err} ->
         if on_parse_crash == :heuristic do
@@ -184,15 +186,17 @@ defmodule RetrievalNode.Ingest.FileIngest do
   # file's chunks away with an EMPTY keep-set — the index reflects the current
   # file or nothing — and reaps the raw row (fail-closed: a scrub-cancelled
   # row would otherwise leave un-redacted content sitting in staging forever).
-  defp unindexable(row, reason) do
-    case reconcile_and_reap(row, []) do
+  defp unindexable(row, reason, findings) do
+    case reconcile_and_reap(row, [], findings) do
       {:ok, reconciled} -> {:ok, %{action: :unindexable, reason: reason, reconciled: reconciled}}
       {:error, error} -> {:error, error}
     end
   end
 
-  defp reconcile_and_reap(row, keep_chunk_keys) do
+  defp reconcile_and_reap(row, keep_chunk_keys, findings) do
     Repo.transaction(fn ->
+      record_audit(row, findings)
+
       reconciled =
         Ingest.reconcile_file_chunks(
           Repo,
@@ -242,13 +246,21 @@ defmodule RetrievalNode.Ingest.FileIngest do
 
   defp file_prefix(row), do: Map.get(row.metadata || %{}, "path") || row.natural_key
 
+  # Called only from inside a terminal `Repo.transaction` (`write/7`,
+  # `reconcile_and_reap/3`), so the append-only audit rows commit exactly when
+  # the file's ingest does — a failed/retried ingest never leaves orphan or
+  # duplicate findings. A record failure rolls the whole transaction back (the
+  # raw row survives for retry) instead of being silently dropped.
   defp record_audit(_row, []), do: :ok
 
   defp record_audit(row, findings) do
-    Scrubber.record_findings(findings, %{
-      source_id: row.source_id,
-      file_reference: row.natural_key
-    })
+    case Scrubber.record_findings(findings, %{
+           source_id: row.source_id,
+           file_reference: row.natural_key
+         }) do
+      {:ok, _count} -> :ok
+      {:error, reason} -> Repo.rollback({:audit_failed, reason})
+    end
   end
 
   # Embedding reuse: load the file's EXISTING chunks (by file identity, not by
@@ -327,6 +339,7 @@ defmodule RetrievalNode.Ingest.FileIngest do
     keep_chunk_keys = Enum.map(built, & &1.chunk_key)
 
     Repo.transaction(fn ->
+      record_audit(row, Keyword.get(opts, :findings, []))
       now = DateTime.utc_now()
       insert_batches(entries, now)
 

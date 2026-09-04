@@ -25,6 +25,12 @@ defmodule RetrievalNode.Ingest.PendingChunksTest do
     assert PendingChunks.fetch!(row.id).natural_key == "repo:acme/app:lib/foo.ex"
   end
 
+  test "insert_raw carries :force through the single-row changeset" do
+    assert {:ok, row} = PendingChunks.insert_raw(raw_attrs(%{force: true}))
+    assert row.force == true
+    assert PendingChunks.fetch!(row.id).force == true
+  end
+
   test "insert_raw_all bulk-inserts in a single round-trip and returns the ids" do
     assert {:ok, ids} = PendingChunks.insert_raw_all([raw_attrs(), raw_attrs()])
     assert length(ids) == 2

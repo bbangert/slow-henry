@@ -63,6 +63,27 @@ defmodule RetrievalNode.Ingest.FileIngestTest do
     Repo.one!(from(p in PendingChunk, order_by: [desc: p.id], limit: 1))
   end
 
+  # Generic staging helper for non-git sources (drive_folder / jira_project),
+  # so the doc_id / issue_key identity branches get real coverage.
+  defp seed_row(source, attrs) do
+    base = %{
+      source: "git",
+      source_id: source.id,
+      source_type: "git_repo",
+      repo: "acme/app",
+      lang: "python",
+      content_hash: "rawhash-#{System.unique_integer([:positive])}",
+      raw_content: "print('x')",
+      metadata: %{}
+    }
+
+    {:ok, _} = PendingChunks.insert_raw_all([Map.merge(base, attrs)])
+    Repo.one!(from(p in PendingChunk, order_by: [desc: p.id], limit: 1))
+  end
+
+  defp source_chunk_count(source),
+    do: Repo.aggregate(from(c in Chunk, where: c.source_id == ^source.id), :count, :id)
+
   defp force_chunk(result), do: Application.put_env(:retrieval_node, :fake_chunk_result, result)
 
   defp chunk_result(specs) do
@@ -458,6 +479,111 @@ defmodule RetrievalNode.Ingest.FileIngestTest do
 
       assert {:error, :no_file_identity} = FileIngest.apply(raw, [])
       assert Repo.get(PendingChunk, raw.id)
+    end
+  end
+
+  describe "source-specific identity (drive folder, jira project)" do
+    test "drive: deletion by doc_id reconciles that document's chunks away" do
+      drive =
+        Repo.insert!(%Source{source_type: :drive_folder, name: "docs", identifier: "folder/1"})
+
+      force_chunk(chunk_result([{"doc body", "b", 1, 1}]))
+
+      raw =
+        seed_row(drive, %{
+          source: "drive",
+          source_type: "drive_folder",
+          natural_key: "drive:#{drive.id}:doc-1",
+          metadata: %{"doc_id" => "doc-1"}
+        })
+
+      assert {:ok, %{action: :indexed, chunks: 1}} = FileIngest.apply(raw, [])
+      assert source_chunk_count(drive) == 1
+
+      deletion =
+        seed_row(drive, %{
+          source: "drive",
+          source_type: "drive_folder",
+          status: "deleted",
+          content_hash: nil,
+          raw_content: nil,
+          natural_key: "drive:#{drive.id}:doc-1",
+          metadata: %{"doc_id" => "doc-1"}
+        })
+
+      assert {:ok, %{action: :deleted, reconciled: 1}} = FileIngest.apply(deletion, [])
+      assert source_chunk_count(drive) == 0
+    end
+
+    test "jira: unchanged-skip and boundary-shift reconcile key on issue_key" do
+      jira = Repo.insert!(%Source{source_type: :jira_project, name: "proj", identifier: "PROJ"})
+
+      force_chunk(chunk_result([{"c1", "a", 1, 1}, {"c2", "b", 2, 2}]))
+
+      raw1 =
+        seed_row(jira, %{
+          source: "jira",
+          source_type: "jira_project",
+          natural_key: "jira:PROJ:PROJ-1",
+          content_hash: "issue-h1",
+          metadata: %{"issue_key" => "PROJ-1"}
+        })
+
+      assert {:ok, %{action: :indexed, chunks: 2}} = FileIngest.apply(raw1, [])
+      assert source_chunk_count(jira) == 2
+
+      # Same content_hash on the same issue_key → the unchanged skip fires
+      # (proving the issue_key identity query, not just path, is wired).
+      raw_same =
+        seed_row(jira, %{
+          source: "jira",
+          source_type: "jira_project",
+          natural_key: "jira:PROJ:PROJ-1",
+          content_hash: "issue-h1",
+          metadata: %{"issue_key" => "PROJ-1"}
+        })
+
+      assert {:skipped, :unchanged} = FileIngest.apply(raw_same, [])
+
+      # Fewer chunks than before → the dropped chunk's stale row is reconciled
+      # away, scoped by issue_key.
+      force_chunk(chunk_result([{"c1", "a", 1, 1}]))
+
+      raw2 =
+        seed_row(jira, %{
+          source: "jira",
+          source_type: "jira_project",
+          natural_key: "jira:PROJ:PROJ-1",
+          content_hash: "issue-h2",
+          metadata: %{"issue_key" => "PROJ-1"}
+        })
+
+      assert {:ok, %{action: :indexed, chunks: 1, reconciled: 1}} = FileIngest.apply(raw2, [])
+      assert source_chunk_count(jira) == 1
+    end
+  end
+
+  describe "audit rows ride the terminal transaction" do
+    test "a parse crash writes no secret_finding (nothing to duplicate on retry)", %{
+      source: source
+    } do
+      # Scrub redacts the key (findings present), then chunking crashes →
+      # {:error}. The row survives and NO audit row is committed, so a retry
+      # can't accumulate duplicate findings.
+      force_chunk({:error, :boom})
+      raw = seed_raw(source, "key = \"#{@aws_key}\"", "repo:acme/app:crash.py", "crash.py")
+
+      assert {:error, :boom} = FileIngest.apply(raw, [])
+      assert Repo.aggregate(SecretFinding, :count, :id) == 0
+      assert Repo.get(PendingChunk, raw.id)
+    end
+
+    test "a successful ingest commits the redacted-secret audit row", %{source: source} do
+      force_chunk(chunk_result([{"chunk a", "a", 1, 1}]))
+      raw = seed_raw(source, "key = \"#{@aws_key}\"", "repo:acme/app:sec.py", "sec.py")
+
+      assert {:ok, %{action: :indexed}} = FileIngest.apply(raw, [])
+      assert Repo.aggregate(SecretFinding, :count, :id) == 1
     end
   end
 end
