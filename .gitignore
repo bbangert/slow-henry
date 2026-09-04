@@ -37,4 +37,6 @@ retrieval_node-*.tar
 /.claude/skill-metrics/
 /.claude/audit/
 /.claude/research/
+/.claude/deps-audit/
+/.claude/deps-update/
 
