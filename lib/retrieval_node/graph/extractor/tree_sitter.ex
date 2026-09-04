@@ -55,8 +55,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # minified/generated code the grammar mislabels as an identifier. Beyond
   # junk quality, these are lethal downstream: entities' composite unique
   # btree index rejects rows past ~2,700 bytes (Postgres index-row limit),
-  # which would discard the whole UpsertChunks job. Skipped, not truncated —
-  # truncation would collide unrelated junk under one entity.
+  # which would discard the whole `Ingest.FileIngest.apply/2` write. Skipped,
+  # not truncated — truncation would collide unrelated junk under one entity.
   @max_symbol_bytes 256
 
   # Node kind -> definition category, per language. Anything not listed here

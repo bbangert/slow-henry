@@ -1,9 +1,10 @@
 defmodule RetrievalNode.Chunking.FakeImpl do
   @moduledoc """
   Test-only `Chunking` implementation whose `chunk/2` return is dictated by the
-  `:fake_chunk_result` application env. Lets `ChunkFiles`-scoped tests force the
-  fallback/skip branches (`:unsupported_language`, `:too_large`, `:binary_content`,
-  a crash reason) that the real `HeuristicImpl` can never produce.
+  `:fake_chunk_result` application env. Lets `Ingest.FileIngest`-scoped tests
+  force the fallback/skip branches (`:unsupported_language`, `:too_large`,
+  `:binary_content`, a crash reason) that the real `HeuristicImpl` can never
+  produce.
 
   `chunk_with_graph/2` is dictated separately by `:fake_chunk_with_graph_result`
   so graph-focused tests can hand back controlled entities/references without
@@ -11,7 +12,7 @@ defmodule RetrievalNode.Chunking.FakeImpl do
   back to wrapping `chunk/2`'s result with empty graph lists — the same
   wrapping `RetrievalNode.Chunking.chunk_with_graph/2` does for any impl that
   doesn't define this callback — so existing `fake_chunk_result`-only tests
-  keep working unchanged now that `ChunkFiles` calls `chunk_with_graph/2`.
+  keep working unchanged now that `Ingest.FileIngest` calls `chunk_with_graph/2`.
   """
   @behaviour RetrievalNode.Chunking
 

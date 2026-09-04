@@ -59,6 +59,11 @@ defmodule Mix.Tasks.Rn.Bench do
   @impl Mix.Task
   def run(args) do
     Mix.Task.run("app.config")
+    # This VM boots with its normal (non-empty) Oban queues config, so
+    # Ingest.Supervisor would otherwise start Ingest.SourceOwner processes —
+    # this task has no reason to become a second writer for a source the dev
+    # server already owns.
+    Application.put_env(:retrieval_node, :ingest_resume_on_boot, false)
     {:ok, _} = Application.ensure_all_started(:retrieval_node)
 
     {opts, _rest} =

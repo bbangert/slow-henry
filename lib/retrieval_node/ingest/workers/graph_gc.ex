@@ -1,60 +1,66 @@
 defmodule RetrievalNode.Ingest.Workers.GraphGc do
   @moduledoc """
-  Periodic sweep for graph rows stranded by the ingest pipeline's file-deletion
-  paths. Two removal paths exist today, both going through the same
-  `Ingest.tombstone_file/4` claim-then-conditionally-delete helper (see
-  `RepoSync`'s moduledoc, "Deletion is a tombstone claim"): `RepoSync.delete_removed/2`
-  deletes a removed path's `chunks` by `metadata->>"path"`, and
-  `DriveSync.delete_removed/2` deletes a removed Doc's `chunks` by
-  `metadata->>"doc_id"` (not a filesystem path — Drive files are identified by
-  id). `JiraSync` has no removal path today (see `Ingest.file_identity/2`'s
-  moduledoc comment). Either deletion's `Repo.delete_all` on `chunks` cascades
-  via FK to that file's `entity_mentions`, but leaves behind any `entities`
-  (and their `entity_edges`) that now have zero mentions anywhere. Nothing in
-  the ingest path itself notices — a deletion event never looks back at the
-  entities it just orphaned — so this runs as its own cron job instead.
+  Daily catch-all sweep for zero-mention entities. `Ingest.SourceOwner`
+  already reaps its own source's orphans after every pass that reconciles or
+  deletes a file (see its moduledoc's "one pass" step 4) — this worker exists
+  for whatever that doesn't catch: orphans from before that behavior existed,
+  or from any path that touches `chunks` outside an owner's pass.
 
-  An intra-file edit that only shifts chunk boundaries (no path change) used
-  to leave the *old* chunk row orphaned forever, with its own graph rows
-  (mentions, and any entity that went zero-mention as a result) persisting
-  right along with it — `UpsertChunks` now reconciles a file's chunk row set
-  on every upsert (deleting rows whose `chunk_key` it no longer produces, see
-  its moduledoc), so that gap is closed at the source and this worker no
-  longer needs to compensate for it. It remains the catch-all for entities
-  that reach zero mentions any other way — this worker only reaps entities
-  that are *already* at zero mentions; it has no way to tell a stale chunk
-  from a live one, which is fine now that stale chunk rows aren't supposed to
-  exist in the first place.
+  Fans out per source rather than running one corpus-wide sweep: distinct
+  `source_id`s with at least one `entities` row, `Ingest.SourceOwner.gc/1`
+  each in turn (sequential, synchronous — this worker is a slow daily cron
+  job, not a latency-sensitive path, so there's no reason to run sources
+  concurrently). `SourceOwner.gc/1` runs `Graph.gc_orphaned_entities/1`
+  scoped to that source INSIDE the owning process's mailbox — the same
+  single-writer guarantee every other write to that source's graph rows
+  goes through, so this sweep never races a sync landing new mentions for a
+  source it's currently scanning.
+
+  `queue: :sync` — the old per-file staging pipeline's own upsert queue is
+  gone along with it; `:sync` is the one queue that exists in every env
+  already (discovery workers run there too).
   """
   use Oban.Worker,
-    queue: :upsert,
+    queue: :sync,
     max_attempts: 3,
     unique: [
       period: {1, :hour},
       states: [:available, :scheduled, :executing, :retryable, :suspended]
     ]
 
+  import Ecto.Query
+
   require Logger
 
-  alias RetrievalNode.Graph
+  alias RetrievalNode.Graph.Entity
+  alias RetrievalNode.Ingest.SourceOwner
+  alias RetrievalNode.Repo
 
   # An unbounded orphan backlog (plausible post-backfill or after a large
-  # repo deletion) must not squat an :upsert slot indefinitely, competing
-  # with latency-sensitive UpsertChunks jobs. Graph.gc_orphaned_entities/1's
-  # batched loop makes a timeout-triggered retry resume roughly where it left
-  # off — already-deleted batches don't come back.
+  # repo deletion) must not squat a :sync slot indefinitely, competing with
+  # discovery jobs. Each source's own gc_orphaned_entities/1 call is itself
+  # a batched loop, so a timeout-triggered retry resumes roughly where the
+  # sweep left off — sources already fully reaped don't come back.
   @impl Oban.Worker
   def timeout(_job), do: :timer.minutes(30)
 
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
-    case Graph.gc_orphaned_entities() do
-      0 ->
-        :ok
+    total =
+      source_ids_with_entities()
+      |> Enum.reduce(0, fn source_id, total ->
+        {:ok, deleted} = SourceOwner.gc(source_id)
+        total + deleted
+      end)
 
-      deleted ->
-        Logger.info("graph_gc deleted #{deleted} zero-mention entities")
-        :ok
+    if total > 0 do
+      Logger.info("graph_gc deleted #{total} zero-mention entities")
     end
+
+    :ok
+  end
+
+  defp source_ids_with_entities do
+    Entity |> distinct(true) |> select([e], e.source_id) |> Repo.all()
   end
 end

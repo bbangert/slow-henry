@@ -7,6 +7,7 @@ defmodule RetrievalNode.Ingest.Workers.GraphGcTest do
   import ExUnit.CaptureLog
 
   alias RetrievalNode.Graph.{Entity, EntityMention}
+  alias RetrievalNode.Ingest.SourceOwner
   alias RetrievalNode.Ingest.Workers.GraphGc
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.{Chunk, Source}
@@ -25,6 +26,10 @@ defmodule RetrievalNode.Ingest.Workers.GraphGcTest do
     on_exit(fn -> Logger.configure(level: prev) end)
 
     source = Repo.insert!(%Source{source_type: :git_repo, name: "app", identifier: "acme/app"})
+    # perform/1 now runs each source's reap through SourceOwner.gc/1, which
+    # starts (or reuses) that source's real owner process under the shared
+    # sandbox — stop it so it doesn't linger into the next test.
+    on_exit(fn -> SourceOwner.stop(source.id) end)
     %{source: source}
   end
 
@@ -63,14 +68,19 @@ defmodule RetrievalNode.Ingest.Workers.GraphGcTest do
     assert Repo.get(Entity, kept.id)
   end
 
-  test "logs nothing when there is nothing to reap", %{source: source} do
+  test "logs no deleted-count line when there is nothing to reap", %{source: source} do
     chunk = seed_chunk(source, "keep.py", "k1")
     kept = seed_entity(source, "kept")
     Repo.insert!(%EntityMention{entity_id: kept.id, chunk_id: chunk.id, kind: :definition})
 
+    # SourceOwner.gc/1 starts (or reuses) this source's owner, whose own
+    # init drain pass always logs a line (Ingest.SourceOwner's per-pass
+    # summary) even with nothing to apply — this worker's own "graph_gc
+    # deleted N" summary line is what stays conditional on there being
+    # something to report.
     log = capture_log(fn -> assert :ok = perform_job(GraphGc, %{}) end)
 
-    assert log == ""
+    refute log =~ "graph_gc deleted"
   end
 
   test "declares a 30-minute timeout so an unbounded orphan backlog can't squat an :upsert slot forever" do

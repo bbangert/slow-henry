@@ -118,57 +118,43 @@ defmodule RetrievalNode.Ingest.PendingChunksTest do
     assert Enum.map(ids, &natural_key_by_id[&1]) == expected
   end
 
-  test "write_chunks splits a raw row into N chunk rows sharing natural_key/content_hash" do
-    {:ok, raw} = PendingChunks.insert_raw(raw_attrs())
-
-    chunks = [
-      %{chunk_index: 0, chunk_content: "chunk zero"},
-      %{chunk_index: 1, chunk_content: "chunk one"}
-    ]
-
-    assert {:ok, [c0, c1]} =
-             PendingChunks.write_chunks(raw, chunks,
-               chunk_quality: "tree_sitter",
-               scrub_mode: "regex"
-             )
-
-    assert c0.natural_key == raw.natural_key
-    assert c0.content_hash == raw.content_hash
-    assert c0.chunk_quality == "tree_sitter"
-    assert c0.status == "chunked"
-    assert Enum.sort([c0.chunk_index, c1.chunk_index]) == [0, 1]
-  end
-
-  test "set_embeddings writes 384-dim vectors back and flips status to embedded" do
-    {:ok, raw} = PendingChunks.insert_raw(raw_attrs())
-    {:ok, [chunk]} = PendingChunks.write_chunks(raw, [%{chunk_index: 0, chunk_content: "x"}])
-
-    # Distinct per-dimension values so a transposed/garbled write would be caught.
-    vector = for i <- 1..384, do: i * 0.001
-    assert {:ok, :ok} = PendingChunks.set_embeddings([%{id: chunk.id, embedding: vector}])
-
-    reloaded = PendingChunks.fetch!(chunk.id)
-    assert reloaded.status == "embedded"
-
-    round_tripped = Pgvector.to_list(reloaded.embedding)
-    assert length(round_tripped) == 384
-    # vector(384) stores float32, so compare within tolerance.
-    assert Enum.zip(round_tripped, vector) |> Enum.all?(fn {a, b} -> abs(a - b) < 1.0e-4 end)
-  end
-
-  test "set_embeddings rolls back if an id doesn't exist (no silent drop)" do
-    vector = for _ <- 1..384, do: 0.0
-
-    assert {:error, {:no_such_pending_chunk, 999_999}} =
-             PendingChunks.set_embeddings([%{id: 999_999, embedding: vector}])
-  end
-
-  test "fetch_many! and delete_by_ids operate on a set of ids" do
+  test "delete_by_ids operates on a set of ids" do
     {:ok, a} = PendingChunks.insert_raw(raw_attrs())
     {:ok, b} = PendingChunks.insert_raw(raw_attrs())
 
-    assert length(PendingChunks.fetch_many!([a.id, b.id])) == 2
     assert {2, nil} = PendingChunks.delete_by_ids([a.id, b.id])
-    assert PendingChunks.fetch_many!([a.id, b.id]) == []
+    refute Repo.get(PendingChunk, a.id)
+    refute Repo.get(PendingChunk, b.id)
+  end
+
+  test "insert_raw_all accepts a deletion entry (status: \"deleted\", no content/content_hash)" do
+    deletion = %{
+      source: "git",
+      source_id: Ecto.UUID.generate(),
+      source_type: "git_repo",
+      natural_key: "repo:acme/app:gone.py",
+      metadata: %{"path" => "gone.py"},
+      status: "deleted"
+    }
+
+    assert {:ok, [id]} = PendingChunks.insert_raw_all([deletion])
+
+    row = PendingChunks.fetch!(id)
+    assert row.status == "deleted"
+    assert row.raw_content == nil
+    assert row.content_hash == nil
+    # a deletion entry has no content to check — the binary-content guard
+    # (which would otherwise need raw_content) is skipped for it entirely.
+  end
+
+  test "insert_raw_all accepts force: true rows (defaults to false when absent)" do
+    assert {:ok, [forced_id, default_id]} =
+             PendingChunks.insert_raw_all([
+               raw_attrs(%{force: true}),
+               raw_attrs()
+             ])
+
+    assert PendingChunks.fetch!(forced_id).force == true
+    assert PendingChunks.fetch!(default_id).force == false
   end
 end

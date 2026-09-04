@@ -1,44 +1,42 @@
 defmodule RetrievalNode.Ingest.Workers.RepoSync do
   @moduledoc """
-  Watermark-driven "discover work" job for a git source. Ensures the bare mirror is
-  current, takes the `diff --raw` (`changed_entries`) between the stored
-  `last_sha` and `HEAD`, then for each added/modified file inserts a raw
-  `pending_chunks` row and enqueues a `ChunkFiles` job; files the diff marks
-  **deleted** are handled as a tombstone claim, not a guard-row delete — see
-  `delete_removed/2`. Deletion is decided by the diff status, not by whether
-  `show` can read the blob, so an unreadable-but-present file is skipped rather
-  than wrongly pruned. The watermark is advanced last (only after enqueues
-  succeed), so a crash re-discovers the same work (the `ChunkFiles`/
-  `UpsertChunks` idempotency makes re-processing harmless).
+  Watermark-driven "discover work" job for a git source. Append-only: ensures
+  the bare mirror is current, takes the `diff --raw` (`changed_entries`)
+  between the stored `last_sha` and `HEAD`, and stages one `pending_chunks`
+  row per changed file — a content row for an added/modified path, a
+  **deletion entry** (`status: "deleted"`, no content) for a removed one.
+  This job never touches `chunks`: `Ingest.SourceOwner` is the only process
+  that does, and it applies these rows in arrival order (see its moduledoc).
 
-  ## Deletion is a tombstone claim, not a row delete
+  Staging the rows and advancing the watermark happen in ONE `Repo.transaction`
+  — a plain write (`SyncState.changeset`), not a compare-and-set: this job's
+  own `unique` window makes it the sole writer of its source's cursor, so
+  nothing else could have changed it out from under a stale read the way the
+  old optimistic-CAS design guarded against. After commit,
+  `Ingest.SourceOwner.notify/1` wakes (or starts) the owner that actually
+  applies the batch. Even when `HEAD` is unchanged (`new_sha == last_sha`),
+  `notify/1` still fires — cheap, and it's what lets a previously
+  failure-marked row get another look on every cron tick without this job
+  needing to know anything about failure state.
 
-  `delete_removed/2` never deletes a `file_versions` row — it claims a fresh
-  generation for the deleted path through `Ingest.tombstone_file/4`, the same
-  helper `Ingest.Workers.DriveSync.delete_removed/2` uses for removed Drive
-  docs, which claims through the exact same `Ingest.claim_file_version/4`
-  compare-and-set `Ingest.Workers.UpsertChunks` claims through and deletes the
-  path's `chunks` only if that claim wins (`:claimed`). Deleting the guard row
-  instead (the previous design) left a hole: this job advances its watermark
-  after enqueueing `ChunkFiles` jobs, not after their downstream `UpsertChunks`
-  jobs commit, so a pre-deletion edit's `UpsertChunks` job can still be in
-  flight when the deletion runs. If the guard row were simply gone, that
-  delayed job would see no `file_versions` row for the path, treat its own
-  (now-stale) generation as a fresh first claim, and resurrect the deleted
-  file's chunks right after this job removed them.
+  ## `args["full"]` — graph-only backfill
 
-  Claiming instead of deleting closes that hole: the generation drawn for a
-  deletion (`Ingest.next_ingest_generation/1`, from the same `pending_chunks.id`
-  sequence raw rows draw their generation from) is guaranteed greater than any
-  raw row staged before the deletion ran, so a delayed pre-deletion job's claim
-  always loses (`:stale`) instead of resurrecting anything. A file re-added
-  after a deletion is unaffected — it simply claims a still-higher generation
-  (its own later raw row id) the normal way and persists normally. And a
-  deletion that runs after a newer version already committed a higher
-  generation loses too (`:stale`), so it can never delete that newer version's
-  chunks out from under it. `file_versions` rows are therefore never deleted
-  for a source's whole lifetime — a deleted path's row simply stays as a
-  tombstone recording the highest generation ever claimed for it.
+  `true` diffs against `nil` regardless of the stored cursor (stages every
+  file in the repo, exactly like a from-scratch first sync) and marks every
+  staged content row `force: true` — a re-derive request
+  (`mix rn.graph.backfill`) that must re-chunk/re-extract even though a
+  file's content is unchanged. `Ingest.FileIngest` still reuses existing
+  embeddings wherever `(chunk_key, content_hash)` matches (see its
+  moduledoc), so this is cheap despite touching the whole corpus. The
+  watermark still advances to `HEAD` regardless of `full?` — a backfill also
+  catches the source up to the latest commit.
+
+  `unique` keys on `[:source_id, :full]`, not just `:source_id`: both a
+  cron-triggered plain sync and a `"full" => true` backfill job are
+  append-only, so running both for the same source is harmless — but
+  collapsing a backfill onto an in-flight plain sync (or vice versa) would
+  silently swallow the `force: true` re-derive request the caller actually
+  wanted.
 
   Two edge cases short-circuit before any staging happens:
 
@@ -50,37 +48,21 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
       comes back a deterministic git error (`{:git, _code, _msg}`), that single file
       is skipped-and-logged rather than failing the whole job — a repo-level error
       (mirror missing, timeout) is a different reason and still propagates.
-
-  `unique` on `source_id` collapses overlapping cron/webhook triggers for one repo.
-
-  The watermark advance itself (`advance_watermark/2`) is an optimistic write:
-  it only takes effect if the `sync_states` row's `cursor` is still exactly
-  what this job read at `perform/1` start. If `Ingest.force_full_resync_git_sources/0`
-  clears the cursor (or another sync races in) while this job is mid-flight,
-  the `UPDATE` matches zero rows, a warning is logged, and the watermark is
-  deliberately left as-is — this job's staged work (`ChunkFiles`/`UpsertChunks`)
-  already happened and is idempotent, but writing the cursor computed from a
-  stale read would silently re-establish "synced to HEAD" over a cursor that
-  was just cleared for a full re-sync. Not advancing is the safe direction:
-  the next cron tick re-syncs from whatever the DB's current cursor actually is.
   """
   use Oban.Worker,
     queue: :sync,
     max_attempts: 5,
     unique: [
       period: {15, :minutes},
-      keys: [:source_id],
+      keys: [:source_id, :full],
       states: [:available, :scheduled, :executing, :retryable, :suspended]
     ]
 
-  import Ecto.Query
   require Logger
 
-  alias RetrievalNode.Ingest
-  alias RetrievalNode.Ingest.{GitMirror, PendingChunks}
-  alias RetrievalNode.Ingest.Workers.ChunkFiles
+  alias RetrievalNode.Ingest.{GitMirror, PendingChunks, SourceOwner}
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.{Chunk, Source, SyncState}
+  alias RetrievalNode.Retrieval.{Source, SyncState}
 
   @lang_by_ext %{
     "py" => "python",
@@ -97,18 +79,20 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   }
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"source_id" => source_id}}) do
+  def perform(%Oban.Job{args: %{"source_id" => source_id} = args}) do
+    full? = Map.get(args, "full", false)
     source = Repo.get!(Source, source_id)
     sync_state = get_or_create_sync_state(source_id)
     slug = repo_slug(source)
-    last_sha = Map.get(sync_state.cursor || %{}, "last_sha")
+    last_sha = unless full?, do: Map.get(sync_state.cursor || %{}, "last_sha")
 
     with {:ok, _path} <- GitMirror.ensure_mirror(slug, source.identifier),
          {:ok, new_sha} <- GitMirror.head_sha(slug) do
       if new_sha == last_sha do
+        SourceOwner.notify(source.id)
         :ok
       else
-        sync_changes(source, slug, last_sha, new_sha, sync_state)
+        sync_changes(source, slug, last_sha, new_sha, sync_state, full?)
       end
     else
       {:error, :empty_repo} ->
@@ -120,77 +104,73 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
     end
   end
 
-  defp sync_changes(source, slug, last_sha, new_sha, sync_state) do
+  defp sync_changes(source, slug, last_sha, new_sha, sync_state, full?) do
     with {:ok, entries} <- GitMirror.changed_entries(slug, last_sha, new_sha) do
       # Deletions come from the diff status, NOT from probing `show` — a file that
       # still exists but is unreadable ({:error, :file_too_large}) must be skipped,
       # never mistaken for a deletion and pruned.
       {deleted, present} = Enum.split_with(entries, fn {status, _} -> status == :deleted end)
 
-      delete_removed(source, Enum.map(deleted, &elem(&1, 1)))
+      deletion_rows =
+        Enum.map(deleted, fn {_status, path} -> deletion_row(source, slug, path) end)
 
-      with :ok <- enqueue_changed(source, slug, Enum.map(present, &elem(&1, 1)), new_sha) do
-        advance_watermark(sync_state, new_sha)
-        :ok
+      with {:ok, content_rows} <-
+             build_rows(source, slug, Enum.map(present, &elem(&1, 1)), new_sha, full?) do
+        stage_and_advance(source, sync_state, new_sha, deletion_rows ++ content_rows)
       end
     end
   end
 
-  defp delete_removed(_source, []), do: :ok
+  defp deletion_row(source, slug, path) do
+    %{
+      source: "git",
+      source_id: source.id,
+      source_type: "git_repo",
+      repo: slug,
+      natural_key: "repo:#{source.id}:#{path}",
+      metadata: %{"path" => path},
+      status: "deleted"
+    }
+  end
 
-  defp delete_removed(source, paths) do
-    Enum.each(paths, &delete_one_path(source, &1))
+  # Stages this batch's rows AND advances the watermark to new_sha in ONE
+  # transaction — insert_raw_all/1's own transaction nests inside (joins)
+  # this one, so the whole thing is atomic: either every row this sync
+  # discovered is durable AND the cursor reflects it, or (on any error)
+  # neither happened and the next cron tick re-discovers the same diff.
+  defp stage_and_advance(source, sync_state, new_sha, rows) do
+    {:ok, :ok} =
+      Repo.transaction(
+        fn ->
+          if rows != [], do: PendingChunks.insert_raw_all(rows)
+          advance_watermark!(sync_state, new_sha)
+          :ok
+        end,
+        timeout: PendingChunks.insert_timeout()
+      )
+
+    SourceOwner.notify(source.id)
     :ok
   end
 
-  # Each deleted path claims its own fresh generation through the same
-  # compare-and-set `Ingest.Workers.UpsertChunks` claims through — see the
-  # moduledoc's "Deletion is a tombstone claim" section for why a guard-row
-  # delete is unsafe here. `Ingest.tombstone_file/4` runs the draw, the claim,
-  # and the conditional delete inside one transaction (`claim_file_version/4`
-  # must be called inside the caller's own transaction — its own @doc).
-  defp delete_one_path(source, path) do
-    Repo.transaction(fn ->
-      Ingest.tombstone_file(Repo, source.id, path, fn repo ->
-        from(c in Chunk,
-          where: c.source_id == ^source.id and fragment("?->>'path'", c.metadata) == ^path
-        )
-        |> repo.delete_all()
-      end)
-    end)
-
-    :ok
+  defp advance_watermark!(sync_state, new_sha) do
+    sync_state
+    |> SyncState.changeset(%{
+      cursor: Map.put(sync_state.cursor || %{}, "last_sha", new_sha),
+      status: :idle,
+      last_synced_at: DateTime.utc_now()
+    })
+    |> Repo.update!()
   end
 
-  defp enqueue_changed(_source, _slug, [], _new_sha), do: :ok
-
-  defp enqueue_changed(source, slug, paths, new_sha) do
-    with {:ok, rows} <- build_rows(source, slug, paths, new_sha) do
-      {:ok, ids} = PendingChunks.insert_raw_all(rows)
-      enqueue_chunk_files(ids)
-    end
-  end
-
-  # Surface a failed enqueue ({:error, _}) so perform errors and the watermark isn't
-  # advanced past staged rows that never got a ChunkFiles job. A unique overlap comes
-  # back {:ok, conflict?} and is fine.
-  defp enqueue_chunk_files(ids) do
-    Enum.reduce_while(ids, :ok, fn id, :ok ->
-      case Oban.insert(ChunkFiles.new(%{"pending_chunk_id" => id})) do
-        {:ok, _job} -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-  end
-
-  # Build raw rows, halting on any *unexpected* show error so the job retries
-  # (watermark not advanced) rather than silently dropping the file forever. Known
-  # non-indexable/deterministic-per-file cases are skipped instead — the file
-  # exists (or, for a gitlink that slipped through, "exists" in a sense `show`
-  # can't read), there's nothing a retry would fix.
-  defp build_rows(source, slug, paths, new_sha) do
+  # Build content rows, halting on any *unexpected* show error so the job retries
+  # (nothing staged, watermark not advanced) rather than silently dropping the
+  # file forever. Known non-indexable/deterministic-per-file cases are skipped
+  # instead — the file exists (or, for a gitlink that slipped through, "exists"
+  # in a sense `show` can't read), there's nothing a retry would fix.
+  defp build_rows(source, slug, paths, new_sha, full?) do
     Enum.reduce_while(paths, {:ok, []}, fn path, {:ok, acc} ->
-      case raw_row(source, slug, path, new_sha) do
+      case raw_row(source, slug, path, new_sha, full?) do
         {:ok, row} -> {:cont, {:ok, [row | acc]}}
         :skip -> {:cont, {:ok, acc}}
         {:error, reason} -> {:halt, {:error, {path, reason}}}
@@ -198,7 +178,7 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
     end)
   end
 
-  defp raw_row(source, slug, path, new_sha) do
+  defp raw_row(source, slug, path, new_sha, full?) do
     case GitMirror.show(slug, path, new_sha) do
       {:ok, content} ->
         {:ok,
@@ -211,7 +191,8 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
            natural_key: "repo:#{source.id}:#{path}",
            content_hash: sha256(content),
            raw_content: content,
-           metadata: %{"path" => path, "ref" => new_sha}
+           metadata: %{"path" => path, "ref" => new_sha},
+           force: full?
          }}
 
       {:error, :file_too_large} ->
@@ -232,33 +213,6 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
       {:error, reason} ->
         {:error, reason}
     end
-  end
-
-  # Public (not `defp`) and @doc false purely so RepoSyncTest can exercise the
-  # concurrent-clear race directly — not part of this worker's job-behaviour API.
-  @doc false
-  def advance_watermark(sync_state, new_sha) do
-    new_cursor = Map.put(sync_state.cursor || %{}, "last_sha", new_sha)
-
-    # Optimistic concurrency check — see the moduledoc's watermark paragraph:
-    # only advance if the row's cursor still matches what was read at the
-    # start of this job.
-    {count, _} =
-      Repo.update_all(
-        from(s in SyncState,
-          where: s.id == ^sync_state.id and s.cursor == ^(sync_state.cursor || %{})
-        ),
-        set: [cursor: new_cursor, status: :idle, last_synced_at: DateTime.utc_now()]
-      )
-
-    if count == 0 do
-      Logger.warning(
-        "sync_state cursor changed mid-sync (concurrent clear/backfill?) — " <>
-          "not advancing watermark; next sync re-discovers from the newer cursor"
-      )
-    end
-
-    :ok
   end
 
   defp get_or_create_sync_state(source_id) do

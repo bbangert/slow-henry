@@ -27,16 +27,30 @@ config :retrieval_node,
   embedding_impl: RetrievalNode.Embedding.NxServingImpl,
   reranking_impl: RetrievalNode.Reranking.NxServingImpl
 
-# Oban ingest pipeline. Queue concurrencies (design-oban §2): sync I/O-bound;
-# chunk CPU+NIF (bounded so it doesn't monopolize dirty schedulers); embed=1
-# (single Nx.Serving, must not starve the MCP endpoint); upsert cheap Postgres.
-# Pruner keeps 14d of job history; Lifeline rescues jobs orphaned >20m. The Cron
-# plugin below drives per-source watermark syncs via SyncScheduler (see its own
-# comment for the fan-out rationale). Repo pool_size is raised (dev/runtime) to
-# num_queues + sum(limits) + buffer.
+# Oban: `sync` is the only ingest queue left. It runs discovery
+# (RepoSync/DriveSync/JiraSync — I/O-bound, watermark-driven "stage rows and
+# notify") plus the daily GraphGc sweep below. Per-file work (scrub -> chunk
+# -> embed -> write) no longer runs on Oban at all — it runs inside
+# `Ingest.SourceOwner`, one GenServer boundary process per source with work,
+# started on demand by a discovery worker's `notify/1` call (see that
+# module's moduledoc: the redesign that replaced the old
+# chunk/embed/upsert queues). Embedding concurrency across those
+# concurrently-running owners is bounded by `Nx.Serving`'s own cross-caller
+# batching (confirmed by the Phase 0 spike: concurrent `batched_run/2`
+# callers coalesce into shared batches), not by a queue concurrency limit.
+# Pruner keeps 14d of job history; Lifeline rescues jobs orphaned >20m. The
+# Cron plugin below drives per-source watermark syncs via SyncScheduler (see
+# its own comment for the fan-out rationale) and the daily GraphGc sweep,
+# which fans out per source through `Ingest.SourceOwner.gc/1` (see that
+# worker's moduledoc) — that's a `chunks`/graph-table write too, so it's
+# funneled through the same single-writer-per-source boundary as everything
+# else. Repo pool_size (dev/runtime) is raised to cover the `sync` queue's
+# concurrency (3) plus concurrent `Ingest.SourceOwner` write transactions
+# (one per source with work, held only for the duration of one file's
+# write) plus MCP/ad-hoc connections.
 config :retrieval_node, Oban,
   repo: RetrievalNode.Repo,
-  queues: [sync: 3, chunk: 2, embed: 1, upsert: 5],
+  queues: [sync: 3],
   plugins: [
     {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 14},
     {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(20)},
@@ -55,7 +69,7 @@ config :retrieval_node, Oban,
 
 # Embedding serving (Bumblebee/Nx.Serving over nomic-embed-text-v1.5). `compile`
 # forces a JIT pass at init (batch_size 16); batch_timeout groups concurrent
-# query/indexing calls. The model emits 768-dim vectors; the impl
+# owner/query calls. The model emits 768-dim vectors; the impl
 # Matryoshka-truncates to 384.
 #
 # `sequence_length` is a list of shape-bucket lengths rather than one fixed

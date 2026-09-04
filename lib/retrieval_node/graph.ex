@@ -6,16 +6,18 @@ defmodule RetrievalNode.Graph do
   one-context-per-table boundary: this module IS the context responsible for
   those three tables, not a call-site reaching around one.
 
-  Called from inside `Ingest.Workers.UpsertChunks`' transaction — every
+  Called from inside `Ingest.FileIngest.apply/2`'s write transaction — every
   `insert_all`/`delete_all` here runs against the same `repo` (the sandboxed
   connection for that transaction), and `chunk_ids_by_key` is the id map
-  UpsertChunks just produced from its own (possibly ON CONFLICT-preserved)
-  chunk insert.
+  `FileIngest` just produced from its own (possibly ON CONFLICT-preserved)
+  chunk insert. Only `Ingest.SourceOwner` ever calls `apply/2` (its
+  single-writer contract), so `upsert_from_staged/3` never races a concurrent
+  caller for the same source.
 
-  `upsert_from_staged/3` assumes all `staged_rows` come from one
-  `ChunkFiles` job's worth of chunks (one source file, hence one
-  `source_id`) — the same assumption `UpsertChunks` already relies on
-  implicitly for its own chunk upsert.
+  `upsert_from_staged/3` assumes all `staged_rows` come from one raw row's
+  worth of chunks (one source file, hence one `source_id`) — the same
+  assumption `FileIngest` already relies on implicitly for its own chunk
+  upsert.
 
   Also owns the read side of the same three tables — `find_entities/2`,
   `related_entities/3`, `definition_snippets/2` — used by the `related_code`
@@ -31,7 +33,7 @@ defmodule RetrievalNode.Graph do
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.Chunk
 
-  # Same 65,535-bind-parameter ceiling as PendingChunks/UpsertChunks (see
+  # Same 65,535-bind-parameter ceiling as PendingChunks/FileIngest (see
   # PendingChunks' moduledoc) — every insert_all below batches at this size.
   @insert_batch_size 2_000
 
@@ -62,7 +64,7 @@ defmodule RetrievalNode.Graph do
 
     # write_edges/2's per-from-entity delete-then-rederive safety argument
     # assumes every row in this batch belongs to one source (one file) —
-    # UpsertChunks batches are per-file today; this pins that assumption so a
+    # FileIngest batches are per-file today; this pins that assumption so a
     # future caller violating it fails loudly instead of silently clobbering
     # another file's edges.
     unless Enum.all?(staged_rows, &(Map.fetch!(&1, :source_id) == source_id)) do
@@ -109,42 +111,50 @@ defmodule RetrievalNode.Graph do
   # --- garbage collection -------------------------------------------------
 
   @doc """
-  Deletes entities with zero remaining `entity_mentions` — the ingest
-  pipeline's file-deletion path (`Repo.delete_all` on `chunks` by
-  `source_id`/path) cascades away the mentions on those chunks but has no
-  reason to know about the entities they used to point at, so a
-  zero-mention entity is a durable orphan until something reaps it. Its
-  `entity_edges` rows die for free via their own `entities` FK cascade —
-  no separate edge cleanup needed here. Chunk-provenance edge rows (those
-  carrying a non-NULL `chunk_id`) additionally cascade the moment their
-  owning chunk is deleted, via `entity_edges.chunk_id`'s own FK — same
+  Deletes entities with zero remaining `entity_mentions` — a file's chunks
+  going away (a deletion entry, or a boundary shift that reconciles old
+  `chunk_key`s out — see `Ingest.FileIngest`) cascades away the mentions on
+  those chunks but has no reason to know about the entities they used to
+  point at, so a zero-mention entity is a durable orphan until something
+  reaps it. Its `entity_edges` rows die for free via their own `entities` FK
+  cascade — no separate edge cleanup needed here. Chunk-provenance edge rows
+  (those carrying a non-NULL `chunk_id`) additionally cascade the moment
+  their owning chunk is deleted, via `entity_edges.chunk_id`'s own FK — same
   lifecycle as `entity_mentions` — so this GC's job for those rows is
   already partly done by the time an entity goes zero-mention; the
   `entities` FK cascade above remains the catch-all for whatever a chunk
   deletion didn't reach (e.g. legacy NULL-`chunk_id` edge rows).
+
+  `:source_id` scopes the candidate select to one source — what
+  `Ingest.SourceOwner.gc/1` calls after a pass that reconciled or deleted a
+  file, reaping only the source it owns. Omitted, this scans every source
+  (`Ingest.Workers.GraphGc`'s daily catch-all sweep, for orphans older than
+  the per-source-reap behavior, or from before it existed).
 
   Deletes in batches of `:batch_size` (default 10,000) rather than one
   statement: `entities` is sized for a many-repo corpus (can reach into the
   millions of rows), and one unbounded `DELETE` would hold its row locks
   and accumulate undo/WAL for the entire scan instead of releasing them
   between batches. Loops until a round's candidate select comes back
-  shorter than a full batch (see `delete_orphaned_batch/1` for why this is
-  no longer "deletes fewer than a batch" — the recheck it does can now
-  legitimately delete less than it selected). Returns the total number of
-  entities deleted. Raises `ArgumentError` if `:batch_size` is not a positive
-  integer — a non-positive batch never returns fewer candidates than itself,
-  which would otherwise recurse forever on an empty batch.
+  shorter than a full batch. Returns the total number of entities deleted.
+  Raises `ArgumentError` if `:batch_size` is not a positive integer — a
+  non-positive batch never returns fewer candidates than itself, which
+  would otherwise recurse forever on an empty batch.
 
-  Each batch selects and deletes inside one transaction, locking candidates
-  against a concurrent `UpsertChunks` upsert (queue concurrency 5) landing a
-  new mention in the gap between classification and delete — see
-  `delete_orphaned_batch/1`.
+  No locking: with a single writer per source (`Ingest.SourceOwner` — see
+  its moduledoc), there is no concurrent process that could land a new
+  mention on one of this batch's candidates between the select and the
+  delete, so each batch is a plain "select candidate ids, delete those ids"
+  inside one transaction — the `FOR UPDATE SKIP LOCKED` + delete-time
+  recheck an earlier revision used here existed only for a multi-writer
+  world this design no longer has.
   """
   @spec gc_orphaned_entities(keyword()) :: non_neg_integer()
   def gc_orphaned_entities(opts \\ []) do
     batch_size = Keyword.get(opts, :batch_size, @gc_batch_size)
     validate_positive_batch_size!(batch_size)
-    gc_batches(batch_size, 0)
+    source_id = Keyword.get(opts, :source_id)
+    gc_batches(batch_size, source_id, 0)
   end
 
   # Shared entry-point guard for every batch_size this module uses to drive a
@@ -165,86 +175,54 @@ defmodule RetrievalNode.Graph do
     raise ArgumentError, "batch_size must be a positive integer, got: #{inspect(other)}"
   end
 
-  defp gc_batches(batch_size, total) do
-    {candidate_count, deleted} = delete_orphaned_batch(batch_size)
+  defp gc_batches(batch_size, source_id, total) do
+    {candidate_count, deleted} = delete_orphaned_batch(batch_size, source_id)
     total = total + deleted
 
     if candidate_count < batch_size do
       total
     else
-      gc_batches(batch_size, total)
+      gc_batches(batch_size, source_id, total)
     end
   end
 
-  # A plain "SELECT zero-mention ids, then DELETE those ids" (the previous
-  # shape) is a snapshot race: a mention committed by a concurrent
-  # UpsertChunks between the SELECT and the DELETE is invisible to the
-  # SELECT's NOT EXISTS, so its entity looks orphaned and gets deleted
-  # anyway — cascading away the just-inserted mention along with it.
-  #
-  # Fixed with lock-then-recheck, both inside one transaction:
-  #
-  #   1. SELECT candidate ids `FOR UPDATE SKIP LOCKED`. This takes a row lock
-  #      on each candidate entity. SKIP LOCKED means GC never blocks behind
-  #      an in-flight UpsertChunks transaction that's already touching one of
-  #      these rows (e.g. via its own FK-driven lock) — it just moves on to
-  #      the next candidate and picks this one up on a later run instead.
-  #   2. DELETE those ids with the SAME zero-mention condition rechecked in
-  #      the DELETE's own WHERE. A concurrent mention INSERT must acquire a
-  #      FOR KEY SHARE lock on its parent entity row (Postgres does this
-  #      automatically for the FK reference) — which now blocks on our FOR
-  #      UPDATE until this transaction commits or rolls back. So by the time
-  #      the DELETE runs, any mention that could still land on a candidate
-  #      has either already committed (making the recheck's NOT EXISTS catch
-  #      it and spare the row) or is blocked until we're done (and lands
-  #      after, on a surviving row, since we only deleted what still had zero
-  #      mentions at DELETE time).
-  #
-  # Consequence: a round can now delete FEWER rows than it selected as
-  # candidates (some got spared by the recheck) — the candidate count, not
-  # the delete count, is what gc_batches/2 uses to decide whether to loop
-  # again.
-  defp delete_orphaned_batch(batch_size) do
+  # One transaction: select this round's candidate ids, delete them. No
+  # locking — a single writer per source (Ingest.SourceOwner) means no
+  # concurrent process can land a new mention on a candidate between the
+  # SELECT and the DELETE, so unlike an earlier multi-writer revision of
+  # this function, there's no snapshot race here to guard against. The
+  # candidate count (not the delete count — the two are always equal now)
+  # drives gc_batches/3's "was that a full batch" decision.
+  defp delete_orphaned_batch(batch_size, source_id) do
     {:ok, {candidate_count, deleted}} =
       Repo.transaction(fn ->
         orphan_ids =
-          from(e in Entity,
-            as: :entity,
-            where:
-              not exists(
-                from(m in EntityMention, where: m.entity_id == parent_as(:entity).id, select: 1)
-              ),
-            select: e.id,
-            limit: ^batch_size,
-            lock: "FOR UPDATE SKIP LOCKED"
-          )
+          orphan_candidates_query(source_id)
+          |> select([e], e.id)
+          |> limit(^batch_size)
           |> Repo.all()
 
-        deleted = delete_still_orphaned(orphan_ids)
+        {count, _} = Repo.delete_all(from(e in Entity, where: e.id in ^orphan_ids))
 
-        {length(orphan_ids), deleted}
+        {length(orphan_ids), count}
       end)
 
     {candidate_count, deleted}
   end
 
-  defp delete_still_orphaned([]), do: 0
-
-  defp delete_still_orphaned(ids) do
-    {count, _} =
-      Repo.delete_all(
-        from(e in Entity,
-          as: :entity,
-          where: e.id in ^ids,
-          where:
-            not exists(
-              from(m in EntityMention, where: m.entity_id == parent_as(:entity).id, select: 1)
-            )
+  defp orphan_candidates_query(source_id) do
+    from(e in Entity,
+      as: :entity,
+      where:
+        not exists(
+          from(m in EntityMention, where: m.entity_id == parent_as(:entity).id, select: 1)
         )
-      )
-
-    count
+    )
+    |> scope_source(source_id)
   end
+
+  defp scope_source(query, nil), do: query
+  defp scope_source(query, source_id), do: from(e in query, where: e.source_id == ^source_id)
 
   # --- read-side queries ---------------------------------------------------
 
@@ -612,7 +590,7 @@ defmodule RetrievalNode.Graph do
   # (or already sitting in pending_chunks when a cap ships) can still carry
   # oversized names, and one such row past the entities unique btree index's
   # ~2,700-byte row limit fails the INSERT and — after max_attempts — discards
-  # the whole UpsertChunks job, losing every chunk in the file. Dropped with a
+  # the whole FileIngest.apply/2 call, losing every chunk in the file. Dropped with a
   # warning rather than raised: junk symbols must never take real chunks down.
   #
   # Shape, not just size, is validated here — at two levels:
@@ -780,7 +758,7 @@ defmodule RetrievalNode.Graph do
   # Staged graph jsonb is extractor-produced; the LLM-extractor seam means a
   # future producer could emit a ref kind neither TreeSitter clause expects.
   # Fail with a clear ArgumentError here rather than a FunctionClauseError
-  # deep inside UpsertChunks' transaction.
+  # deep inside Ingest.FileIngest.apply/2's write transaction.
   defp ref_entity_kind(other) do
     raise ArgumentError,
           "unknown reference kind #{inspect(other)} — expected \"call\" or \"import\""
@@ -903,7 +881,7 @@ defmodule RetrievalNode.Graph do
   end
 
   # Rows whose chunk_key has no entry in chunk_ids_by_key were skipped by
-  # UpsertChunks' own insert (shouldn't happen in practice — every staged row
+  # FileIngest's own insert (shouldn't happen in practice — every staged row
   # in this job was just written — but skip rather than crash on a nil chunk id).
   defp mention_entries(row, chunk_ids_by_key, entity_ids) do
     case Map.get(chunk_ids_by_key, row.chunk_key) do
@@ -1086,8 +1064,9 @@ defmodule RetrievalNode.Graph do
   # Sorts entries by their table's ON CONFLICT target tuple BEFORE they reach
   # insert_all_batched/4's Enum.chunk_every/2 — so the ordering holds across
   # batch boundaries too, not just within one batch. Two concurrent
-  # UpsertChunks jobs (queue concurrency 5) upserting overlapping keys in
-  # different orders is the classic Postgres multi-row ON CONFLICT deadlock:
+  # SourceOwner processes (one per source with work) upserting overlapping
+  # keys in different orders is the classic Postgres multi-row ON CONFLICT
+  # deadlock:
   # if batch A locks {X, Y} in that order while batch B locks {Y, X}, each
   # acquires one row lock then blocks waiting on the other. Sorting every
   # batch by the same key makes lock acquisition order consistent across
@@ -1112,7 +1091,7 @@ defmodule RetrievalNode.Graph do
   end
 
   # Ecto.Enum's dump values are looked up rather than String.to_existing_atom/1
-  # (same reasoning as UpsertChunks.to_enum/2): atom interning is load-order
+  # (same reasoning as FileIngest.to_enum/2): atom interning is load-order
   # dependent, and this stays a strict allowlist against the schema's own enum.
   defp kind_atom(schema, field, value) when is_binary(value) do
     schema

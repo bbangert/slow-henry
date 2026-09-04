@@ -1,25 +1,24 @@
 defmodule RetrievalNode.Ingest.Workers.DriveSync do
   @moduledoc """
-  Watermark-driven "discover work" job for a Google Drive folder/drive. Fetches
-  Changes since the stored `start_page_token`: each changed Doc is exported to
-  markdown, staged as a raw `pending_chunks` row, and enqueued for `ChunkFiles`;
-  removed/unshared files have their permanent `chunks` pruned. Advances the cursor.
-  A 429 returns `{:snooze, seconds}`.
+  Watermark-driven "discover work" job for a Google Drive folder/drive.
+  Append-only, same shape as `Ingest.Workers.RepoSync`: fetches Changes since
+  the stored `start_page_token`, exports each changed Doc to markdown and
+  stages it as a raw `pending_chunks` row, and stages a **deletion entry**
+  (`status: "deleted"`, `natural_key: "drive:<doc_id>"`) for each
+  removed/unshared doc id — never touches `chunks` directly.
+  `Ingest.SourceOwner` is the only process that does (see its moduledoc).
 
-  ## Deletion is a tombstone claim, not a row delete
+  Staging the rows and advancing the cursor happen in ONE `Repo.transaction`
+  (a plain write — this job's `unique` window on `source_id` makes it the
+  sole writer of its cursor, so no compare-and-set is needed). After commit,
+  `Ingest.SourceOwner.notify/1` wakes (or starts) the owner that applies the
+  batch.
 
-  `delete_removed/2` mirrors `Ingest.Workers.RepoSync.delete_removed/2` exactly
-  (see that moduledoc's "Deletion is a tombstone claim" section for the full
-  race it closes): each removed doc id claims its own fresh generation via
-  `Ingest.tombstone_file/4` — the same claim-then-conditionally-delete helper
-  RepoSync uses — rather than deleting its `chunks` unconditionally. A
-  still-in-flight pre-deletion `UpsertChunks` job for that doc loses the race
-  (`:stale`) instead of resurrecting the deleted Doc's chunks, and a deletion
-  that runs after a newer version already committed a higher generation loses
-  too, leaving that version's chunks untouched. `file_versions` rows are
-  therefore never deleted for a Drive source's whole lifetime either — a
-  removed doc's row stays as a tombstone recording the highest generation ever
-  claimed for it.
+  A 429 returns `{:snooze, seconds}`. An export failure stages the
+  successes (idempotent via `chunk_key` on the owner's side) but does NOT
+  advance the cursor — advancing past a Doc that failed to export would skip
+  it forever, since it won't reappear in a later Changes page — and returns
+  `{:error, :export_incomplete}` so Oban retries the whole page.
   """
   use Oban.Worker,
     queue: :sync,
@@ -30,13 +29,9 @@ defmodule RetrievalNode.Ingest.Workers.DriveSync do
       states: [:available, :scheduled, :executing, :retryable, :suspended]
     ]
 
-  import Ecto.Query
-
-  alias RetrievalNode.Ingest
-  alias RetrievalNode.Ingest.{Drive, PendingChunks}
-  alias RetrievalNode.Ingest.Workers.ChunkFiles
+  alias RetrievalNode.Ingest.{Drive, PendingChunks, SourceOwner}
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.{Chunk, Source, SyncState}
+  alias RetrievalNode.Retrieval.{Source, SyncState}
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"source_id" => source_id}}) do
@@ -52,33 +47,22 @@ defmodule RetrievalNode.Ingest.Workers.DriveSync do
   end
 
   defp ingest(source, state, %{changed: changed, removed: removed, cursor: new_cursor}) do
-    delete_removed(source, removed)
-
+    deletion_rows = Enum.map(removed, &deletion_row(source, &1))
     results = Enum.map(changed, &raw_row(source, &1))
-    rows = for {:ok, row} <- results, do: row
-    {:ok, ids} = PendingChunks.insert_raw_all(rows)
+    content_rows = for {:ok, row} <- results, do: row
 
-    # Advancing the cursor past a Doc we failed to export/enqueue would skip it
-    # forever (it won't reappear in the next Changes page). Stage the successes
-    # (idempotent via chunk_key), but if any export OR enqueue failed — typically a
-    # transient 429/5xx — leave the cursor put and error so Oban re-runs the page.
-    with :ok <- enqueue_chunk_files(ids) do
-      if Enum.any?(results, &match?({:error, _}, &1)) do
-        {:error, :export_incomplete}
-      else
-        advance_watermark(state, new_cursor)
-        :ok
-      end
-    end
+    stage_and_maybe_advance(source, state, new_cursor, deletion_rows ++ content_rows, results)
   end
 
-  defp enqueue_chunk_files(ids) do
-    Enum.reduce_while(ids, :ok, fn id, :ok ->
-      case Oban.insert(ChunkFiles.new(%{"pending_chunk_id" => id})) do
-        {:ok, _job} -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
+  defp deletion_row(source, doc_id) do
+    %{
+      source: "drive",
+      source_id: source.id,
+      source_type: "drive_folder",
+      natural_key: "drive:#{doc_id}",
+      metadata: %{"doc_id" => doc_id},
+      status: "deleted"
+    }
   end
 
   defp raw_row(source, doc) do
@@ -101,34 +85,38 @@ defmodule RetrievalNode.Ingest.Workers.DriveSync do
     end
   end
 
-  defp delete_removed(_source, []), do: :ok
+  # Advancing the cursor past a Doc we failed to export would skip it forever
+  # (it won't reappear in the next Changes page), so the successes are still
+  # staged (idempotent via chunk_key on the owner's side) but the cursor is
+  # left put and {:error, :export_incomplete} is returned so Oban re-runs the
+  # page. Either way, whatever WAS staged is committed and notified — a
+  # partial page isn't held back waiting for the whole page to succeed.
+  defp stage_and_maybe_advance(source, state, new_cursor, rows, export_results) do
+    {:ok, :ok} =
+      Repo.transaction(
+        fn ->
+          if rows != [], do: PendingChunks.insert_raw_all(rows)
 
-  defp delete_removed(source, doc_ids) do
-    Enum.each(doc_ids, &delete_one_doc(source, &1))
-    :ok
+          if not Enum.any?(export_results, &match?({:error, _}, &1)),
+            do: advance_watermark!(state, new_cursor)
+
+          :ok
+        end,
+        timeout: PendingChunks.insert_timeout()
+      )
+
+    SourceOwner.notify(source.id)
+
+    if Enum.any?(export_results, &match?({:error, _}, &1)) do
+      {:error, :export_incomplete}
+    else
+      :ok
+    end
   end
 
-  # Mirrors RepoSync.delete_one_path/2 — each removed doc id claims its own
-  # fresh generation through `Ingest.tombstone_file/4` (draw + claim + the
-  # conditional delete all inside one transaction) rather than an
-  # unconditional delete. See the moduledoc's "Deletion is a tombstone claim"
-  # section.
-  defp delete_one_doc(source, doc_id) do
-    Repo.transaction(fn ->
-      Ingest.tombstone_file(Repo, source.id, doc_id, fn repo ->
-        from(c in Chunk,
-          where: c.source_id == ^source.id and fragment("?->>'doc_id'", c.metadata) == ^doc_id
-        )
-        |> repo.delete_all()
-      end)
-    end)
+  defp advance_watermark!(_state, nil), do: :ok
 
-    :ok
-  end
-
-  defp advance_watermark(_state, nil), do: :ok
-
-  defp advance_watermark(state, cursor) do
+  defp advance_watermark!(state, cursor) do
     state
     |> SyncState.changeset(%{
       cursor: Map.put(state.cursor || %{}, "start_page_token", cursor),

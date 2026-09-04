@@ -10,9 +10,10 @@ defmodule RetrievalNode.Ingest do
   import Ecto.Query
 
   alias RetrievalNode.Graph.{Entity, EntityEdge, EntityMention}
+  alias RetrievalNode.Ingest.PendingChunks
   alias RetrievalNode.Ingest.Workers.RepoSync
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.{Chunk, FileVersion, PendingChunk, Source, SyncState}
+  alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source}
 
   @type repo_entry :: %{
           repo: String.t(),
@@ -66,26 +67,28 @@ defmodule RetrievalNode.Ingest do
     do: %{repo: s.name, source_type: to_string(s.source_type), default_ref: nil}
 
   @doc """
-  Forces a full re-sync of every active git source by clearing its sync
-  watermark (`sync_states.cursor`'s `"last_sha"`) and enqueueing a fresh
-  `RepoSync` job. `RepoSync` with no `last_sha` diffs against nothing and
-  stages every file in the repo (see its moduledoc); the existing
-  `chunk_key`/`content_hash` idempotency in `ChunkFiles`/`UpsertChunks` makes
-  the re-run a replace of each chunk, not a duplicate — this is how newly
-  added graph extraction (entities/mentions/edges) backfills onto a corpus
-  that was already ingested before that pipeline stage existed.
+  Forces a graph-only backfill re-derive of every active git source by
+  enqueueing a `RepoSync` job with `"full" => true` for each. `RepoSync`
+  treats `full?` as "diff against nil regardless of the stored cursor" (see
+  its moduledoc) — it stages every file in the repo, tagged `force: true`,
+  and still advances the watermark to `HEAD` on completion. No cursor is
+  cleared here (append-only discovery has nothing to clear): the previous
+  design's `sync_states.cursor` reset is gone along with the CAS watermark
+  it existed to protect. `Ingest.SourceOwner`/`Ingest.FileIngest` reuse
+  existing embeddings wherever `(chunk_key, content_hash)` matches, so a
+  `force: true` re-derive is cheap despite touching the whole corpus — this
+  is how newly added graph extraction (entities/mentions/edges) backfills
+  onto a corpus that was already ingested before that pipeline stage existed.
 
   Only *active* git sources are touched (`policy: :deny` sources are included
   deliberately — `RepoSync` has no policy gate, only `Ingest.list_repos/0`'s
   MCP-facing catalog does); inactive sources and non-git sources are left
   alone entirely.
 
-  `RepoSync` declares a 15-minute `unique` window on `source_id` — if a
-  cron-driven `SyncScheduler` tick already queued/started a `RepoSync` for a
-  source in that window, `Oban.insert/1` here collapses onto it instead of
-  adding a second job. That's fine: the cursor was already cleared before the
-  insert, so whichever job actually runs (this one or the cron one it
-  deduped onto) does the full re-stage regardless of which caller's args won.
+  `RepoSync` declares a `unique` window keyed on `[:source_id, :full]` — a
+  `"full" => true` job for a source can't be swallowed by an in-flight plain
+  cron sync for that same source (or vice versa), so this always gets its
+  own job even when `SyncScheduler` just fired.
   """
   @spec force_full_resync_git_sources() :: {:ok, non_neg_integer()} | {:error, term()}
   def force_full_resync_git_sources, do: force_full_resync_git_sources(:all)
@@ -100,9 +103,9 @@ defmodule RetrievalNode.Ingest do
   `name` OR its `identifier` (whichever the caller has handy). Any entry
   that matches no *active* git source is reported back as
   `{:error, {:unknown_sources, unmatched}}` — the whole call is rejected
-  (no cursor is cleared, nothing is enqueued) rather than silently
-  resyncing a partial set, so a typo'd source name never runs a full
-  backfill for the wrong repo without warning.
+  (nothing is enqueued) rather than silently resyncing a partial set, so a
+  typo'd source name never runs a full backfill for the wrong repo without
+  warning.
   """
   @spec force_full_resync_git_sources(:all | [String.t()]) ::
           {:ok, non_neg_integer()}
@@ -140,29 +143,23 @@ defmodule RetrievalNode.Ingest do
 
   defp resync_sources(sources) do
     Enum.reduce_while(sources, {:ok, 0}, fn source, {:ok, count} ->
-      clear_sync_cursor!(source.id)
-
-      case Oban.insert(RepoSync.new(%{"source_id" => source.id})) do
+      case Oban.insert(RepoSync.new(%{"source_id" => source.id, "full" => true})) do
         {:ok, _job} -> {:cont, {:ok, count + 1}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
   end
 
-  defp clear_sync_cursor!(source_id) do
-    case Repo.get_by(SyncState, source_id: source_id) do
-      nil -> Repo.insert!(%SyncState{source_id: source_id, cursor: %{}, status: :idle})
-      state -> state |> SyncState.changeset(%{cursor: %{}}) |> Repo.update!()
-    end
-  end
-
   @doc """
   Read-only snapshot of backfill progress: `pending_chunks` counts by stage
-  status, `oban_jobs` in-flight counts by queue and state, and corpus-wide
+  status, `oban_jobs` in-flight counts by queue and state, corpus-wide
   `graph` totals (entities/entity_mentions/entity_edges plus the chunk count
-  they're derived from). Used by `mix rn.graph.backfill --status` to monitor
-  a resync started elsewhere (the dev server's Oban queues) without touching
-  any state itself.
+  they're derived from), `failed_files` (rows `Ingest.SourceOwner` gave up on
+  — `PendingChunks.failed_count/0`), and `owners` (how many `SourceOwner`
+  processes are currently registered in `Ingest.SourceRegistry` — 0 on a VM
+  that doesn't run ingest, e.g. this task's own boot). Used by
+  `mix rn.graph.backfill --status` to monitor a resync started elsewhere (the
+  dev server's Oban queues) without touching any state itself.
   """
   @spec backfill_status() :: %{
           pending_chunks: %{String.t() => non_neg_integer()},
@@ -172,13 +169,17 @@ defmodule RetrievalNode.Ingest do
             entity_mentions: non_neg_integer(),
             entity_edges: non_neg_integer(),
             chunks: non_neg_integer()
-          }
+          },
+          failed_files: non_neg_integer(),
+          owners: non_neg_integer()
         }
   def backfill_status do
     %{
       pending_chunks: pending_chunk_counts_by_status(),
       oban_jobs: oban_job_counts_by_queue_and_state(),
-      graph: graph_totals()
+      graph: graph_totals(),
+      failed_files: PendingChunks.failed_count(),
+      owners: Registry.count(RetrievalNode.Ingest.SourceRegistry)
     }
   end
 
@@ -212,7 +213,7 @@ defmodule RetrievalNode.Ingest do
     }
   end
 
-  # --- file-identity chunk reconciliation (shared by UpsertChunks and ChunkFiles) ---
+  # --- file-identity chunk reconciliation ---
 
   # Per-source-type identity field a file's chunk rows are grouped/scoped by —
   # the same field each Sync worker's own file-level deletion already keys
@@ -231,9 +232,9 @@ defmodule RetrievalNode.Ingest do
   @doc """
   Resolves a file's stable identity `{field, value}` from its `source_type`
   and staged `metadata`, or `nil` when `source_type` isn't a known identity
-  carrier or the field is missing/blank. Shared by `reconcile_file_chunks/5`
-  and `Ingest.Workers.UpsertChunks`' own batch-grouping (a batch can span more
-  than one file — see that module's moduledoc).
+  carrier or the field is missing/blank. Used by `reconcile_file_chunks/5` and
+  by `Ingest.FileIngest`'s own unchanged-content skip and embedding-reuse
+  lookups (both need to find a file's existing chunks by this same identity).
   """
   @spec file_identity(String.t(), map() | nil) :: {String.t(), String.t()} | nil
   def file_identity(source_type, metadata) do
@@ -255,11 +256,11 @@ defmodule RetrievalNode.Ingest do
   `entity_mentions`/`entity_edges` for free once its `chunks` row is gone.
 
   Runs against `repo` (the caller's transaction/sandbox connection —
-  `Ingest.Workers.UpsertChunks` is the pipeline's single terminal stage and
-  calls this inside its `Ecto.Multi`, after `claim_file_version/4` has
-  confirmed this batch is the file's current version). Returns the number of
-  rows deleted; `0` (never an error) when `source_type`/`metadata` resolve no
-  identity — reconciliation never guesses an identity to delete against.
+  `Ingest.FileIngest.apply/2` calls this inside its own write transaction, and
+  only `Ingest.SourceOwner` ever calls `apply/2` — see its moduledoc's
+  single-writer contract). Returns the number of rows deleted; `0` (never an
+  error) when `source_type`/`metadata` resolve no identity — reconciliation
+  never guesses an identity to delete against.
   """
   @spec reconcile_file_chunks(Ecto.Repo.t(), binary(), String.t(), map() | nil, [String.t()]) ::
           non_neg_integer()
@@ -268,175 +269,6 @@ defmodule RetrievalNode.Ingest do
       nil -> 0
       {field, value} -> delete_stale_chunks(repo, source_id, field, value, keep_chunk_keys)
     end
-  end
-
-  @doc """
-  SHA-256 hex digest (lowercase) of a file's `identity` — the actual unique
-  key `file_versions` claims against (see `claim_file_version/4` and the
-  `20260902150001_hash_file_version_identity` migration this backfills from).
-  A git path (or any identity) is unbounded text; hashing it down to a fixed
-  64-char digest before it ever reaches a B-tree unique index avoids the
-  ~2.7 KB index-tuple limit that an unbounded `identity` column could exceed
-  — the same failure class as the `entities.qualified_name` incident, where
-  every claim for an over-long identity would fail forever (and the terminal
-  job would retry into discard).
-
-  MUST stay byte-identical to the migration's SQL backfill —
-  `encode(sha256(convert_to(identity, 'UTF8')), 'hex')` — since existing rows'
-  `identity_hash` was computed there, not here; `identity` is UTF-8 text on
-  both sides, so hashing it as UTF-8 bytes here matches (see the
-  `identity_hash/1` test that asserts the two computations agree, via
-  `Repo.query!/2`, for both an ASCII and a non-ASCII identity).
-  """
-  @spec identity_hash(String.t()) :: String.t()
-  def identity_hash(identity) when is_binary(identity) do
-    :crypto.hash(:sha256, identity) |> Base.encode16(case: :lower)
-  end
-
-  @doc """
-  Atomically claims `generation` as the current version of file `identity`
-  under `source_id` in `file_versions` — the ingest pipeline's single
-  serialization point for per-file invariants (see
-  `Ingest.Workers.UpsertChunks`, the pipeline's one terminal stage). One
-  statement:
-
-      INSERT INTO file_versions (id, source_id, identity, identity_hash, generation, inserted_at, updated_at)
-      VALUES (...)
-      ON CONFLICT (source_id, identity_hash) DO UPDATE
-        SET generation = EXCLUDED.generation, updated_at = EXCLUDED.updated_at
-        WHERE file_versions.generation < EXCLUDED.generation
-      RETURNING id
-
-  The unique/conflict key is `(source_id, identity_hash)`, NOT
-  `(source_id, identity)` — `identity` is unbounded text (an arbitrary git
-  path, Drive doc id, etc.) that could exceed PostgreSQL's ~2.7 KB B-tree
-  index-tuple limit and make every claim for that file fail; `identity_hash`
-  (see `identity_hash/1`) is a fixed-size digest that can't. `identity` is
-  still written on every claim and kept as the human-readable value for
-  inspection — nothing reads it as a uniqueness key.
-
-  Postgres takes the conflicting row's lock to evaluate the `ON CONFLICT`
-  clause, so two terminal jobs racing for the same `(source_id, identity_hash)`
-  serialize right here — the loser blocks on this INSERT until the winner's
-  transaction commits, then evaluates the `WHERE` against whatever the
-  winner just persisted. Returns `:claimed` (1 row returned) when
-  `generation` is strictly newer than what's persisted — including the very
-  first claim for a file, since a missing row never blocks the initial
-  insert. Returns `:stale` (0 rows) when `generation` is the same (a
-  same-version retry after commit — a duplicate delivery of a job whose
-  version already landed, correctly a no-op) or older (a genuinely
-  out-of-order job that lost the race).
-
-  MUST be called inside the caller's own transaction — the row lock this
-  takes is only meaningful held across the reconciliation work it guards;
-  claiming outside a transaction (or in one that commits before the guarded
-  work runs) defeats the whole point.
-  """
-  @spec claim_file_version(Ecto.Repo.t(), binary(), String.t(), integer()) :: :claimed | :stale
-  def claim_file_version(repo, source_id, identity, generation) do
-    now = DateTime.utc_now()
-
-    # The DO UPDATE's WHERE clause compares against EXCLUDED (the row this
-    # statement is trying to insert) via fragment, exactly like the on_conflict
-    # query form Ecto.Repo.insert_all/3 documents for conditional upserts —
-    # confirmed against the actual generated SQL (see the claim_file_version
-    # tests' capture_log assertions).
-    on_conflict =
-      from(f in FileVersion,
-        update: [
-          set: [
-            generation: fragment("EXCLUDED.generation"),
-            updated_at: fragment("EXCLUDED.updated_at")
-          ]
-        ],
-        where: fragment("EXCLUDED.generation > ?", f.generation)
-      )
-
-    entry = %{
-      id: Ecto.UUID.generate(),
-      source_id: source_id,
-      identity: identity,
-      identity_hash: identity_hash(identity),
-      generation: generation,
-      inserted_at: now,
-      updated_at: now
-    }
-
-    {count, _} =
-      repo.insert_all(FileVersion, [entry],
-        on_conflict: on_conflict,
-        conflict_target: [:source_id, :identity_hash],
-        returning: [:id]
-      )
-
-    if count > 0, do: :claimed, else: :stale
-  end
-
-  @doc """
-  Draws a fresh generation number from the SAME sequence `pending_chunks.id`
-  (a bigserial) is drawn from, rather than minting an independent counter.
-  Sharing that domain is what makes the draw safely usable as an ingest
-  generation for `claim_file_version/4`: every raw staging row already in
-  existence at the moment of this call has a strictly smaller id, so a
-  generation drawn here outranks any pipeline job staged before this moment —
-  including one whose `UpsertChunks` claim hasn't landed yet — while still
-  losing to a genuinely later ingest generation (a file re-added after this
-  draw stages its own, even later, raw row id and claims with that instead).
-  See `Ingest.Workers.RepoSync.delete_removed/2`, today's only caller, for how
-  a file deletion uses this to claim a tombstone generation through
-  `claim_file_version/4` rather than deleting the `file_versions` row
-  outright.
-
-  `nextval` is not transactional — a rolled-back call does not return its
-  value to the sequence — which is fine here: the only property this needs
-  is monotonicity, not gap-free numbering.
-  """
-  @spec next_ingest_generation(Ecto.Repo.t()) :: integer()
-  def next_ingest_generation(repo) do
-    %Postgrex.Result{rows: [[value]]} =
-      repo.query!("SELECT nextval(pg_get_serial_sequence('pending_chunks', 'id'))")
-
-    value
-  end
-
-  @doc """
-  Handles one file's removal as a tombstone claim rather than a guard-row
-  delete — the shared protocol behind both `Ingest.Workers.RepoSync.delete_removed/2`
-  and `Ingest.Workers.DriveSync.delete_removed/2` (see the former's moduledoc,
-  "Deletion is a tombstone claim", for why deleting the `file_versions` row
-  outright is unsafe: a still-in-flight pre-deletion terminal job could then
-  mistake the row's absence for "no version has ever claimed this identity"
-  and resurrect the very chunks this deletion just removed).
-
-  Draws a fresh generation (`next_ingest_generation/1`, from the same
-  `pending_chunks.id` sequence a raw row's own generation comes from — see
-  that function's @doc for why that ordering guarantee is what makes this
-  safe) and claims it for `identity` under `source_id` via
-  `claim_file_version/4`. `delete_fun.(repo)` — the caller's own chunk
-  deletion, scoped however that source type identifies a file (a git path, a
-  Drive doc id, ...) — runs ONLY when the claim wins (`:claimed`); a losing
-  claim (`:stale`) means a newer version already committed and this
-  deletion must leave its chunks untouched, exactly like `Ingest.Workers.UpsertChunks`'
-  own stale-claim skip.
-
-  MUST be called inside the caller's own transaction, same requirement as
-  `claim_file_version/4` itself (the row lock the claim takes is only
-  meaningful held across `delete_fun`'s work). Always returns `:ok` — the
-  claimed-vs-stale branch is fully resolved here, so callers never need to
-  inspect it themselves.
-  """
-  @spec tombstone_file(Ecto.Repo.t(), binary(), String.t(), (Ecto.Repo.t() -> any())) :: :ok
-  def tombstone_file(repo, source_id, identity, delete_fun) when is_function(delete_fun, 1) do
-    generation = next_ingest_generation(repo)
-
-    case claim_file_version(repo, source_id, identity, generation) do
-      :claimed -> delete_fun.(repo)
-      # A newer version's terminal job already claimed a higher generation
-      # for this identity — its chunks must stay untouched.
-      :stale -> :ok
-    end
-
-    :ok
   end
 
   # `metadata->>?` binds the jsonb key as an ordinary text parameter — unlike
@@ -448,8 +280,8 @@ defmodule RetrievalNode.Ingest do
   # `chunk_key not in ^keep_chunk_keys` compiles to `NOT (chunk_key = ANY($1))`
   # — the whole key list rides in as ONE array-typed bind parameter, not one
   # bind per key (confirmed via Ecto.Adapters.SQL.to_sql/3), so this is exempt
-  # from the 65,535-bind-parameter ceiling that makes UpsertChunks'
-  # insert_batches/3 batch its insert_all calls: unlike insert_all, `in`/`not
+  # from the 65,535-bind-parameter ceiling that makes FileIngest's own
+  # insert_batches/2 batch its insert_all calls: unlike insert_all, `in`/`not
   # in` against a pinned list never expands into one param per element. An
   # empty `keep_chunk_keys` matches `NOT (chunk_key = ANY('{}'))`, i.e. every
   # row for that identity — deliberate, see `reconcile_file_chunks/5`.

@@ -17,9 +17,10 @@ defmodule RetrievalNode.Chunking do
   fall back. The fallback *orchestration* — deciding which error reasons re-run
   through `HeuristicImpl` (`:chunk_timeout`/`:chunk_crashed`/`:unsupported_language`)
   versus skip the file (`:too_large`/`:binary_content`) — lives in the ingest
-  worker (`Ingest.Workers.ChunkFiles`, Phase 6). That worker only ever calls
-  `chunk/2`, never the NIF directly, so promoting to the peer-node isolation
-  escape hatch later is a config change plus one module, not a call-site rewrite.
+  pipeline's functional core (`Ingest.FileIngest`). That module only ever calls
+  `chunk_with_graph/2`/`chunk/2`, never the NIF directly, so promoting to the
+  peer-node isolation escape hatch later is a config change plus one module,
+  not a call-site rewrite.
 
   Graph extraction (`chunk_with_graph/2`) is tree-sitter-only: it is an
   **optional** callback, implemented only by `TreeSitterImpl` (single parse,

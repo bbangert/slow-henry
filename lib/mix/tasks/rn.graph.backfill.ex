@@ -1,73 +1,72 @@
 defmodule Mix.Tasks.Rn.Graph.Backfill do
-  @shortdoc "Forces a full re-sync of every active git source to backfill graph extraction"
+  @shortdoc "Forces a full re-derive of every active git source to backfill graph extraction"
 
   @moduledoc """
-  Forces a full re-sync of every active git source through the existing
-  4-stage ingest pipeline (`RepoSync` -> `ChunkFiles` -> `EmbedBatch` ->
-  `UpsertChunks`), so newly-added graph extraction (entities/entity_mentions/
-  entity_edges) backfills onto the whole corpus — not just files touched by
-  future syncs.
+  Forces a full re-derive of every active git source's chunks/graph rows, so
+  newly-added graph extraction (entities/entity_mentions/entity_edges)
+  backfills onto the whole corpus — not just files touched by future syncs.
 
   ## Mechanism
 
-  Clears each git source's sync watermark (`sync_states.cursor`'s
-  `"last_sha"`) and enqueues a `RepoSync` job for it. `RepoSync` with no
-  `last_sha` diffs against nothing and stages every file in the repo (see its
-  moduledoc), so every chunk flows back through `ChunkFiles`, which now
-  extracts entities/mentions per chunk.
+  Enqueues a `RepoSync` job per active git source with `"full" => true`
+  (`Ingest.force_full_resync_git_sources/0,1`). `RepoSync` treats `full?` as
+  "diff against nil regardless of the stored cursor" — it stages every file
+  in the repo, each row tagged `force: true`, and still advances the
+  watermark to `HEAD` on completion (no cursor is cleared: append-only
+  discovery has nothing to clear). The source's `Ingest.SourceOwner` picks up
+  those staged rows the normal way and re-chunks/re-extracts each file
+  through `Ingest.FileIngest.apply/2`.
 
-  ## Idempotency
+  ## Idempotency and cost
 
-  This is a replace, not a duplicate: `ChunkFiles`/`UpsertChunks` key each
-  chunk on `chunk_key`/`content_hash`, so re-processing unchanged content
-  upserts the same row. `RepoSync`'s 15-minute `unique` window on `source_id`
-  means an overlapping cron-driven sync for the same source dedups onto one
-  job — harmless here, since the cursor is cleared before either job runs, so
-  whichever one actually executes does the full re-stage.
-
-  ## This is expensive — deliberately
-
-  At ~586k chunks corpus-wide, this re-embeds the *entire* corpus through
-  `EmbedBatch` again, not just newly-extracted graph data. Expect this to run
-  for **hours**. That's an accepted tradeoff of this task's plan (piggyback
-  on the existing pipeline's idempotency instead of writing a graph-only
-  extraction path) — not an oversight.
+  `force: true` re-chunks/re-extracts even though a file's content is
+  unchanged, but `FileIngest` REUSES existing embeddings wherever
+  `(chunk_key, content_hash)` matches an already-persisted chunk (see its
+  moduledoc's "Embedding reuse") — so this is now cheap despite touching the
+  whole corpus, unlike the old pipeline's full re-embed (which used to cost
+  hours). Chunks are keyed on `chunk_key`/`content_hash` regardless, so
+  re-processing unchanged content upserts the same row rather than
+  duplicating it.
 
   ## Where the work actually happens
 
   This task only enqueues jobs — see "Boot" below, it deliberately runs no
-  queues of its own. The enqueued `RepoSync`/`ChunkFiles`/`EmbedBatch`/
-  `UpsertChunks` jobs execute on whatever node is actually running Oban
-  queues (the dev server, or the production Oban instance), NOT this admin
-  task's process. That other process must already be up (or come up) for
-  the backfill to make progress; watch it with `mix rn.graph.backfill
-  --status`.
+  queues of its own and starts no `Ingest.SourceOwner` processes itself
+  (`Ingest.Supervisor`'s `queues: []` gate keeps it from starting owners too
+  — see that module's moduledoc). The enqueued `RepoSync` jobs, and the
+  `Ingest.SourceOwner` processes that apply the rows they stage, run on
+  whatever node is actually running Oban queues (the dev server, or the
+  production Oban instance), NOT this admin task's process. That other
+  process must already be up (or come up) for the backfill to make progress;
+  watch it with `mix rn.graph.backfill --status`.
 
   ## Usage
 
       mix rn.graph.backfill
 
-  Prints the number of active git sources about to be reset, forces the
-  resync, then prints how many `RepoSync` jobs were enqueued plus a
-  `--status` hint.
+  Prints the number of active git sources, forces the full re-derive, then
+  prints how many `RepoSync` jobs were enqueued plus a `--status` hint.
 
   ## Targeted re-sync
 
       mix rn.graph.backfill --source my-repo --source other-repo
 
-  Repeatable `--source <name-or-identifier>` resets and enqueues ONLY the
-  named active git source(s) — matched against either a source's `name` or
-  its `identifier` — instead of paying the full-corpus re-embed cost. Any
+  Repeatable `--source <name-or-identifier>` enqueues a full re-derive for
+  ONLY the named active git source(s) — matched against either a source's
+  `name` or its `identifier` — instead of paying the full-corpus cost. Any
   name that matches no active git source aborts the whole run (nothing is
-  reset or enqueued) with the unmatched name(s) listed.
+  enqueued) with the unmatched name(s) listed.
 
   ## Status only
 
       mix rn.graph.backfill --status
 
-  Prints `pending_chunks` counts by stage, in-flight `oban_jobs` counts by
-  queue/state, and graph totals (entities/entity_mentions/entity_edges/
-  chunks). Read-only — no cursor is cleared, nothing is enqueued.
+  Prints `pending_chunks` counts by status, in-flight `oban_jobs` counts by
+  queue/state, graph totals (entities/entity_mentions/entity_edges/chunks),
+  `failed_files` (rows an owner gave up on after max attempts), and `owners`
+  (how many `Ingest.SourceOwner` processes are currently registered on the
+  VM actually running ingest — always 0 on this task's own short-lived VM).
+  Read-only — nothing is enqueued.
   """
 
   use Mix.Task
@@ -153,6 +152,9 @@ defmodule Mix.Tasks.Rn.Graph.Backfill do
   # deliberately disables local queue/plugin execution and the ~1.2 GB embedding
   # model load: actual ingestion/embedding runs on the already-supervised Oban
   # instance (dev server / systemd), never inside this short-lived task process.
+  # `queues: []` also keeps this VM from starting `Ingest.SourceOwner`
+  # processes of its own — `Ingest.Supervisor`'s boot-resume gate reads this
+  # same Oban config back (see that module's moduledoc).
   defp boot do
     Mix.Task.run("app.config")
 
@@ -190,14 +192,14 @@ defmodule Mix.Tasks.Rn.Graph.Backfill do
         :id
       )
 
-    Mix.shell().info("Resetting sync watermark for #{source_count} active git source(s)...")
+    Mix.shell().info("Forcing a full re-derive for #{source_count} active git source(s)...")
 
     report_resync(Ingest.force_full_resync_git_sources(), "full resync")
   end
 
   defp backfill(source_names) do
     Mix.shell().info(
-      "Resetting sync watermark for #{length(source_names)} named git source(s): " <>
+      "Forcing a full re-derive for #{length(source_names)} named git source(s): " <>
         "#{Enum.join(source_names, ", ")}..."
     )
 
@@ -208,7 +210,7 @@ defmodule Mix.Tasks.Rn.Graph.Backfill do
     case result do
       {:ok, enqueued} ->
         Mix.shell().info("""
-        Enqueued #{enqueued} RepoSync job(s) with cleared watermarks.
+        Enqueued #{enqueued} RepoSync job(s) with full: true.
 
         Jobs run on whatever node is running Oban queues (the dev server) —
         NOT this task. Monitor with:
@@ -239,6 +241,9 @@ defmodule Mix.Tasks.Rn.Graph.Backfill do
 
     Mix.shell().info("\ngraph totals:")
     print_count_map(status.graph)
+
+    Mix.shell().info("\nfailed_files (gave up after max attempts): #{status.failed_files}")
+    Mix.shell().info("owners (SourceOwner processes registered on this VM): #{status.owners}")
   end
 
   defp print_count_map(map) do

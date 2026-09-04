@@ -6,8 +6,7 @@ defmodule RetrievalNode.GraphTest do
 
   alias RetrievalNode.Graph
   alias RetrievalNode.Graph.{Entity, EntityEdge, EntityMention}
-  alias RetrievalNode.Ingest.PendingChunks
-  alias RetrievalNode.Ingest.Workers.{ChunkFiles, EmbedBatch, UpsertChunks}
+  alias RetrievalNode.Ingest.{FileIngest, PendingChunks}
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source}
 
@@ -45,10 +44,7 @@ defmodule RetrievalNode.GraphTest do
   end
 
   defp run_pipeline(raw) do
-    assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id})
-    ids = Repo.all(from p in PendingChunk, select: p.id)
-    assert :ok = perform_job(EmbedBatch, %{"pending_chunk_ids" => ids})
-    assert :ok = perform_job(UpsertChunks, %{"pending_chunk_ids" => ids})
+    assert {:ok, _summary} = FileIngest.apply(raw, [])
   end
 
   defp force_chunk(result), do: Application.put_env(:retrieval_node, :fake_chunk_result, result)
@@ -91,42 +87,60 @@ defmodule RetrievalNode.GraphTest do
      }}
   end
 
-  describe "ChunkFiles per-chunk graph attachment" do
+  describe "per-chunk graph attachment" do
     test "entities/references land on the chunk whose line range contains them; the unmatched import lands on the first chunk",
          %{source: source} do
       force_chunk_with_graph(two_chunk_result())
       raw = seed_raw(source, "def a():\n    return b()\n\n\ndef b():\n    return 1\n")
 
-      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id})
+      run_pipeline(raw)
 
       [chunk_a, chunk_b] =
-        Repo.all(from p in PendingChunk, where: p.status == "chunked", order_by: p.chunk_index)
+        Chunk
+        |> where([c], c.source_id == ^source.id)
+        |> order_by([c], asc: c.context_breadcrumb)
+        |> Repo.all()
 
-      assert chunk_a.graph == %{
-               "entities" => [%{"qualified_name" => "a", "kind" => "function"}],
-               "references" => [
-                 %{"name" => "b", "kind" => "call", "from" => "a"},
-                 %{"name" => "os", "kind" => "import", "from" => nil}
-               ]
-             }
+      # breadcrumb "app.py > a" sorts before "app.py > b", matching chunk order.
+      a_entity = Repo.get_by!(Entity, source_id: source.id, qualified_name: "a")
+      b_entity = Repo.get_by!(Entity, source_id: source.id, qualified_name: "b")
+      os_entity = Repo.get_by!(Entity, source_id: source.id, qualified_name: "os")
 
-      assert chunk_b.graph == %{
-               "entities" => [%{"qualified_name" => "b", "kind" => "function"}],
-               "references" => []
-             }
+      mentions_for = fn chunk ->
+        EntityMention
+        |> where([m], m.chunk_id == ^chunk.id)
+        |> Repo.all()
+        |> Enum.map(&{&1.entity_id, &1.kind})
+        |> MapSet.new()
+      end
+
+      # chunk_a: definition of "a", a call to "b", and the unmatched "os"
+      # import (attaches to the first chunk).
+      assert mentions_for.(chunk_a) ==
+               MapSet.new([
+                 {a_entity.id, :definition},
+                 {b_entity.id, :call},
+                 {os_entity.id, :import}
+               ])
+
+      # chunk_b: definition of "b" only.
+      assert mentions_for.(chunk_b) == MapSet.new([{b_entity.id, :definition}])
     end
 
-    test "the heuristic fallback path attaches no graph (empty map, the column default)", %{
+    test "the heuristic fallback path attaches no graph (no entities/mentions)", %{
       source: source
     } do
       force_chunk({:error, :unsupported_language})
       raw = seed_raw(source, "def a():\n    return 1\n\ndef b():\n    return 2\n")
 
-      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id})
+      assert {:ok, summary} = FileIngest.apply(raw, [])
+      assert summary.graph == %{entities: 0, mentions: 0, edges: 0}
 
-      chunks = Repo.all(from p in PendingChunk, where: p.status == "chunked")
-      assert chunks != []
-      assert Enum.all?(chunks, &(&1.graph == %{}))
+      persisted = Repo.all(from c in Chunk, where: c.source_id == ^source.id)
+      assert persisted != []
+      assert Enum.all?(persisted, &(&1.parse_status == :heuristic_fallback))
+      assert Repo.aggregate(Entity, :count, :id) == 0
+      assert Repo.aggregate(EntityMention, :count, :id) == 0
     end
   end
 
@@ -166,13 +180,10 @@ defmodule RetrievalNode.GraphTest do
       )
 
       raw = seed_raw(source, "def a():\n    return 1\n")
-      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw.id})
-      ids = Repo.all(from p in PendingChunk, select: p.id)
-      assert :ok = perform_job(EmbedBatch, %{"pending_chunk_ids" => ids})
 
       log =
         capture_log(fn ->
-          assert :ok = perform_job(UpsertChunks, %{"pending_chunk_ids" => ids})
+          assert {:ok, _summary} = FileIngest.apply(raw, [])
         end)
 
       assert log =~ "graph symbol"
@@ -521,7 +532,7 @@ defmodule RetrievalNode.GraphTest do
       x = entities["x"]
       y = entities["y"]
 
-      # Pre-fix, file2's UpsertChunks would delete every outgoing edge of
+      # Pre-fix, file2's ingest would delete every outgoing edge of
       # "shared" (file-wide re-derivation) before writing its own, wiping
       # out file1's x-edge. With chunk-level provenance, both contributions
       # survive as their own rows.
@@ -740,7 +751,7 @@ defmodule RetrievalNode.GraphTest do
       # re-declaring the python entity — a staged row carrying only a NEW
       # reference (no "entities"), targeting the real chunk id via
       # chunk_ids_by_key, called directly against Graph.upsert_from_staged/3
-      # (the same function UpsertChunks calls). This re-triggers
+      # (the same function Ingest.FileIngest's write step calls). This re-triggers
       # resolve_entity_ids/4 for "setup" with both rows now in the table,
       # WITHOUT upserting/touching the python row again: collect_definitions
       # is empty here, and the reference-only entity upsert for "setup" hits
@@ -850,24 +861,15 @@ defmodule RetrievalNode.GraphTest do
   end
 
   describe "gc_orphaned_entities/1" do
-    # The lock-and-recheck fix in delete_orphaned_batch/1 (candidate select
-    # FOR UPDATE SKIP LOCKED, then a DELETE that rechecks the zero-mention
-    # condition itself) exists to close a snapshot race against a *second*,
-    # genuinely concurrent Postgres transaction landing a mention insert
-    # between this module's SELECT and DELETE. `DataCase`'s sandbox gives
-    # every process in a test the SAME underlying connection/transaction
-    # (savepoints, not real concurrent transactions), so there is no seam
-    # here to drive that interleaving honestly without hand-rolling a second
-    # real connection outside the sandbox — not attempted, to avoid
-    # contorting the test's transactional isolation for the rest of the
-    # suite. The mechanism itself was verified by hand during development:
-    # capturing the statement log around a call to gc_orphaned_entities/1
-    # shows the candidate SELECT carrying `FOR UPDATE SKIP LOCKED` and the
-    # DELETE carrying its own `NOT EXISTS` recheck (matching
-    # delete_orphaned_batch/1's SQL exactly). What the tests below cover
-    # instead is the observable contract the fix must preserve: an entity
-    # with a mention is never deleted, a zero-mention entity is, and batching
-    # still exhausts every orphan across rounds.
+    # No locking (FOR UPDATE SKIP LOCKED + delete-time recheck) since
+    # Ingest.SourceOwner became the single writer per source: there is no
+    # concurrent process that could land a new mention on a candidate
+    # between the select and the delete, so a plain "select candidate ids,
+    # delete those ids" inside one transaction is the whole mechanism now.
+    # The tests below cover the observable contract that mechanism must
+    # preserve: an entity with a mention is never deleted, a zero-mention
+    # entity is, batching exhausts every orphan across rounds, and
+    # `source_id:` scopes the sweep to one source.
     defp seed_chunk(source, path, chunk_key) do
       Repo.insert!(%Chunk{
         source_id: source.id,
@@ -963,6 +965,20 @@ defmodule RetrievalNode.GraphTest do
       assert_raise ArgumentError, ~r/batch_size/, fn ->
         Graph.gc_orphaned_entities(batch_size: -5)
       end
+    end
+
+    test "source_id: scopes the sweep to one source, sparing another source's orphans", %{
+      source: source
+    } do
+      other_source =
+        Repo.insert!(%Source{source_type: :git_repo, name: "other", identifier: "acme/other"})
+
+      seed_entity(source, "orphan_here")
+      seed_entity(other_source, "orphan_there")
+
+      assert Graph.gc_orphaned_entities(source_id: source.id) == 1
+
+      assert Repo.all(from e in Entity, select: e.qualified_name) == ["orphan_there"]
     end
   end
 

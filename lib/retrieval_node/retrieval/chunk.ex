@@ -29,13 +29,11 @@ defmodule RetrievalNode.Retrieval.Chunk do
 
     field :secrets_status, Ecto.Enum, values: [:clean, :redacted], default: :clean
 
-    # Monotonic per-file version marker (the raw `pending_chunks` row id that
-    # produced this chunk) — cheap provenance copied over by UpsertChunks.
-    # Order-safety itself is enforced upstream of this write, by the atomic
-    # claim in `file_versions` (see `Ingest.claim_file_version/4`); this
-    # column is not read back for that decision. NULL (legacy rows predating
-    # this column) counts as generation 0 anywhere it IS read.
-    field :ingest_generation, :integer
+    # The raw file hash (pending_chunks.content_hash) this chunk was derived
+    # from — lets a reader recognise "this file's content hasn't changed since
+    # its last ingest" without re-reading/re-hashing the file (Ingest.FileIngest's
+    # unchanged-content skip). NULL for chunks written before this column existed.
+    field :file_hash, :string
 
     # tsv is DB-generated (GENERATED ALWAYS ... STORED). `writable: :never` keeps
     # the pipeline from ever trying to insert/update it; `load_in_query: false`
@@ -49,7 +47,7 @@ defmodule RetrievalNode.Retrieval.Chunk do
   end
 
   @required [:source_id, :source_type, :chunk_key, :content_hash, :content, :context_breadcrumb]
-  @optional [:repo, :lang, :metadata, :embedding, :parse_status, :secrets_status]
+  @optional [:repo, :lang, :metadata, :embedding, :parse_status, :secrets_status, :file_hash]
 
   @doc """
   Ingestion upsert changeset. Called from the internal ingestion pipeline

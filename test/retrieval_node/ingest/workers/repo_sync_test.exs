@@ -4,12 +4,9 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
   use RetrievalNode.DataCase, async: false
   use Oban.Testing, repo: RetrievalNode.Repo
 
-  import ExUnit.CaptureLog
-
-  alias RetrievalNode.Ingest
-  alias RetrievalNode.Ingest.Workers.{ChunkFiles, EmbedBatch, RepoSync, UpsertChunks}
+  alias RetrievalNode.Ingest.Workers.RepoSync
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.{Chunk, FileVersion, PendingChunk, Source, SyncState}
+  alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source, SyncState}
 
   setup do
     root = Path.join(System.tmp_dir!(), "reposync-#{System.unique_integer([:positive])}")
@@ -49,7 +46,8 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     git!(src, ["commit", "-qm", "c"])
   end
 
-  test "first sync ingests every file, enqueues ChunkFiles, advances the watermark", ctx do
+  test "first sync stages a raw row per file, advances the watermark",
+       ctx do
     commit(ctx.src, [{"a.py", "def a(): pass\n"}, {"b.py", "def b(): pass\n"}])
 
     assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
@@ -60,9 +58,8 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
              ["repo:#{ctx.source.id}:a.py", "repo:#{ctx.source.id}:b.py"]
 
     assert Enum.all?(raws, &(&1.lang == "python" and &1.source_id == ctx.source.id))
-    assert_enqueued(worker: ChunkFiles)
+    assert Enum.all?(raws, &(&1.force == false))
 
-    # watermark advanced to HEAD
     head = String.trim(git!(ctx.src, ["rev-parse", "HEAD"]))
     state = Repo.get_by!(SyncState, source_id: ctx.source.id)
     assert state.cursor["last_sha"] == head
@@ -93,12 +90,13 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     assert Repo.aggregate(PendingChunk, :count, :id) == 0
   end
 
-  test "a deleted file removes its permanent chunks and leaves file_versions as a tombstone with a higher generation",
+  test "a deleted file stages a deletion entry — chunks are untouched here, that's the owner's job",
        ctx do
     commit(ctx.src, [{"gone.py", "def g(): pass\n"}])
     perform_job(RepoSync, %{"source_id" => ctx.source.id})
+    Repo.delete_all(PendingChunk)
 
-    # Simulate the chunk already having been upserted for gone.py.
+    # Simulate the chunk already having been indexed for gone.py by an owner.
     Repo.insert!(%Chunk{
       source_id: ctx.source.id,
       source_type: :git_repo,
@@ -109,150 +107,31 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
       metadata: %{"path" => "gone.py"}
     })
 
-    # Simulate a version already having been claimed for gone.py too.
-    Repo.insert!(%FileVersion{
-      source_id: ctx.source.id,
-      identity: "gone.py",
-      identity_hash: Ingest.identity_hash("gone.py"),
-      generation: 1
-    })
-
     File.rm!(Path.join(ctx.src, "gone.py"))
     File.write!(Path.join(ctx.src, "keep.py"), "def k(): pass\n")
     git!(ctx.src, ["add", "-A"])
     git!(ctx.src, ["commit", "-qm", "rm"])
 
     assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
-    assert Repo.aggregate(from(c in Chunk, where: c.chunk_key == "k1"), :count, :id) == 0
 
-    # The file_versions row is NEVER deleted — deletion is a tombstone claim,
-    # not a guard-row delete (see the moduledoc). The claimed generation is
-    # strictly greater than the prior one.
-    tombstone = Repo.get_by!(FileVersion, source_id: ctx.source.id, identity: "gone.py")
-    assert tombstone.generation > 1
-  end
+    # RepoSync only appends to the mailbox — it never deletes a chunks row
+    # itself (Ingest.SourceOwner does, when it applies this entry).
+    assert Repo.aggregate(from(c in Chunk, where: c.chunk_key == "k1"), :count, :id) == 1
 
-  describe "delete_removed/2 tombstone claim (Fix 1)" do
-    test "THE HOLE: a delayed pre-deletion UpsertChunks job is stale, not a resurrection", ctx do
-      commit(ctx.src, [{"hole.py", "def h(): pass\n"}])
-      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+    deletion =
+      Repo.one!(from p in PendingChunk, where: p.natural_key == ^"repo:#{ctx.source.id}:gone.py")
 
-      # v1's raw row is staged and ChunkFiles enqueued, but NOT yet run — an
-      # hours-deep backlog stalls it right here.
-      raw1 = Repo.one!(from p in PendingChunk, where: p.status == "raw")
+    assert deletion.status == "deleted"
+    assert deletion.metadata == %{"path" => "gone.py"}
 
-      # The path is deleted and re-synced BEFORE v1's pipeline ever runs.
-      File.rm!(Path.join(ctx.src, "hole.py"))
-      git!(ctx.src, ["add", "-A"])
-      git!(ctx.src, ["commit", "-qm", "rm"])
-      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+    added =
+      Repo.one!(from p in PendingChunk, where: p.natural_key == ^"repo:#{ctx.source.id}:keep.py")
 
-      # The tombstone claim landed for hole.py, at a generation greater than
-      # raw1's id (same pending_chunks id sequence the deletion drew from).
-      tombstone = Repo.get_by!(FileVersion, source_id: ctx.source.id, identity: "hole.py")
-      assert tombstone.generation > raw1.id
+    assert added.status == "raw"
 
-      # v1's stalled pipeline finally runs to completion.
-      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw1.id})
-      ids = Repo.all(from p in PendingChunk, select: p.id)
-      assert :ok = perform_job(EmbedBatch, %{"pending_chunk_ids" => ids})
-      ids = Repo.all(from p in PendingChunk, where: p.id in ^ids, select: p.id)
-      assert :ok = perform_job(UpsertChunks, %{"pending_chunk_ids" => ids})
-
-      # No chunk was resurrected for hole.py, and staging is fully drained —
-      # the stale claim still cleans up its own staging rows.
-      assert Repo.aggregate(from(c in Chunk, where: c.source_id == ^ctx.source.id), :count, :id) ==
-               0
-
-      assert Repo.aggregate(PendingChunk, :count, :id) == 0
-
-      # The tombstone's generation is untouched by the stale claim.
-      assert Repo.get_by!(FileVersion, source_id: ctx.source.id, identity: "hole.py").generation ==
-               tombstone.generation
-    end
-
-    test "a re-added file after a deletion claims a higher generation and persists normally",
-         ctx do
-      commit(ctx.src, [{"back.py", "def b(): return 1\n"}])
-      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
-      raw1 = Repo.one!(from p in PendingChunk, where: p.status == "raw")
-      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw1.id})
-      ids = Repo.all(from p in PendingChunk, select: p.id)
-      assert :ok = perform_job(EmbedBatch, %{"pending_chunk_ids" => ids})
-      ids = Repo.all(from p in PendingChunk, where: p.id in ^ids, select: p.id)
-      assert :ok = perform_job(UpsertChunks, %{"pending_chunk_ids" => ids})
-      assert [_] = Repo.all(from c in Chunk, where: c.source_id == ^ctx.source.id)
-
-      # Delete it — tombstone claim removes the chunk.
-      File.rm!(Path.join(ctx.src, "back.py"))
-      git!(ctx.src, ["add", "-A"])
-      git!(ctx.src, ["commit", "-qm", "rm"])
-      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
-      assert Repo.all(from c in Chunk, where: c.source_id == ^ctx.source.id) == []
-
-      tombstone = Repo.get_by!(FileVersion, source_id: ctx.source.id, identity: "back.py")
-
-      # Re-add the file with new content — a fresh raw row, at a higher id
-      # than the tombstone's claimed generation.
-      commit(ctx.src, [{"back.py", "def b(): return 2\n"}])
-      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
-      raw2 = Repo.one!(from p in PendingChunk, where: p.status == "raw")
-      assert raw2.id > tombstone.generation
-
-      assert :ok = perform_job(ChunkFiles, %{"pending_chunk_id" => raw2.id})
-      ids2 = Repo.all(from p in PendingChunk, select: p.id)
-      assert :ok = perform_job(EmbedBatch, %{"pending_chunk_ids" => ids2})
-      ids2 = Repo.all(from p in PendingChunk, where: p.id in ^ids2, select: p.id)
-      assert :ok = perform_job(UpsertChunks, %{"pending_chunk_ids" => ids2})
-
-      assert [chunk] = Repo.all(from c in Chunk, where: c.source_id == ^ctx.source.id)
-      assert chunk.content =~ "return 2"
-
-      assert Repo.get_by!(FileVersion, source_id: ctx.source.id, identity: "back.py").generation ==
-               raw2.id
-    end
-
-    test "a deletion that loses to an already-higher committed generation leaves that version's chunks untouched",
-         ctx do
-      commit(ctx.src, [{"newer.py", "def n(): pass\n"}])
-      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
-
-      # Simulate a newer version of newer.py that already committed at a
-      # generation higher than anything this deletion's tombstone draw could
-      # produce (the sequence's current value is nowhere near this).
-      future_generation = Ingest.next_ingest_generation(Repo) + 1_000_000
-
-      Repo.insert!(%Chunk{
-        source_id: ctx.source.id,
-        source_type: :git_repo,
-        chunk_key: "future-k1",
-        content_hash: "h",
-        content: "def n(): pass  # newer",
-        context_breadcrumb: "newer.py",
-        metadata: %{"path" => "newer.py"},
-        ingest_generation: future_generation
-      })
-
-      Repo.insert!(%FileVersion{
-        source_id: ctx.source.id,
-        identity: "newer.py",
-        identity_hash: Ingest.identity_hash("newer.py"),
-        generation: future_generation
-      })
-
-      File.rm!(Path.join(ctx.src, "newer.py"))
-      git!(ctx.src, ["add", "-A"])
-      git!(ctx.src, ["commit", "-qm", "rm"])
-
-      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
-
-      # The deletion's claim lost (:stale) — the newer chunk is untouched and
-      # the tombstone's generation is unchanged.
-      assert Repo.aggregate(from(c in Chunk, where: c.chunk_key == "future-k1"), :count, :id) == 1
-
-      assert Repo.get_by!(FileVersion, source_id: ctx.source.id, identity: "newer.py").generation ==
-               future_generation
-    end
+    head = String.trim(git!(ctx.src, ["rev-parse", "HEAD"]))
+    state = Repo.get_by!(SyncState, source_id: ctx.source.id)
+    assert state.cursor["last_sha"] == head
   end
 
   test "a modified file is re-enqueued, NOT treated as a deletion", ctx do
@@ -276,12 +155,34 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
 
     # modification is NOT a deletion — the existing chunk survives (it'll be
-    # upserted by the pipeline), and a fresh raw row is staged for re-chunking
+    # upserted by the owner), and a fresh raw row is staged for re-chunking
     assert Repo.aggregate(from(c in Chunk, where: c.chunk_key == "mk1"), :count, :id) == 1
     raw = Repo.one!(from p in PendingChunk, where: p.status == "raw")
     assert raw.natural_key == "repo:#{ctx.source.id}:mod.py"
     assert raw.raw_content =~ "return 42"
-    assert_enqueued(worker: ChunkFiles)
+  end
+
+  test "\"full\" => true ignores the cursor and stages every file with force: true", ctx do
+    commit(ctx.src, [{"a.py", "def a(): pass\n"}])
+    assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+    Repo.delete_all(PendingChunk)
+
+    commit(ctx.src, [{"b.py", "def b(): pass\n"}])
+
+    assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id, "full" => true})
+
+    raws = Repo.all(from p in PendingChunk, where: p.status == "raw")
+
+    # both files staged — a.py too, even though it was already synced and
+    # the second commit alone would have only diffed b.py.
+    assert Enum.sort(Enum.map(raws, & &1.natural_key)) ==
+             ["repo:#{ctx.source.id}:a.py", "repo:#{ctx.source.id}:b.py"]
+
+    assert Enum.all?(raws, &(&1.force == true))
+
+    head = String.trim(git!(ctx.src, ["rev-parse", "HEAD"]))
+    state = Repo.get_by!(SyncState, source_id: ctx.source.id)
+    assert state.cursor["last_sha"] == head
   end
 
   test "a repo with a binary file skips it — text file still staged, job still completes", ctx do
@@ -294,7 +195,6 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
 
     raws = Repo.all(from p in PendingChunk, where: p.status == "raw")
     assert Enum.map(raws, & &1.natural_key) == ["repo:#{ctx.source.id}:app.py"]
-    assert_enqueued(worker: ChunkFiles)
 
     # watermark still advances past the binary file — it isn't retried forever
     head = String.trim(git!(ctx.src, ["rev-parse", "HEAD"]))
@@ -310,7 +210,6 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
 
     raws = Repo.all(from p in PendingChunk, where: p.status == "raw")
     assert Enum.map(raws, & &1.natural_key) == ["repo:#{ctx.source.id}:app.py"]
-    assert_enqueued(worker: ChunkFiles)
   end
 
   test "a repo with a submodule syncs the real files and skips the gitlink entirely", ctx do
@@ -333,9 +232,8 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
 
     raws = Repo.all(from p in PendingChunk, where: p.status == "raw")
     assert Enum.map(raws, & &1.natural_key) == ["repo:#{ctx.source.id}:app.py"]
-    assert_enqueued(worker: ChunkFiles)
 
-    # no staged row (and no ChunkFiles job) for the gitlink path
+    # no staged row for the gitlink path
     refute Repo.get_by(PendingChunk, natural_key: "repo:#{ctx.source.id}:sublib")
 
     # job completed (didn't retry-forever the way a job-fatal submodule would),
@@ -350,7 +248,6 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
 
     assert Repo.aggregate(from(p in PendingChunk), :count, :id) == 0
-    refute_enqueued(worker: ChunkFiles)
 
     state = Repo.get_by!(SyncState, source_id: ctx.source.id)
     assert state.cursor == %{}
@@ -372,49 +269,5 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     head = String.trim(git!(ctx.src, ["rev-parse", "HEAD"]))
     state = Repo.get_by!(SyncState, source_id: ctx.source.id)
     assert state.cursor["last_sha"] == head
-  end
-
-  describe "advance_watermark/2 optimistic write" do
-    test "advances when the DB row's cursor still matches what was read at job start", ctx do
-      state =
-        Repo.insert!(%SyncState{
-          source_id: ctx.source.id,
-          cursor: %{"last_sha" => "old-sha"},
-          status: :syncing
-        })
-
-      assert :ok = RepoSync.advance_watermark(state, "new-sha")
-
-      updated = Repo.get_by!(SyncState, source_id: ctx.source.id)
-      assert updated.cursor == %{"last_sha" => "new-sha"}
-      assert updated.status == :idle
-    end
-
-    test "does NOT advance when the DB row's cursor changed since it was read (concurrent clear/backfill)",
-         ctx do
-      state =
-        Repo.insert!(%SyncState{
-          source_id: ctx.source.id,
-          cursor: %{"last_sha" => "old-sha"},
-          status: :syncing
-        })
-
-      # Simulate Ingest.force_full_resync_git_sources/0's clear_sync_cursor!/1
-      # racing in after `state` was read (at perform/1 start) but before
-      # advance_watermark runs.
-      state |> SyncState.changeset(%{cursor: %{}}) |> Repo.update!()
-
-      log =
-        capture_log(fn ->
-          assert :ok = RepoSync.advance_watermark(state, "new-sha")
-        end)
-
-      assert log =~ "not advancing watermark"
-
-      # cursor stays at the CONCURRENTLY-CLEARED value — the stale `state`
-      # struct's computed new_sha must never overwrite it.
-      updated = Repo.get_by!(SyncState, source_id: ctx.source.id)
-      assert updated.cursor == %{}
-    end
   end
 end
