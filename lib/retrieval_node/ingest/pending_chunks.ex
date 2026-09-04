@@ -43,6 +43,13 @@ defmodule RetrievalNode.Ingest.PendingChunks do
   skips) — callers enqueue `ChunkFiles` per returned id, so a skipped row
   correctly gets no chunking job, and callers that zip ids back against input rows
   can rely on the ordering.
+
+  A row may carry `status: "deleted"` — a **deletion entry** for
+  `Ingest.FileIngest.apply/2` (no `raw_content`/`content_hash`, just the file's
+  identity) — instead of the default `status: "raw"`; the binary-content guard
+  above is skipped for it (there's no content to check). A row may also carry
+  `force: true` (a forced re-derive / backfill); both default to their normal
+  values (`"raw"`, `false`) when absent, so every existing caller is unaffected.
   """
   @spec insert_raw_all([map()]) :: {:ok, [integer()]}
   def insert_raw_all(rows) do
@@ -69,6 +76,8 @@ defmodule RetrievalNode.Ingest.PendingChunks do
   defp insert_batch_size,
     do: Application.get_env(:retrieval_node, :insert_raw_batch_size, @insert_batch_size)
 
+  # A deletion entry has no content to check — and no `raw_content` at all.
+  defp binary?(%{status: "deleted"}), do: false
   defp binary?(attrs), do: Chunking.binary_content?(Map.get(attrs, :raw_content) || "")
 
   defp log_skip(attrs) do
@@ -90,7 +99,8 @@ defmodule RetrievalNode.Ingest.PendingChunks do
       content_hash: Map.get(attrs, :content_hash),
       raw_content: Map.get(attrs, :raw_content),
       metadata: Map.get(attrs, :metadata, %{}),
-      status: "raw",
+      status: Map.get(attrs, :status, "raw"),
+      force: Map.get(attrs, :force, false),
       inserted_at: now,
       updated_at: now
     }
