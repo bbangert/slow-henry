@@ -77,9 +77,9 @@ defmodule RetrievalNode.Ingest.SourceOwner do
 
   @doc """
   Fire-and-forget "you have mail" for `source_id`: starts its owner if one
-  isn't running, else wakes the running one — either way, `init`'s (or the
-  running owner's) `handle_continue(:drain, _)` picks up whatever is now in
-  the table. `:ok` in every case; this is a hint, not a guarantee the drain
+  isn't running, else wakes the running one with a non-blocking cast — either way,
+  `init`'s (or the running owner's) drain picks up whatever is now in the
+  table. `:ok` in every case; this is a hint, not a guarantee the drain
   has happened by the time it returns (`drain/1` is the synchronous version).
 
   Two gates make this a no-op in situations where starting an owner would be
@@ -111,23 +111,22 @@ defmodule RetrievalNode.Ingest.SourceOwner do
         :ok
 
       true ->
-        start_or_notify(source_id, 3)
+        start_or_notify(source_id)
     end
   end
 
   defp notify_enabled?,
     do: Application.get_env(:retrieval_node, :source_owner_notify, true)
 
-  defp start_or_notify(source_id, 0) do
-    Logger.warning(
-      "Ingest.SourceOwner.notify/1: gave up after 3 tries (owner kept exiting mid-lookup) " <>
-        "source_id=#{source_id}"
-    )
-
-    :ok
-  end
-
-  defp start_or_notify(source_id, tries_left) do
+  # Fire-and-forget by design: `start_child` drains a fresh owner via
+  # `handle_continue`; an already-running owner is woken with a non-blocking
+  # `cast` so the discovery job caller never blocks on (or times out against)
+  # an owner that's mid-pass. The one race a `call`+retry would have caught —
+  # the owner idle-stopping between this lookup and the cast — is benign here:
+  # the rows are already durably committed, so the source's next discovery
+  # tick (or the boot-resume Task) notifies again and picks them up. A cast to
+  # a just-dead pid is simply dropped.
+  defp start_or_notify(source_id) do
     case DynamicSupervisor.start_child(
            RetrievalNode.Ingest.SourceSupervisor,
            child_spec(source_id)
@@ -136,15 +135,7 @@ defmodule RetrievalNode.Ingest.SourceOwner do
         :ok
 
       {:error, {:already_started, pid}} ->
-        try do
-          GenServer.call(pid, :notify)
-          :ok
-        catch
-          # The owner was idle-stopping between our lookup and this call —
-          # loop and either find it gone (start a fresh one) or find whatever
-          # replaced it.
-          :exit, _reason -> start_or_notify(source_id, tries_left - 1)
-        end
+        GenServer.cast(pid, :notify)
 
       {:error, reason} ->
         Logger.warning(
@@ -244,7 +235,7 @@ defmodule RetrievalNode.Ingest.SourceOwner do
   end
 
   @impl GenServer
-  def handle_call(:notify, _from, state), do: {:reply, :ok, state, {:continue, :drain}}
+  def handle_cast(:notify, state), do: {:noreply, state, {:continue, :drain}}
 
   @impl GenServer
   def handle_call(:drain, _from, state) do
@@ -299,13 +290,21 @@ defmodule RetrievalNode.Ingest.SourceOwner do
         apply_row(source_id, row, stats)
       end)
 
-    Logger.info(
+    # A pass that touched no rows (a `notify/1` on a source with nothing new —
+    # e.g. a routine sync tick that staged nothing) is logged at debug, not
+    # info, so idle notifies don't flood production logs.
+    log_pass(source_id, stats, kept)
+
+    {stats, full_batch?}
+  end
+
+  defp log_pass(source_id, stats, kept) do
+    message =
       "Ingest.SourceOwner pass source_id=#{source_id} applied=#{stats.applied} " <>
         "skipped=#{stats.skipped} failed=#{stats.failed} superseded=#{stats.superseded} " <>
         "embedded=#{stats.embedded} reused=#{stats.reused}"
-    )
 
-    {stats, full_batch?}
+    if kept == [] and stats.superseded == 0, do: Logger.debug(message), else: Logger.info(message)
   end
 
   # Group the pass's rows by file identity, keep only the newest (highest id)
