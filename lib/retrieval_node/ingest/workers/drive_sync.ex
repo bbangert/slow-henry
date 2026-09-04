@@ -109,7 +109,7 @@ defmodule RetrievalNode.Ingest.Workers.DriveSync do
     {:ok, :ok} =
       Repo.transaction(
         fn ->
-          if rows != [], do: PendingChunks.insert_raw_all(rows)
+          if rows != [], do: {:ok, _ids} = PendingChunks.insert_raw_all(rows)
 
           if not Enum.any?(export_results, &match?({:error, _}, &1)),
             do: advance_watermark!(state, new_cursor)

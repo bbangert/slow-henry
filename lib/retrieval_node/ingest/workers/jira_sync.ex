@@ -69,7 +69,7 @@ defmodule RetrievalNode.Ingest.Workers.JiraSync do
     {:ok, :ok} =
       Repo.transaction(
         fn ->
-          PendingChunks.insert_raw_all(rows)
+          {:ok, _ids} = PendingChunks.insert_raw_all(rows)
           advance_watermark!(state, new_watermark)
           :ok
         end,

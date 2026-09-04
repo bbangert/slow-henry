@@ -123,14 +123,18 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
 
   # Stages this batch's rows AND advances the watermark to new_sha in ONE
   # transaction — insert_raw_all/1's own transaction nests inside (joins)
-  # this one, so the whole thing is atomic: either every row this sync
+  # this one. The `{:ok, _} =` match makes the atomicity explicit: insert_raw_all
+  # returns `{:ok, ids}` or raises (a raise already rolls the outer transaction
+  # back), and should its contract ever return `{:error, _}`, the MatchError
+  # aborts this transaction too — the watermark can never advance past rows that
+  # didn't stage. So the whole thing is atomic: either every row this sync
   # discovered is durable AND the cursor reflects it, or (on any error)
   # neither happened and the next cron tick re-discovers the same diff.
   defp stage_and_advance(source, sync_state, new_sha, rows) do
     {:ok, :ok} =
       Repo.transaction(
         fn ->
-          if rows != [], do: PendingChunks.insert_raw_all(rows)
+          if rows != [], do: {:ok, _ids} = PendingChunks.insert_raw_all(rows)
           advance_watermark!(sync_state, new_sha)
           :ok
         end,
