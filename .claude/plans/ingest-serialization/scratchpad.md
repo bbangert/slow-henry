@@ -180,3 +180,16 @@ Resume with: /phx:work --continue
   the binary guard once the old pipeline is deleted. Add a test that drives the
   real staging seam (not just a forced `:binary_content` on ordinary text).
 - PR #17 thread PRRT_kwDOTXolXc6fYVwR left OPEN as the tracked cross-slice item.
+
+## Slice-3 candidate (from PR #20 Copilot round 3, suppressed comments, 2026-09-04)
+
+- Minor operational-status accuracy: the no-change sync paths don't touch
+  `sync_states.last_synced_at`, so `--status` shows `last_synced=never`/stale
+  for a source that syncs successfully but hasn't changed:
+  - `repo_sync.ex` when `new_sha == last_sha` (returns :ok + notify, no touch)
+  - `jira_sync.ex` on the `{:ok, []}` path (no resolved issues)
+- Not a correctness bug (partly pre-existing on main); Copilot suppressed it.
+- Trade-off: touching last_synced_at on every no-change tick is a small write
+  per source per 15-min tick (90 sources). Decide in slice 3, which owns the
+  admin/status task (`rn.graph.backfill --status` / `rn.seed --status`).
+- Deliberately NOT pulled into PR #20 to keep slice 2 focused and merge-ready.
