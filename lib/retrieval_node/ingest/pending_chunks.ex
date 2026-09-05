@@ -200,82 +200,55 @@ defmodule RetrievalNode.Ingest.PendingChunks do
   @spec drainable?(binary()) :: boolean()
   def drainable?(source_id), do: source_id |> drainable(limit: 1) |> Enum.any?()
 
+  # Reduce a source's mailbox to one row per file — newest id per natural_key
+  # (arrival = version order) — in ONE data-modifying statement: a single CTE
+  # snapshot both propagates a superseded row's `force` onto the survivor and
+  # deletes the superseded rows. Must be one statement (not two under the
+  # default READ COMMITTED): if force-propagation and deletion were separate
+  # statements, a discovery transaction could commit a newer sibling BETWEEN
+  # them — the update would set force on the old survivor, then the delete
+  # would see the new row and remove that forced survivor, leaving the new row
+  # `force: false` (the very lost-re-derive race this is meant to prevent). In
+  # one CTE, `ranked` is computed once; the UPDATE and DELETE both read it, and
+  # any row committed after this statement's snapshot is simply left for the
+  # next pass's collapse.
+  @collapse_sql """
+  WITH ranked AS (
+    SELECT id, force,
+      row_number() OVER (PARTITION BY natural_key ORDER BY id DESC) AS rn,
+      bool_or(force) OVER (PARTITION BY natural_key) AS any_force
+    FROM pending_chunks
+    WHERE source_id = $1::uuid
+  ),
+  propagated AS (
+    UPDATE pending_chunks p SET force = true
+    FROM ranked r
+    WHERE p.id = r.id AND r.rn = 1 AND r.any_force AND NOT r.force
+  ),
+  removed AS (
+    DELETE FROM pending_chunks p
+    USING ranked r
+    WHERE p.id = r.id AND r.rn > 1
+    RETURNING p.id
+  )
+  SELECT count(*) FROM removed
+  """
+
   @doc """
   Durably reduce a source's mailbox to one row per file — the newest `id` per
-  `natural_key` (arrival order = version order) — in ONE transaction: carry any
-  superseded row's `force` onto the survivor, then delete the superseded rows.
-  Returns the number deleted.
+  `natural_key` — carrying any superseded row's `force` onto the survivor and
+  deleting the superseded rows, in a single consistent SQL statement (see
+  `@collapse_sql`). Returns the number deleted.
 
-  `Ingest.SourceOwner` runs this at the start of every drain pass, for two
-  reasons the old in-memory "collapse the current page" step couldn't cover:
-
-    * **Cross-page correctness.** A pass only reads `@rows_per_pass` rows. If an
-      older version of a file sits in one page and a newer version lands a page
-      later, collapsing per page would fully scrub/embed/reconcile/audit the
-      OLD content before the newer row is ever seen. Deduping across the WHOLE
-      source first means only the newest version of each file is ever applied.
-    * **Durable `force`.** The merged force flag has to survive a crash. If it
-      lived only on the in-memory struct while the forced (superseded) row was
-      deleted, a crash mid-apply would leave the retained DB row with
-      `force: false`, and its retry could take the unchanged-content skip and
-      silently drop a requested re-derive. Persisting it here fixes that.
+  `Ingest.SourceOwner` runs this at the start of every drain pass, so "newest
+  per file" holds across the WHOLE source, not just one 50-row drain page (an
+  older version in an earlier page would otherwise be fully scrubbed/embedded
+  before a newer row is seen), and so the merged `force` survives a crash.
   """
   @spec collapse_source(binary()) :: non_neg_integer()
   def collapse_source(source_id) do
-    {:ok, deleted} =
-      Repo.transaction(fn ->
-        # Force propagation must run BEFORE the delete so it can still see the
-        # older, about-to-be-deleted sibling that carried `force`.
-        propagate_force_to_survivors(source_id)
-        delete_superseded(source_id)
-      end)
-
+    %Postgrex.Result{rows: [[deleted]]} = Repo.query!(@collapse_sql, [Ecto.UUID.dump!(source_id)])
     deleted
-  end
-
-  # Set `force: true` on each survivor (the newest id for its file) that has an
-  # older sibling carrying force — so a requested re-derive isn't lost when the
-  # superseded rows are deleted.
-  defp propagate_force_to_survivors(source_id) do
-    Repo.update_all(
-      from(sv in PendingChunk,
-        as: :sv,
-        where: sv.source_id == ^source_id and sv.force == false,
-        where: not exists(newer_sibling(:sv)),
-        where: exists(forced_older_sibling(:sv))
-      ),
-      set: [force: true]
-    )
-  end
-
-  # Delete every row that has a newer row for the same file. Returns the count.
-  defp delete_superseded(source_id) do
-    {count, _} =
-      Repo.delete_all(
-        from(p in PendingChunk,
-          as: :p,
-          where: p.source_id == ^source_id and exists(newer_sibling(:p))
-        )
-      )
-
-    count
-  end
-
-  defp newer_sibling(binding) do
-    from(n in PendingChunk,
-      where:
-        n.source_id == parent_as(^binding).source_id and
-          n.natural_key == parent_as(^binding).natural_key and n.id > parent_as(^binding).id
-    )
-  end
-
-  defp forced_older_sibling(binding) do
-    from(o in PendingChunk,
-      where:
-        o.source_id == parent_as(^binding).source_id and
-          o.natural_key == parent_as(^binding).natural_key and
-          o.id < parent_as(^binding).id and o.force == true
-    )
   end
 
   @doc """
