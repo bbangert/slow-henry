@@ -84,6 +84,11 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
     with {:ok, _path} <- GitMirror.ensure_mirror(slug, source.identifier),
          {:ok, new_sha} <- GitMirror.head_sha(slug) do
       if new_sha == last_sha do
+        # No new commits, but the sync ran successfully — refresh last_synced_at
+        # (cursor unchanged) so operational status doesn't read stale/never for a
+        # quiet repo. Still notify: the owner may have staged work from a prior
+        # run to drain.
+        mark_synced!(sync_state)
         SourceOwner.notify(source.id)
         :ok
       else
@@ -150,6 +155,12 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
 
     SourceOwner.notify(source.id)
     :ok
+  end
+
+  defp mark_synced!(sync_state) do
+    sync_state
+    |> SyncState.changeset(%{status: :idle, last_synced_at: DateTime.utc_now()})
+    |> Repo.update!()
   end
 
   defp advance_watermark!(sync_state, new_sha) do

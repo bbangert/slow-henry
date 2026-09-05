@@ -29,8 +29,6 @@ defmodule RetrievalNode.Retrieval.PendingChunk do
   schema "pending_chunks" do
     # staging bookkeeping
     field :status, :string, default: "raw"
-    field :scrub_mode, :string
-    field :chunk_quality, :string
     field :raw_content, :string
 
     # provenance (set by *Sync on the raw row)
@@ -42,17 +40,6 @@ defmodule RetrievalNode.Retrieval.PendingChunk do
     field :natural_key, :string
     field :content_hash, :string
     field :metadata, :map, default: %{}
-
-    # chunk-level: unused by the current owner-applied pipeline (FileIngest
-    # writes straight to Retrieval.Chunk in one transaction, no intermediate
-    # chunk-row stage); left in the schema/table rather than migrated away.
-    field :chunk_index, :integer
-    field :chunk_content, :string
-    field :chunk_key, :string
-    field :context_breadcrumb, :string
-    field :parse_status, :string, default: "ok"
-    field :secrets_status, :string, default: "clean"
-    field :embedding, Pgvector.Ecto.Vector
 
     # owner drain bookkeeping (a future per-source drain boundary): a row that
     # keeps failing is marked here rather than blocking the rest of its
