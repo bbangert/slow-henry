@@ -18,8 +18,9 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
 
   Staging the rows and advancing the watermark happen in ONE `Repo.transaction`
   — a plain write (`SyncState.changeset`), not a compare-and-set: this job's
-  own `unique` window makes it the sole writer of its source's cursor, so
-  nothing else could have changed it out from under a stale read. After
+  lifetime `unique` (`period: :infinity`, active states) makes it the sole
+  ACTIVE sync for its source, so nothing else could have changed the cursor
+  out from under a stale read while this job runs, however long it runs. After
   commit, `Ingest.SourceOwner.notify/1` wakes (or starts) the owner that
   actually applies the batch. Even when `HEAD` is unchanged (`new_sha ==
   last_sha`), `notify/1` still fires — cheap, and it's what lets a previously
@@ -43,7 +44,13 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
     queue: :sync,
     max_attempts: 5,
     unique: [
-      period: {15, :minutes},
+      # `period: :infinity` with active-only `states` (no :completed) makes an
+      # ACTIVE sync the sole one for its source for its whole lifetime — however
+      # long it runs — closing the window where a finite period expired while a
+      # slow sync was still executing and a second concurrent sync could then
+      # regress the cursor / mailbox order. A fresh sync still enqueues once the
+      # prior one leaves the active states (completed/discarded/cancelled).
+      period: :infinity,
       keys: [:source_id],
       states: [:available, :scheduled, :executing, :retryable, :suspended]
     ]

@@ -30,7 +30,13 @@ defmodule RetrievalNode.Ingest.Workers.DriveSync do
     queue: :sync,
     max_attempts: 5,
     unique: [
-      period: {30, :minutes},
+      # `period: :infinity` with active-only `states` (no :completed) makes an
+      # ACTIVE sync the sole one for its source for its whole lifetime — however
+      # long it runs — closing the window where a finite period expired while a
+      # slow sync was still executing and a second concurrent sync could then
+      # regress the cursor / mailbox order. A fresh sync still enqueues once the
+      # prior one leaves the active states (completed/discarded/cancelled).
+      period: :infinity,
       keys: [:source_id],
       states: [:available, :scheduled, :executing, :retryable, :suspended]
     ]
