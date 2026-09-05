@@ -193,3 +193,17 @@ Resume with: /phx:work --continue
   per source per 15-min tick (90 sources). Decide in slice 3, which owns the
   admin/status task (`rn.graph.backfill --status` / `rn.seed --status`).
 - Deliberately NOT pulled into PR #20 to keep slice 2 focused and merge-ready.
+
+## Slice-2 follow-up (from PR #20 Copilot round 4, deferred, 2026-09-05)
+
+- Boot resume (SourceOwner.resume_all) starts an owner for EVERY source with
+  pending work, no global concurrency bound. On a mass restart with a big
+  backlog, each owner fetches up to 50 full-content rows and runs chunking
+  independently. Embedding is already bounded (Nx.Serving batches across
+  callers, Phase-0 spike); chunking is bounded only by dirty-scheduler count;
+  per-owner memory (50 rows of file content × N owners) is unbounded.
+- Deferred from PR #20 (Ben's call): rare-event hardening, not a correctness
+  bug. Steady state runs few concurrent owners. Fix later with a global
+  demand/concurrency limit (e.g. a bounded/staggered resume, or a cap on
+  concurrently-draining owners) while keeping per-source serialization.
+- PR #20 thread PRRT_kwDOTXolXc6fcSm0 left OPEN as the tracked item.
