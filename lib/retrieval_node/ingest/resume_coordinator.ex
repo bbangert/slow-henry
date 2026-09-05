@@ -44,7 +44,8 @@ defmodule RetrievalNode.Ingest.ResumeCoordinator do
   @doc """
   Drain every source with pending work, at most `max_concurrency` at a time.
   Public so tests can drive it directly (the coordinator process itself is
-  gated off in the test env). Returns the number of sources drained.
+  gated off in the test env). Returns the number of sources that drained
+  successfully; a source whose drain fails is logged and skipped.
   """
   @spec resume() :: non_neg_integer()
   def resume do
@@ -56,19 +57,53 @@ defmodule RetrievalNode.Ingest.ResumeCoordinator do
         "(max_concurrency=#{max})"
     )
 
+    # Catch inside the task so one source's failure (a start_child error, an
+    # owner crash mid-drain) neither takes down the async_stream nor is silently
+    # counted as success — log it and press on. Returns the count that DRAINED.
     source_ids
-    |> Task.async_stream(&SourceOwner.drain/1,
+    |> Task.async_stream(
+      fn source_id ->
+        try do
+          {:drained, SourceOwner.drain(source_id)}
+        catch
+          kind, reason -> {:failed, source_id, kind, reason}
+        end
+      end,
       max_concurrency: max,
       timeout: :infinity,
       ordered: false
     )
-    |> Stream.run()
+    |> Enum.reduce(0, fn
+      {:ok, {:drained, _}}, drained ->
+        drained + 1
 
-    length(source_ids)
+      {:ok, {:failed, source_id, kind, reason}}, drained ->
+        Logger.error(
+          "Ingest.ResumeCoordinator: drain failed source_id=#{source_id} " <>
+            "#{kind}=#{inspect(reason)} — left for the source's next discovery tick"
+        )
+
+        drained
+    end)
   end
 
-  # `|| default` (not just get_env's default arg) so an explicit nil override
-  # falls back too — a key set to nil is present, so get_env wouldn't default it.
-  defp max_concurrency,
-    do: Application.get_env(:retrieval_node, :resume_max_concurrency) || @default_max_concurrency
+  # Validate the configured bound; fall back to the default for a missing, nil,
+  # or nonsense value rather than letting Task.async_stream raise during boot.
+  defp max_concurrency do
+    case Application.get_env(:retrieval_node, :resume_max_concurrency) do
+      n when is_integer(n) and n > 0 ->
+        n
+
+      nil ->
+        @default_max_concurrency
+
+      other ->
+        Logger.warning(
+          "Ingest.ResumeCoordinator: invalid :resume_max_concurrency #{inspect(other)}, " <>
+            "using #{@default_max_concurrency}"
+        )
+
+        @default_max_concurrency
+    end
+  end
 end

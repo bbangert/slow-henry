@@ -253,8 +253,8 @@ defmodule RetrievalNode.Ingest.PendingChunks do
 
   @doc """
   Distinct `source_id`s with at least one drainable row — `Ingest.ResumeCoordinator`'s
-  boot-time query, so a restart notifies every source that still has staged
-  work rather than waiting for that source's next discovery run.
+  boot-time query, so a restart drains every source that still has staged work
+  (bounded concurrency) rather than waiting for that source's next discovery run.
   """
   @spec pending_source_ids() :: [binary()]
   def pending_source_ids do

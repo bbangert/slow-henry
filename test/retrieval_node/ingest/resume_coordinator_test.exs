@@ -94,4 +94,18 @@ defmodule RetrievalNode.Ingest.ResumeCoordinatorTest do
     assert 3 = ResumeCoordinator.resume()
     assert Repo.aggregate(PendingChunk, :count, :id) == 0
   end
+
+  test "resume/0 falls back to the default bound when max_concurrency is misconfigured" do
+    prev = Application.get_env(:retrieval_node, :resume_max_concurrency)
+    Application.put_env(:retrieval_node, :resume_max_concurrency, 0)
+    on_exit(fn -> Application.put_env(:retrieval_node, :resume_max_concurrency, prev) end)
+
+    s = seed_source("cfg")
+    seed_raw(s, "f.py")
+
+    # An invalid bound (0) would make Task.async_stream raise — the coordinator
+    # must validate it and fall back rather than crash during boot/resume.
+    assert 1 = ResumeCoordinator.resume()
+    assert Repo.aggregate(PendingChunk, :count, :id) == 0
+  end
 end
