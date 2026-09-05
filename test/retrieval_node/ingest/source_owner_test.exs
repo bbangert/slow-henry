@@ -1,31 +1,11 @@
-defmodule RetrievalNode.Ingest.SourceOwnerTest.PoisonChunker do
-  @moduledoc """
-  Test-only `Chunking` impl whose `chunk/2` fails deterministically for
-  content starting with "POISON" and otherwise delegates to the real
-  `HeuristicImpl` — lets a test seed both a poison row and healthy rows in the
-  same pass without disturbing the rest of the suite's `:fake_chunk_result`-
-  driven `FakeImpl`.
-  """
-  @behaviour RetrievalNode.Chunking
-
-  alias RetrievalNode.Chunking.HeuristicImpl
-
-  @impl true
-  def chunk("POISON" <> _, _lang), do: {:error, :boom}
-  def chunk(source, lang), do: HeuristicImpl.chunk(source, lang)
-
-  @impl true
-  def allowed_languages, do: []
-end
-
 defmodule RetrievalNode.Ingest.SourceOwnerTest do
   # async: false — shares the SQL sandbox with the SourceOwner GenServers this
   # module starts directly (a separate process, so it needs the shared-sandbox
   # mode DataCase gives `async: false` tests).
   use RetrievalNode.DataCase, async: false
 
+  alias RetrievalNode.Chunking.PoisonImpl
   alias RetrievalNode.Ingest.{PendingChunks, SourceOwner}
-  alias RetrievalNode.Ingest.SourceOwnerTest.PoisonChunker
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source}
 
@@ -189,7 +169,7 @@ defmodule RetrievalNode.Ingest.SourceOwnerTest do
   describe "poison rows" do
     setup do
       prev = Application.get_env(:retrieval_node, :chunking_impl)
-      Application.put_env(:retrieval_node, :chunking_impl, PoisonChunker)
+      Application.put_env(:retrieval_node, :chunking_impl, PoisonImpl)
       on_exit(fn -> Application.put_env(:retrieval_node, :chunking_impl, prev) end)
       :ok
     end
@@ -211,6 +191,22 @@ defmodule RetrievalNode.Ingest.SourceOwnerTest do
       assert marked.attempts == 1
       assert marked.last_error =~ "boom"
       assert DateTime.compare(marked.retry_after, DateTime.utc_now()) == :gt
+    end
+
+    test "a throwing chunk impl is caught and marked, not crashing the owner", %{source: source} do
+      throws = seed_raw(source, "repo:x:throws.py", "throws.py", "THROW content\n")
+      seed_raw(source, "repo:x:ok.py", "ok.py", "fine content\n")
+
+      assert {:ok, stats} = SourceOwner.drain(source.id)
+      assert stats.applied == 1
+      assert stats.failed == 1
+
+      # The owner survived (drain returned) and the throwing row is a failure
+      # marker, so its terminal give-up will later redact raw_content — the
+      # throw path reaches the same handling as an error return, not a crash.
+      marked = PendingChunks.fetch!(throws.id)
+      assert marked.attempts == 1
+      assert marked.last_error =~ "boom_throw"
     end
 
     test "after max_file_attempts marks, the row is excluded from drainable/2 and counted by failed_count/0",

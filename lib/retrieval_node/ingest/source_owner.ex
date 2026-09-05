@@ -337,6 +337,10 @@ defmodule RetrievalNode.Ingest.SourceOwner do
       rescue
         error -> {:error, {error, __STACKTRACE__}}
       catch
+        # Both non-exception non-local exits reach the normal failure path, so a
+        # throwing chunk/embed impl marks the row (and, at the ceiling, redacts
+        # raw_content) instead of crashing the owner and stranding the payload.
+        :throw, value -> {:error, {:throw, value}}
         :exit, reason -> {:error, {:exit, reason}}
       end
 
