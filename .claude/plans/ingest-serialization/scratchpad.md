@@ -219,3 +219,30 @@ Resume with: /phx:work --continue
   a long-lived, restartable resume coordinator would fix both — re-kick on
   recovery AND a place to bound concurrent owner starts. Do together in the
   resume-hardening follow-up.
+
+## REDESIGN COMPLETE (2026-09-05)
+
+All slices merged to main:
+- #17 FileIngest functional core (slice 1)
+- #20 SourceOwner per-source boundary + pipeline retirement (slice 2)
+- #21 drop dead staging columns + last_synced_at fix (slice 3)
+- #22 ResumeCoordinator: bounded, restartable boot/recovery resume (slice 4)
+Plus security: #18 (6 CVEs), #19 (2 mint CVEs).
+Superseded/closed: #15, #16 (the original stacked mega-PR).
+
+The multi-writer ordering bug class is eliminated by construction (one owner
+process per source; its mailbox is the serialization point). No generation
+guard / claim table / tombstones. Corpus on 5433 intact (578,773 chunks, 0
+pending) throughout.
+
+## Tracked follow-up (open, not blocking)
+
+- HARD concurrency bound under owner crashes. Today SourceOwner is an
+  independent :transient DynamicSupervisor child that drains on its own init,
+  so ResumeCoordinator's max_concurrency is soft when an owner crashes mid-
+  drain: the coordinator mitigates (in-slot retry, stop-on-give-up) but a
+  restarted owner can drain briefly outside the bound. A truly hard bound
+  needs the coordinator to OWN the owner lifecycle (start/stop owners itself
+  rather than owners being independent restartable children). Larger
+  architectural change; owner crashes are rare (apply_row contains its own
+  crashes), so deferred. From PR #22 rounds 4–5 (Copilot).
