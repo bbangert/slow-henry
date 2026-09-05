@@ -65,13 +65,24 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     assert state.cursor["last_sha"] == head
   end
 
-  test "an unchanged repo is a no-op on the second sync", ctx do
+  test "an unchanged repo is a no-op on the second sync but still refreshes last_synced_at",
+       ctx do
     commit(ctx.src, [{"a.py", "x\n"}])
     perform_job(RepoSync, %{"source_id" => ctx.source.id})
     Repo.delete_all(PendingChunk)
 
+    # Backdate last_synced_at so the no-change path's refresh is observable.
+    stale = DateTime.add(DateTime.utc_now(), -3600)
+
+    Repo.update_all(from(s in SyncState, where: s.source_id == ^ctx.source.id),
+      set: [last_synced_at: stale]
+    )
+
     assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
     assert Repo.aggregate(PendingChunk, :count, :id) == 0
+
+    state = Repo.get_by!(SyncState, source_id: ctx.source.id)
+    assert DateTime.compare(state.last_synced_at, stale) == :gt
   end
 
   test "a deleted file stages a deletion entry — chunks are untouched here, that's the owner's job",

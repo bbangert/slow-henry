@@ -137,8 +137,13 @@ defmodule RetrievalNode.Ingest.SourcesTest do
 
       assert :ok = perform_job(JiraSync, %{"source_id" => source.id})
       assert Repo.all(PendingChunk) == []
+
       state = Repo.get_by!(SyncState, source_id: source.id)
+      # Cursor (watermark) stays untouched, but last_synced_at is set (it was nil
+      # on the freshly created state) so operational status doesn't read "never"
+      # for a project that syncs successfully with no resolved issues.
       refute Map.has_key?(state.cursor, "resolutiondate_watermark")
+      refute is_nil(state.last_synced_at)
     end
 
     test "a 429 returns {:snooze, _} instead of failing" do

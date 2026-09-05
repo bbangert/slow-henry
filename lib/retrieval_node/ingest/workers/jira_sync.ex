@@ -49,6 +49,9 @@ defmodule RetrievalNode.Ingest.Workers.JiraSync do
 
     case Jira.fetch_resolved(source.identifier, watermark) do
       {:ok, []} ->
+        # No newly-resolved issues, but the sync succeeded — refresh
+        # last_synced_at (watermark unchanged) so status doesn't read stale.
+        mark_synced!(state)
         SourceOwner.notify(source.id)
         :ok
 
@@ -112,6 +115,12 @@ defmodule RetrievalNode.Ingest.Workers.JiraSync do
       metadata: %{"issue_key" => issue.key},
       status: "deleted"
     }
+  end
+
+  defp mark_synced!(state) do
+    state
+    |> SyncState.changeset(%{status: :idle, last_synced_at: DateTime.utc_now()})
+    |> Repo.update!()
   end
 
   defp advance_watermark!(_state, nil), do: :ok
