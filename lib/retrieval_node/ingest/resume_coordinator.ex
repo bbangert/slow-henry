@@ -84,6 +84,13 @@ defmodule RetrievalNode.Ingest.ResumeCoordinator do
         )
 
         drained
+
+      # A task killed/force-exited by something outside its own try/catch (an
+      # untrappable :kill can't be caught in-task) — log and skip so one dead
+      # task can't FunctionClauseError-crash resume into a boot restart loop.
+      {:exit, reason}, drained ->
+        Logger.error("Ingest.ResumeCoordinator: resume task exited #{inspect(reason)}")
+        drained
     end)
   end
 
