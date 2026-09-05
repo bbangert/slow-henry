@@ -123,7 +123,9 @@ defmodule RetrievalNode.Ingest.Workers.JiraSync do
     |> Repo.update!()
   end
 
-  defp advance_watermark!(_state, nil), do: :ok
+  # No new watermark (Jira returned only issues without a resolutiondate) — still
+  # refresh last_synced_at so a sync that staged work doesn't read stale.
+  defp advance_watermark!(state, nil), do: mark_synced!(state)
 
   defp advance_watermark!(state, watermark) do
     state

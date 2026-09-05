@@ -146,6 +146,30 @@ defmodule RetrievalNode.Ingest.SourcesTest do
       refute is_nil(state.last_synced_at)
     end
 
+    test "issues with no resolutiondate stage work and still refresh last_synced_at" do
+      source = Repo.insert!(%Source{source_type: :jira_project, name: "p", identifier: "P"})
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        Req.Test.json(conn, %{
+          "issues" => [
+            %{
+              "key" => "P-1",
+              "fields" => %{"summary" => "no resolution date", "resolutiondate" => nil}
+            }
+          ]
+        })
+      end)
+
+      assert :ok = perform_job(JiraSync, %{"source_id" => source.id})
+      assert [_row] = Repo.all(PendingChunk)
+
+      state = Repo.get_by!(SyncState, source_id: source.id)
+      # new_watermark is nil (no resolutiondate), but last_synced_at is still
+      # refreshed — a sync that staged work must not read stale.
+      refute Map.has_key?(state.cursor, "resolutiondate_watermark")
+      refute is_nil(state.last_synced_at)
+    end
+
     test "a 429 returns {:snooze, _} instead of failing" do
       source = Repo.insert!(%Source{source_type: :jira_project, name: "p", identifier: "P"})
 
