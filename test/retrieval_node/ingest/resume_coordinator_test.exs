@@ -67,7 +67,7 @@ defmodule RetrievalNode.Ingest.ResumeCoordinatorTest do
     seed_raw(s1, "a.py")
     seed_raw(s2, "b.py")
 
-    assert 2 = ResumeCoordinator.resume()
+    assert {2, 0} = ResumeCoordinator.resume()
 
     assert chunk_count(s1) == 1
     assert chunk_count(s2) == 1
@@ -75,7 +75,7 @@ defmodule RetrievalNode.Ingest.ResumeCoordinatorTest do
   end
 
   test "resume/0 is a no-op (returns 0) when nothing is pending" do
-    assert 0 = ResumeCoordinator.resume()
+    assert {0, 0} = ResumeCoordinator.resume()
   end
 
   test "resume/0 honours a configured max_concurrency bound" do
@@ -91,7 +91,7 @@ defmodule RetrievalNode.Ingest.ResumeCoordinatorTest do
     # With max_concurrency 1 the sources drain one at a time; correctness is the
     # observable guarantee (all drained), which also proves the bound doesn't
     # strand any source.
-    assert 3 = ResumeCoordinator.resume()
+    assert {3, 0} = ResumeCoordinator.resume()
     assert Repo.aggregate(PendingChunk, :count, :id) == 0
   end
 
@@ -105,7 +105,7 @@ defmodule RetrievalNode.Ingest.ResumeCoordinatorTest do
 
     # An invalid bound (0) would make Task.async_stream raise — the coordinator
     # must validate it and fall back rather than crash during boot/resume.
-    assert 1 = ResumeCoordinator.resume()
+    assert {1, 0} = ResumeCoordinator.resume()
     assert Repo.aggregate(PendingChunk, :count, :id) == 0
   end
 
@@ -145,7 +145,7 @@ defmodule RetrievalNode.Ingest.ResumeCoordinatorTest do
       seed_raw(src, "f.py")
     end
 
-    assert 3 = ResumeCoordinator.resume()
+    assert {3, 0} = ResumeCoordinator.resume()
 
     # With the bound at 1, no two sources ever chunk at the same time. If the
     # bound were ignored/hard-coded higher, the 40ms sleeps would overlap and

@@ -54,8 +54,17 @@ defmodule RetrievalNode.Ingest.ResumeCoordinator do
   # supervisor's restart intensity terminates the whole ingest tree. Guard it:
   # on a top-level failure, stay alive and retry with bounded backoff.
   defp attempt_resume(state) do
-    resume()
-    {:noreply, %{state | resume_attempts: 0}}
+    case resume() do
+      {_drained, 0} ->
+        {:noreply, %{state | resume_attempts: 0}}
+
+      {drained, failed} ->
+        # Some sources didn't drain (their owners kept crashing within the
+        # per-source retries). Schedule a bounded top-level retry so their
+        # durable rows are re-kicked rather than waiting for discovery; the
+        # retry only re-touches sources that still have pending rows.
+        schedule_retry(state, {:incomplete, drained: drained, failed: failed})
+    end
   rescue
     error -> schedule_retry(state, {:error, error})
   catch
@@ -80,10 +89,12 @@ defmodule RetrievalNode.Ingest.ResumeCoordinator do
   @doc """
   Drain every source with pending work, at most `max_concurrency` at a time.
   Public so tests can drive it directly (the coordinator process itself is
-  gated off in the test env). Returns the number of sources that drained
-  successfully; a source whose drain fails is logged and skipped.
+  gated off in the test env). Returns `{drained, failed}` — sources that
+  drained vs. those whose owner kept crashing past the per-source retries
+  (logged, their owner stopped so it can't drain outside the bound, and the
+  GenServer schedules a top-level retry).
   """
-  @spec resume() :: non_neg_integer()
+  @spec resume() :: {non_neg_integer(), non_neg_integer()}
   def resume do
     source_ids = PendingChunks.pending_source_ids()
     max = max_concurrency()
@@ -102,24 +113,29 @@ defmodule RetrievalNode.Ingest.ResumeCoordinator do
       timeout: :infinity,
       ordered: false
     )
-    |> Enum.reduce(0, fn
-      {:ok, {:drained, _}}, drained ->
-        drained + 1
+    |> Enum.reduce({0, 0}, fn
+      {:ok, {:drained, _}}, {drained, failed} ->
+        {drained + 1, failed}
 
-      {:ok, {:failed, source_id, kind, reason}}, drained ->
+      {:ok, {:failed, source_id, kind, reason}}, {drained, failed} ->
         Logger.error(
-          "Ingest.ResumeCoordinator: drain failed source_id=#{source_id} " <>
-            "#{kind}=#{inspect(reason)} — left for the source's next discovery tick"
+          "Ingest.ResumeCoordinator: drain gave up source_id=#{source_id} " <>
+            "#{kind}=#{inspect(reason)} — stopping its owner and scheduling a retry"
         )
 
-        drained
+        # The owner is a :transient child: after its crash it restarts and
+        # drains on its OWN, outside this bound. Stop it here so releasing this
+        # slot can't leave a second drainer running; the scheduled retry (or the
+        # source's next discovery tick) restarts it in-bound.
+        SourceOwner.stop(source_id)
+        {drained, failed + 1}
 
       # A task killed/force-exited by something outside its own try/catch (an
       # untrappable :kill can't be caught in-task) — log and skip so one dead
       # task can't FunctionClauseError-crash resume into a boot restart loop.
-      {:exit, reason}, drained ->
+      {:exit, reason}, {drained, failed} ->
         Logger.error("Ingest.ResumeCoordinator: resume task exited #{inspect(reason)}")
-        drained
+        {drained, failed + 1}
     end)
   end
 
