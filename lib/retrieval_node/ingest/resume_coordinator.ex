@@ -29,16 +29,52 @@ defmodule RetrievalNode.Ingest.ResumeCoordinator do
   alias RetrievalNode.Ingest.{PendingChunks, SourceOwner}
 
   @default_max_concurrency 4
+  # Per-source in-slot retries when an owner crashes mid-drain (keeps the slot
+  # occupied, see drain_source/2), and the bounded backoff for a top-level
+  # resume failure (keeps the permanent child from crash-looping the tree).
+  @drain_retries 3
+  @drain_retry_ms 50
+  @resume_retry_base_ms 1_000
+  @resume_retry_max_ms 60_000
 
   def start_link(_arg), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
 
   @impl true
-  def init(:ok), do: {:ok, %{}, {:continue, :resume}}
+  def init(:ok), do: {:ok, %{resume_attempts: 0}, {:continue, :resume}}
 
   @impl true
-  def handle_continue(:resume, state) do
+  def handle_continue(:resume, state), do: attempt_resume(state)
+
+  @impl GenServer
+  def handle_info(:retry_resume, state), do: attempt_resume(state)
+
+  # resume/0 reads the DB (`pending_source_ids/0`) before any task is created,
+  # so a transient DB outage at boot/recovery would raise straight out of the
+  # continuation and, for this :permanent child, crash-loop until the
+  # supervisor's restart intensity terminates the whole ingest tree. Guard it:
+  # on a top-level failure, stay alive and retry with bounded backoff.
+  defp attempt_resume(state) do
     resume()
-    {:noreply, state}
+    {:noreply, %{state | resume_attempts: 0}}
+  rescue
+    error -> schedule_retry(state, {:error, error})
+  catch
+    kind, reason -> schedule_retry(state, {kind, reason})
+  end
+
+  defp schedule_retry(state, reason) do
+    attempts = state.resume_attempts + 1
+
+    delay =
+      min(@resume_retry_base_ms * Integer.pow(2, min(attempts - 1, 6)), @resume_retry_max_ms)
+
+    Logger.error(
+      "Ingest.ResumeCoordinator: resume failed (#{inspect(reason)}); retrying in #{delay}ms " <>
+        "(attempt #{attempts})"
+    )
+
+    Process.send_after(self(), :retry_resume, delay)
+    {:noreply, %{state | resume_attempts: attempts}}
   end
 
   @doc """
@@ -61,14 +97,7 @@ defmodule RetrievalNode.Ingest.ResumeCoordinator do
     # owner crash mid-drain) neither takes down the async_stream nor is silently
     # counted as success — log it and press on. Returns the count that DRAINED.
     source_ids
-    |> Task.async_stream(
-      fn source_id ->
-        try do
-          {:drained, SourceOwner.drain(source_id)}
-        catch
-          kind, reason -> {:failed, source_id, kind, reason}
-        end
-      end,
+    |> Task.async_stream(&drain_source(&1, @drain_retries),
       max_concurrency: max,
       timeout: :infinity,
       ordered: false
@@ -92,6 +121,25 @@ defmodule RetrievalNode.Ingest.ResumeCoordinator do
         Logger.error("Ingest.ResumeCoordinator: resume task exited #{inspect(reason)}")
         drained
     end)
+  end
+
+  # Drain one source, RE-draining the SAME source in this same async_stream
+  # slot if its owner crashes mid-drain. An owner is a :transient
+  # DynamicSupervisor child, so a crash restarts it and its init drains again
+  # on its own — if we instead freed this slot and let a new source start, that
+  # restarted owner would drain OUTSIDE the concurrency bound (N + 1). Keeping
+  # the slot on this source until it actually drains (or retries run out) holds
+  # the bound; Registry uniqueness means our re-drain and the restarted owner
+  # are the same process, so they don't double up.
+  defp drain_source(source_id, retries) do
+    {:drained, SourceOwner.drain(source_id)}
+  catch
+    _kind, _reason when retries > 0 ->
+      Process.sleep(@drain_retry_ms)
+      drain_source(source_id, retries - 1)
+
+    kind, reason ->
+      {:failed, source_id, kind, reason}
   end
 
   # Validate the configured bound; fall back to the default for a missing, nil,

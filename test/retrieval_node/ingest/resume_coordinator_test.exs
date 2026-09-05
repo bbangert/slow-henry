@@ -166,7 +166,17 @@ defmodule RetrievalNode.Ingest.ResumeCoordinatorTest do
         strategy: :rest_for_one
       )
 
-    on_exit(fn -> Process.exit(sup, :normal) end)
+    # Supervisors trap exits, so Process.exit(_, :normal) would NOT stop it (it
+    # becomes a message) — the sup and the globally-named coordinator would leak
+    # and later randomized tests would hit :already_started. Stop via the API,
+    # tolerating the case where the link already took it down with the test.
+    on_exit(fn ->
+      try do
+        Supervisor.stop(sup)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
 
     pid1 = Process.whereis(ResumeCoordinator)
     assert is_pid(pid1)
