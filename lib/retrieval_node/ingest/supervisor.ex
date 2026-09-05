@@ -2,15 +2,18 @@ defmodule RetrievalNode.Ingest.Supervisor do
   @moduledoc """
   Supervises the per-source ingest boundary: `Ingest.SourceRegistry` (owner
   lookup by `source_id`), `Ingest.SourceSupervisor` (starts/restarts owners
-  on demand), and — only on a VM that actually processes ingest — a one-shot
-  boot Task that notifies every source with work waiting in `pending_chunks`
-  (`Ingest.SourceOwner.resume_all/0`), so nothing staged before a restart or
-  deploy sits unnoticed until that source's next discovery run.
+  on demand), and — only on a VM that actually processes ingest —
+  `Ingest.ResumeCoordinator`, a long-lived child that drains every source
+  with work waiting in `pending_chunks` (bounded concurrency) so nothing
+  staged before a restart or deploy sits unnoticed until that source's next
+  discovery run.
 
-  `:rest_for_one`: `SourceSupervisor` and the resume Task both depend on the
-  Registry being up (an owner registers into it at start), so if the
-  Registry dies, both restart with it; a `SourceSupervisor`-only restart
-  doesn't need to touch the Registry.
+  `:rest_for_one`: `SourceSupervisor` and the resume coordinator both depend
+  on the Registry being up (an owner registers into it at start), so if the
+  Registry dies, both restart with it — and the coordinator's restart
+  re-kicks the resume, so owners that died with the Registry are brought back
+  from the durable table (a `:temporary` boot Task would not re-run here). A
+  `SourceSupervisor`-only restart doesn't need to touch the Registry.
 
   ## Why the resume kick is conditional
 
@@ -31,7 +34,7 @@ defmodule RetrievalNode.Ingest.Supervisor do
   """
   use Supervisor
 
-  alias RetrievalNode.Ingest.SourceOwner
+  alias RetrievalNode.Ingest.ResumeCoordinator
 
   def start_link(init_arg) do
     Supervisor.start_link(__MODULE__, init_arg, name: __MODULE__)
@@ -53,17 +56,7 @@ defmodule RetrievalNode.Ingest.Supervisor do
   end
 
   defp resume_children do
-    if ingest_vm?() do
-      [
-        %{
-          id: :resume,
-          start: {Task, :start_link, [&SourceOwner.resume_all/0]},
-          restart: :temporary
-        }
-      ]
-    else
-      []
-    end
+    if ingest_vm?(), do: [ResumeCoordinator], else: []
   end
 
   defp ingest_vm? do

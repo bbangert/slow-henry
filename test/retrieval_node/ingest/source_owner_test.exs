@@ -304,38 +304,6 @@ defmodule RetrievalNode.Ingest.SourceOwnerTest do
     assert length(chunks_for(source, "h.py")) == 1
   end
 
-  # --- 7. resume_all/0 ------------------------------------------------------
-
-  describe "resume_all/0" do
-    setup do
-      prev = Application.get_env(:retrieval_node, :source_owner_notify)
-      Application.put_env(:retrieval_node, :source_owner_notify, true)
-      on_exit(fn -> Application.put_env(:retrieval_node, :source_owner_notify, prev) end)
-      :ok
-    end
-
-    test "notifies every source that has at least one drainable row", %{source: source} do
-      other_source =
-        Repo.insert!(%Source{source_type: :git_repo, name: "other", identifier: "acme/other"})
-
-      on_exit(fn -> SourceOwner.stop(other_source.id) end)
-
-      seed_raw(source, "repo:x:i.py", "i.py", "hi\n")
-      seed_raw(other_source, "repo:y:j.py", "j.py", "hey\n")
-
-      assert :ok = SourceOwner.resume_all()
-
-      assert is_pid(SourceOwner.whereis(source.id))
-      assert is_pid(SourceOwner.whereis(other_source.id))
-
-      assert {:ok, _} = SourceOwner.drain(source.id)
-      assert {:ok, _} = SourceOwner.drain(other_source.id)
-
-      assert length(chunks_for(source, "i.py")) == 1
-      assert length(chunks_for(other_source, "j.py")) == 1
-    end
-  end
-
   # --- 8. :timeout with drainable rows drains instead of stopping ----------
 
   test "handle_info(:timeout) with drainable rows drains instead of stopping", %{source: source} do

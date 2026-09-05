@@ -252,7 +252,7 @@ defmodule RetrievalNode.Ingest.PendingChunks do
   end
 
   @doc """
-  Distinct `source_id`s with at least one drainable row — `Ingest.SourceOwner.resume_all/0`'s
+  Distinct `source_id`s with at least one drainable row — `Ingest.ResumeCoordinator`'s
   boot-time query, so a restart notifies every source that still has staged
   work rather than waiting for that source's next discovery run.
   """
