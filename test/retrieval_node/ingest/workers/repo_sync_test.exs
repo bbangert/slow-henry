@@ -4,7 +4,8 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
   use RetrievalNode.DataCase, async: false
   use Oban.Testing, repo: RetrievalNode.Repo
 
-  alias RetrievalNode.Ingest.Workers.{ChunkFiles, RepoSync}
+  alias RetrievalNode.Ingest.SourceOwner
+  alias RetrievalNode.Ingest.Workers.RepoSync
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source, SyncState}
 
@@ -46,7 +47,7 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     git!(src, ["commit", "-qm", "c"])
   end
 
-  test "first sync ingests every file, enqueues ChunkFiles, advances the watermark", ctx do
+  test "first sync stages a raw row per file, advances the watermark", ctx do
     commit(ctx.src, [{"a.py", "def a(): pass\n"}, {"b.py", "def b(): pass\n"}])
 
     assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
@@ -57,7 +58,6 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
              ["repo:#{ctx.source.id}:a.py", "repo:#{ctx.source.id}:b.py"]
 
     assert Enum.all?(raws, &(&1.lang == "python" and &1.source_id == ctx.source.id))
-    assert_enqueued(worker: ChunkFiles)
 
     # watermark advanced to HEAD
     head = String.trim(git!(ctx.src, ["rev-parse", "HEAD"]))
@@ -74,11 +74,13 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     assert Repo.aggregate(PendingChunk, :count, :id) == 0
   end
 
-  test "a deleted file removes its permanent chunks on the next sync", ctx do
+  test "a deleted file stages a deletion entry — chunks are untouched here, that's the owner's job",
+       ctx do
     commit(ctx.src, [{"gone.py", "def g(): pass\n"}])
     perform_job(RepoSync, %{"source_id" => ctx.source.id})
+    Repo.delete_all(PendingChunk)
 
-    # Simulate the chunk already having been upserted for gone.py.
+    # Simulate the chunk already having been indexed for gone.py by an owner.
     Repo.insert!(%Chunk{
       source_id: ctx.source.id,
       source_type: :git_repo,
@@ -95,7 +97,25 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     git!(ctx.src, ["commit", "-qm", "rm"])
 
     assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
-    assert Repo.aggregate(from(c in Chunk, where: c.chunk_key == "k1"), :count, :id) == 0
+
+    # RepoSync only appends to the mailbox — it never deletes a chunks row
+    # itself (Ingest.SourceOwner does, when it applies this entry).
+    assert Repo.aggregate(from(c in Chunk, where: c.chunk_key == "k1"), :count, :id) == 1
+
+    deletion =
+      Repo.one!(from p in PendingChunk, where: p.natural_key == ^"repo:#{ctx.source.id}:gone.py")
+
+    assert deletion.status == "deleted"
+    assert deletion.metadata == %{"path" => "gone.py"}
+
+    added =
+      Repo.one!(from p in PendingChunk, where: p.natural_key == ^"repo:#{ctx.source.id}:keep.py")
+
+    assert added.status == "raw"
+
+    head = String.trim(git!(ctx.src, ["rev-parse", "HEAD"]))
+    state = Repo.get_by!(SyncState, source_id: ctx.source.id)
+    assert state.cursor["last_sha"] == head
   end
 
   test "a modified file is re-enqueued, NOT treated as a deletion", ctx do
@@ -119,12 +139,11 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
 
     # modification is NOT a deletion — the existing chunk survives (it'll be
-    # upserted by the pipeline), and a fresh raw row is staged for re-chunking
+    # upserted by the owner), and a fresh raw row is staged for re-chunking
     assert Repo.aggregate(from(c in Chunk, where: c.chunk_key == "mk1"), :count, :id) == 1
     raw = Repo.one!(from p in PendingChunk, where: p.status == "raw")
     assert raw.natural_key == "repo:#{ctx.source.id}:mod.py"
     assert raw.raw_content =~ "return 42"
-    assert_enqueued(worker: ChunkFiles)
   end
 
   test "a repo with a binary file skips it — text file still staged, job still completes", ctx do
@@ -137,7 +156,17 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
 
     raws = Repo.all(from p in PendingChunk, where: p.status == "raw")
     assert Enum.map(raws, & &1.natural_key) == ["repo:#{ctx.source.id}:app.py"]
-    assert_enqueued(worker: ChunkFiles)
+
+    # The binary file itself was never staged as content — RepoSync's own
+    # binary_content?/1 check on the added file staged it as a deletion entry
+    # instead (see the dedicated binary-transition test below for a file that
+    # STARTS text and turns binary, where that distinction actually matters).
+    deletion =
+      Repo.one!(
+        from p in PendingChunk, where: p.natural_key == ^"repo:#{ctx.source.id}:favicon.ico"
+      )
+
+    assert deletion.status == "deleted"
 
     # watermark still advances past the binary file — it isn't retried forever
     head = String.trim(git!(ctx.src, ["rev-parse", "HEAD"]))
@@ -145,7 +174,7 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     assert state.cursor["last_sha"] == head
   end
 
-  test "a repo with invalid-UTF-8-but-no-NUL content skips that file too", ctx do
+  test "a repo with invalid-UTF-8-but-no-NUL content stages it as a deletion entry too", ctx do
     File.write!(Path.join(ctx.src, "mystery.bin"), <<255, 254>> <> "not valid utf8")
     commit(ctx.src, [{"app.py", "def a(): pass\n"}])
 
@@ -153,7 +182,52 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
 
     raws = Repo.all(from p in PendingChunk, where: p.status == "raw")
     assert Enum.map(raws, & &1.natural_key) == ["repo:#{ctx.source.id}:app.py"]
-    assert_enqueued(worker: ChunkFiles)
+
+    deletion =
+      Repo.one!(
+        from p in PendingChunk, where: p.natural_key == ^"repo:#{ctx.source.id}:mystery.bin"
+      )
+
+    assert deletion.status == "deleted"
+  end
+
+  test "a file that turns binary stages a deletion entry, not a dropped row — the owner then reconciles its chunks away",
+       ctx do
+    commit(ctx.src, [{"icon.dat", "not binary yet\n"}])
+    assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+    Repo.delete_all(PendingChunk)
+
+    # Simulate icon.dat having already been indexed while it was still text.
+    Repo.insert!(%Chunk{
+      source_id: ctx.source.id,
+      source_type: :git_repo,
+      chunk_key: "bk1",
+      content_hash: "h",
+      content: "not binary yet",
+      context_breadcrumb: "icon.dat",
+      metadata: %{"path" => "icon.dat"}
+    })
+
+    File.write!(Path.join(ctx.src, "icon.dat"), <<0, 255, 216, 0>>)
+    git!(ctx.src, ["add", "-A"])
+    git!(ctx.src, ["commit", "-qm", "now binary"])
+
+    assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+    # Staged as an identity-only deletion entry — NOT silently dropped by
+    # insert_raw_all/1's own binary guard, and NOT staged as a content row.
+    deletion =
+      Repo.one!(from p in PendingChunk, where: p.natural_key == ^"repo:#{ctx.source.id}:icon.dat")
+
+    assert deletion.status == "deleted"
+    assert deletion.raw_content == nil
+    assert deletion.metadata == %{"path" => "icon.dat"}
+
+    # Driving the real staging seam through to the owner: applying this entry
+    # reconciles the file's prior (text-era) chunk away.
+    on_exit(fn -> SourceOwner.stop(ctx.source.id) end)
+    assert {:ok, _stats} = SourceOwner.drain(ctx.source.id)
+    assert Repo.aggregate(from(c in Chunk, where: c.chunk_key == "bk1"), :count, :id) == 0
   end
 
   test "a repo with a submodule syncs the real files and skips the gitlink entirely", ctx do
@@ -176,9 +250,8 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
 
     raws = Repo.all(from p in PendingChunk, where: p.status == "raw")
     assert Enum.map(raws, & &1.natural_key) == ["repo:#{ctx.source.id}:app.py"]
-    assert_enqueued(worker: ChunkFiles)
 
-    # no staged row (and no ChunkFiles job) for the gitlink path
+    # no staged row for the gitlink path
     refute Repo.get_by(PendingChunk, natural_key: "repo:#{ctx.source.id}:sublib")
 
     # job completed (didn't retry-forever the way a job-fatal submodule would),
@@ -193,7 +266,6 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
 
     assert Repo.aggregate(from(p in PendingChunk), :count, :id) == 0
-    refute_enqueued(worker: ChunkFiles)
 
     state = Repo.get_by!(SyncState, source_id: ctx.source.id)
     assert state.cursor == %{}

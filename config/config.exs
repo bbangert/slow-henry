@@ -25,15 +25,30 @@ config :retrieval_node,
   chunking_impl: RetrievalNode.Chunking.TreeSitterImpl,
   embedding_impl: RetrievalNode.Embedding.NxServingImpl
 
-# Oban ingest pipeline. Queue concurrencies (design-oban §2): sync I/O-bound;
-# chunk CPU+NIF (bounded so it doesn't monopolize dirty schedulers); embed=1
-# (single Nx.Serving, must not starve the MCP endpoint); upsert cheap Postgres.
-# Pruner keeps 14d of job history; Lifeline rescues jobs orphaned >20m. The Cron
-# plugin (per-source watermark sync entrypoints) is added with the workers in the
-# next step. Repo pool_size is raised (dev/runtime) to num_queues + sum(limits) + buffer.
+# Oban ingest pipeline. `*Sync` discovery jobs (RepoSync/DriveSync/JiraSync)
+# are the only ingest work left in Oban — they only ever append to
+# `pending_chunks` and advance their source's cursor, then call
+# `Ingest.SourceOwner.notify/1`. Chunking/embedding/upsert no longer run as
+# Oban stages: `Ingest.SourceOwner` (one process per source, started under
+# `Ingest.Supervisor`) is the sole writer of `chunks`, applying staged rows
+# itself via `Ingest.FileIngest.apply/2` outside the queue system entirely —
+# see `Ingest.SourceOwner`'s moduledoc for why a GenServer mailbox is the
+# per-source serialization point instead of Oban concurrency limits.
+# `sync: 3` is I/O-bound (git/HTTP), so 3 concurrent discovery jobs is plenty.
+# Pruner keeps 14d of job history; Lifeline rescues jobs orphaned >20m. Repo
+# pool_size is raised (dev/runtime) to num_queues + sum(limits) + buffer.
+#
+# CUTOVER PRECONDITION: the retired `chunk`/`embed`/`upsert` queues are gone,
+# and `Ingest.SourceOwner` only ever drains `raw`/`deleted` staging rows. Any
+# `pending_chunks` rows left in a legacy intermediate state (a partially
+# chunked/embedded row from the old pipeline) would strand once these queues
+# are removed. Deploy this ONLY after the old pipeline has drained
+# `pending_chunks` to just `raw`/`deleted` rows and emptied the legacy queues
+# — verified empty on the dev corpus before this shipped. A fresh install has
+# nothing to drain.
 config :retrieval_node, Oban,
   repo: RetrievalNode.Repo,
-  queues: [sync: 3, chunk: 2, embed: 1, upsert: 5],
+  queues: [sync: 3],
   plugins: [
     {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 14},
     {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(20)},

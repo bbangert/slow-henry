@@ -3,7 +3,14 @@ defmodule RetrievalNode.Ingest.SourcesTest do
   use Oban.Testing, repo: RetrievalNode.Repo
 
   alias RetrievalNode.Ingest.{Drive, Jira}
-  alias RetrievalNode.Ingest.Workers.{ChunkFiles, DriveSync, JiraSync, RepoSync, SyncScheduler}
+
+  alias RetrievalNode.Ingest.Workers.{
+    DriveSync,
+    JiraSync,
+    RepoSync,
+    SyncScheduler
+  }
+
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source, SyncState}
 
@@ -94,7 +101,7 @@ defmodule RetrievalNode.Ingest.SourcesTest do
       :ok
     end
 
-    test "ingests resolved issues, enqueues ChunkFiles, advances the watermark" do
+    test "stages a raw row per resolved issue, advances the watermark" do
       source = Repo.insert!(%Source{source_type: :jira_project, name: "proj", identifier: "PROJ"})
 
       Req.Test.stub(__MODULE__, fn conn ->
@@ -116,11 +123,22 @@ defmodule RetrievalNode.Ingest.SourcesTest do
       [raw] = Repo.all(PendingChunk)
       assert raw.natural_key == "jira:PROJ-42"
       assert raw.source_type == "jira_project"
+      assert raw.status == "raw"
       assert raw.raw_content =~ "A resolved issue"
-      assert_enqueued(worker: RetrievalNode.Ingest.Workers.ChunkFiles)
 
       state = Repo.get_by!(SyncState, source_id: source.id)
       assert state.cursor["resolutiondate_watermark"] == "2026-03-01T00:00:00.000+0000"
+    end
+
+    test "no resolved issues still advances nothing but is not an error" do
+      source = Repo.insert!(%Source{source_type: :jira_project, name: "p", identifier: "P"})
+
+      Req.Test.stub(__MODULE__, fn conn -> Req.Test.json(conn, %{"issues" => []}) end)
+
+      assert :ok = perform_job(JiraSync, %{"source_id" => source.id})
+      assert Repo.all(PendingChunk) == []
+      state = Repo.get_by!(SyncState, source_id: source.id)
+      refute Map.has_key?(state.cursor, "resolutiondate_watermark")
     end
 
     test "a 429 returns {:snooze, _} instead of failing" do
@@ -147,6 +165,36 @@ defmodule RetrievalNode.Ingest.SourcesTest do
 
       assert {:snooze, 60} = perform_job(JiraSync, %{"source_id" => source.id})
     end
+
+    test "an issue whose extracted text is binary stages a deletion entry instead of a content row" do
+      source = Repo.insert!(%Source{source_type: :jira_project, name: "proj", identifier: "PROJ"})
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        Req.Test.json(conn, %{
+          "issues" => [
+            %{
+              "key" => "PROJ-99",
+              "fields" => %{
+                # a NUL byte is valid UTF-8 but trips Chunking.binary_content?/1 —
+                # defensive: Jira's own ADF extraction shouldn't produce this.
+                "summary" => "weird\u0000issue",
+                "resolutiondate" => "2026-03-01T00:00:00.000+0000"
+              }
+            }
+          ]
+        })
+      end)
+
+      assert :ok = perform_job(JiraSync, %{"source_id" => source.id})
+
+      [row] = Repo.all(PendingChunk)
+      assert row.natural_key == "jira:PROJ-99"
+      assert row.status == "deleted"
+      assert row.raw_content == nil
+
+      state = Repo.get_by!(SyncState, source_id: source.id)
+      assert state.cursor["resolutiondate_watermark"] == "2026-03-01T00:00:00.000+0000"
+    end
   end
 
   describe "DriveSync (Req.Test)" do
@@ -168,19 +216,20 @@ defmodule RetrievalNode.Ingest.SourcesTest do
       assert :ok = perform_job(DriveSync, %{"source_id" => source.id})
 
       assert Repo.all(PendingChunk) == []
-      refute_enqueued(worker: ChunkFiles)
       state = Repo.get_by!(SyncState, source_id: source.id)
       assert state.cursor["start_page_token"] == "tok-seed"
     end
 
-    test "exports a changed Doc, stages it, prunes a removed Doc, advances the cursor" do
+    test "exports a changed Doc, stages a deletion entry for a removed one, advances the cursor" do
       source =
         Repo.insert!(%Source{source_type: :drive_folder, name: "folder", identifier: "root"})
 
       # already seeded from a prior run, so this sync pages real changes
       Repo.insert!(%SyncState{source_id: source.id, cursor: %{"start_page_token" => "tok-0"}})
 
-      # a pre-existing chunk for the doc that this sync reports as removed
+      # a pre-existing chunk for the doc that this sync reports as removed —
+      # DriveSync only stages a deletion entry now; it never touches `chunks`
+      # itself (Ingest.SourceOwner does, when it applies the entry).
       Repo.insert!(
         Chunk.upsert_changeset(%Chunk{}, %{
           source_id: source.id,
@@ -216,14 +265,65 @@ defmodule RetrievalNode.Ingest.SourcesTest do
 
       assert :ok = perform_job(DriveSync, %{"source_id" => source.id})
 
-      [raw] = Repo.all(PendingChunk)
-      assert raw.natural_key == "drive:d1"
+      raw = Repo.one!(from p in PendingChunk, where: p.natural_key == "drive:d1")
       assert raw.source_type == "drive_folder"
+      assert raw.status == "raw"
       assert raw.raw_content =~ "Design Doc"
-      assert_enqueued(worker: ChunkFiles)
 
-      # removed doc's chunk pruned
-      assert Repo.aggregate(Chunk, :count, :id) == 0
+      deletion = Repo.one!(from p in PendingChunk, where: p.natural_key == "drive:d2")
+      assert deletion.status == "deleted"
+      assert deletion.metadata == %{"doc_id" => "d2"}
+
+      # the old chunk is untouched here — staging a deletion entry isn't
+      # applying it
+      assert Repo.aggregate(Chunk, :count, :id) == 1
+
+      state = Repo.get_by!(SyncState, source_id: source.id)
+      assert state.cursor["start_page_token"] == "tok-9"
+    end
+
+    test "an exported Doc whose content is binary stages a deletion entry instead of a content row" do
+      source = Repo.insert!(%Source{source_type: :drive_folder, name: "f", identifier: "root"})
+      Repo.insert!(%SyncState{source_id: source.id, cursor: %{"start_page_token" => "tok-0"}})
+
+      # a pre-existing chunk from when this doc was exportable as text
+      Repo.insert!(
+        Chunk.upsert_changeset(%Chunk{}, %{
+          source_id: source.id,
+          source_type: :drive_folder,
+          chunk_key: "old-key",
+          content_hash: "h",
+          content: "old",
+          context_breadcrumb: "Weird Doc",
+          metadata: %{"doc_id" => "d1"}
+        })
+      )
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        if String.ends_with?(conn.request_path, "/export") do
+          Plug.Conn.send_resp(conn, 200, <<0, 255, 216, 0>>)
+        else
+          Req.Test.json(conn, %{
+            "newStartPageToken" => "tok-9",
+            "changes" => [
+              %{
+                "fileId" => "d1",
+                "file" => %{
+                  "id" => "d1",
+                  "name" => "Weird Doc",
+                  "mimeType" => "application/vnd.google-apps.document"
+                }
+              }
+            ]
+          })
+        end
+      end)
+
+      assert :ok = perform_job(DriveSync, %{"source_id" => source.id})
+
+      deletion = Repo.one!(from p in PendingChunk, where: p.natural_key == "drive:d1")
+      assert deletion.status == "deleted"
+      assert deletion.raw_content == nil
 
       state = Repo.get_by!(SyncState, source_id: source.id)
       assert state.cursor["start_page_token"] == "tok-9"
@@ -258,6 +358,53 @@ defmodule RetrievalNode.Ingest.SourcesTest do
       # cursor left un-advanced (still tok-0, not tok-next) so the next run re-pages
       state = Repo.get_by!(SyncState, source_id: source.id)
       assert state.cursor["start_page_token"] == "tok-0"
+      assert Repo.all(PendingChunk) == []
+    end
+
+    test "a partial page (one export ok, one fails) stages the success but still leaves the cursor put" do
+      source = Repo.insert!(%Source{source_type: :drive_folder, name: "f", identifier: "root"})
+      Repo.insert!(%SyncState{source_id: source.id, cursor: %{"start_page_token" => "tok-0"}})
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        cond do
+          String.ends_with?(conn.request_path, "/d1/export") ->
+            Plug.Conn.send_resp(conn, 200, "# ok doc")
+
+          String.ends_with?(conn.request_path, "/export") ->
+            Plug.Conn.send_resp(conn, 500, "boom")
+
+          true ->
+            Req.Test.json(conn, %{
+              "newStartPageToken" => "tok-next",
+              "changes" => [
+                %{
+                  "fileId" => "d1",
+                  "file" => %{
+                    "id" => "d1",
+                    "name" => "Ok Doc",
+                    "mimeType" => "application/vnd.google-apps.document"
+                  }
+                },
+                %{
+                  "fileId" => "d2",
+                  "file" => %{
+                    "id" => "d2",
+                    "name" => "Bad Doc",
+                    "mimeType" => "application/vnd.google-apps.document"
+                  }
+                }
+              ]
+            })
+        end
+      end)
+
+      assert {:error, :export_incomplete} = perform_job(DriveSync, %{"source_id" => source.id})
+
+      assert Repo.one!(from p in PendingChunk, where: p.natural_key == "drive:d1")
+      refute Repo.get_by(PendingChunk, natural_key: "drive:d2")
+
+      state = Repo.get_by!(SyncState, source_id: source.id)
+      assert state.cursor["start_page_token"] == "tok-0"
     end
 
     test "a 429 returns {:snooze, _} and writes nothing" do
@@ -271,7 +418,6 @@ defmodule RetrievalNode.Ingest.SourcesTest do
 
       assert {:snooze, 45} = perform_job(DriveSync, %{"source_id" => source.id})
       assert Repo.all(PendingChunk) == []
-      refute_enqueued(worker: ChunkFiles)
     end
 
     test "a 429 with a missing Retry-After falls back to the default (no crash)" do
@@ -282,20 +428,6 @@ defmodule RetrievalNode.Ingest.SourcesTest do
       end)
 
       assert {:snooze, 60} = perform_job(DriveSync, %{"source_id" => source.id})
-    end
-  end
-
-  describe "worker uniqueness" do
-    setup do
-      :ok
-    end
-
-    test "ChunkFiles dedups a second enqueue for the same pending_chunk_id" do
-      assert {:ok, _} = Oban.insert(ChunkFiles.new(%{"pending_chunk_id" => 123}))
-      assert {:ok, job} = Oban.insert(ChunkFiles.new(%{"pending_chunk_id" => 123}))
-      # the unique constraint collapses the duplicate onto the first job
-      assert job.conflict?
-      assert Repo.aggregate(Oban.Job, :count, :id) == 1
     end
   end
 end

@@ -23,6 +23,11 @@ defmodule RetrievalNode.Application do
       ] ++
         embedding_children() ++
         [
+          # Owns the per-source ingest boundary (Ingest.SourceOwner processes) —
+          # must be up before Oban so a *Sync job's post-commit
+          # Ingest.SourceOwner.notify/1 always finds Ingest.SourceSupervisor
+          # registered, never races it.
+          RetrievalNode.Ingest.Supervisor,
           {Oban, Application.fetch_env!(:retrieval_node, Oban)},
           # MCP server (streamable_http) — mounted on the Endpoint at /mcp. Anubis' own
           # `start` gate keys off the Phoenix serve-endpoints flag, which is off under

@@ -1,7 +1,7 @@
 defmodule RetrievalNode.Ingest.PendingChunksTest do
   use RetrievalNode.DataCase, async: true
 
-  alias RetrievalNode.Ingest.PendingChunks
+  alias RetrievalNode.Ingest.{PendingChunks, SourceOwner}
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.PendingChunk
 
@@ -142,57 +142,179 @@ defmodule RetrievalNode.Ingest.PendingChunksTest do
     assert Enum.map(ids, &natural_key_by_id[&1]) == expected
   end
 
-  test "write_chunks splits a raw row into N chunk rows sharing natural_key/content_hash" do
-    {:ok, raw} = PendingChunks.insert_raw(raw_attrs())
-
-    chunks = [
-      %{chunk_index: 0, chunk_content: "chunk zero"},
-      %{chunk_index: 1, chunk_content: "chunk one"}
-    ]
-
-    assert {:ok, [c0, c1]} =
-             PendingChunks.write_chunks(raw, chunks,
-               chunk_quality: "tree_sitter",
-               scrub_mode: "regex"
-             )
-
-    assert c0.natural_key == raw.natural_key
-    assert c0.content_hash == raw.content_hash
-    assert c0.chunk_quality == "tree_sitter"
-    assert c0.status == "chunked"
-    assert Enum.sort([c0.chunk_index, c1.chunk_index]) == [0, 1]
-  end
-
-  test "set_embeddings writes 384-dim vectors back and flips status to embedded" do
-    {:ok, raw} = PendingChunks.insert_raw(raw_attrs())
-    {:ok, [chunk]} = PendingChunks.write_chunks(raw, [%{chunk_index: 0, chunk_content: "x"}])
-
-    # Distinct per-dimension values so a transposed/garbled write would be caught.
-    vector = for i <- 1..384, do: i * 0.001
-    assert {:ok, :ok} = PendingChunks.set_embeddings([%{id: chunk.id, embedding: vector}])
-
-    reloaded = PendingChunks.fetch!(chunk.id)
-    assert reloaded.status == "embedded"
-
-    round_tripped = Pgvector.to_list(reloaded.embedding)
-    assert length(round_tripped) == 384
-    # vector(384) stores float32, so compare within tolerance.
-    assert Enum.zip(round_tripped, vector) |> Enum.all?(fn {a, b} -> abs(a - b) < 1.0e-4 end)
-  end
-
-  test "set_embeddings rolls back if an id doesn't exist (no silent drop)" do
-    vector = for _ <- 1..384, do: 0.0
-
-    assert {:error, {:no_such_pending_chunk, 999_999}} =
-             PendingChunks.set_embeddings([%{id: 999_999, embedding: vector}])
-  end
-
-  test "fetch_many! and delete_by_ids operate on a set of ids" do
+  test "delete_by_ids operates on a set of ids" do
     {:ok, a} = PendingChunks.insert_raw(raw_attrs())
     {:ok, b} = PendingChunks.insert_raw(raw_attrs())
 
-    assert length(PendingChunks.fetch_many!([a.id, b.id])) == 2
     assert {2, nil} = PendingChunks.delete_by_ids([a.id, b.id])
-    assert PendingChunks.fetch_many!([a.id, b.id]) == []
+    refute Repo.get(PendingChunk, a.id)
+    refute Repo.get(PendingChunk, b.id)
+  end
+
+  # --- Ingest.SourceOwner's mailbox reads ------------------------------------
+
+  describe "drainable/2 and drainable?/1" do
+    test "returns raw and deleted rows for the source, oldest first, excludes other sources" do
+      source_id = Ecto.UUID.generate()
+      other_id = Ecto.UUID.generate()
+
+      {:ok, [id1]} = PendingChunks.insert_raw_all([raw_attrs(%{source_id: source_id})])
+      {:ok, [id2]} = PendingChunks.insert_raw_all([raw_attrs(%{source_id: source_id})])
+
+      {:ok, [id3]} =
+        PendingChunks.insert_raw_all([
+          raw_attrs(%{
+            source_id: source_id,
+            status: "deleted",
+            content_hash: nil,
+            raw_content: nil
+          })
+        ])
+
+      {:ok, _} = PendingChunks.insert_raw_all([raw_attrs(%{source_id: other_id})])
+
+      rows = PendingChunks.drainable(source_id)
+      assert Enum.map(rows, & &1.id) == [id1, id2, id3]
+      assert Enum.all?(rows, &(&1.source_id == source_id))
+
+      assert PendingChunks.drainable?(source_id)
+      refute PendingChunks.drainable?(Ecto.UUID.generate())
+    end
+
+    test "limit: N bounds the result to the oldest N rows" do
+      source_id = Ecto.UUID.generate()
+
+      ids =
+        for i <- 1..5 do
+          {:ok, [id]} =
+            PendingChunks.insert_raw_all([
+              raw_attrs(%{source_id: source_id, natural_key: "repo:x:f#{i}.ex"})
+            ])
+
+          id
+        end
+
+      rows = PendingChunks.drainable(source_id, limit: 2)
+      assert Enum.map(rows, & &1.id) == Enum.take(ids, 2)
+    end
+
+    test "excludes a row past max_file_attempts, and one still in its retry_after backoff window" do
+      source_id = Ecto.UUID.generate()
+      {:ok, [maxed_id]} = PendingChunks.insert_raw_all([raw_attrs(%{source_id: source_id})])
+      {:ok, [backed_off_id]} = PendingChunks.insert_raw_all([raw_attrs(%{source_id: source_id})])
+      {:ok, [ready_id]} = PendingChunks.insert_raw_all([raw_attrs(%{source_id: source_id})])
+
+      Repo.update_all(PendingChunks.by_ids([maxed_id]),
+        set: [attempts: SourceOwner.max_file_attempts()]
+      )
+
+      Repo.update_all(PendingChunks.by_ids([backed_off_id]),
+        set: [retry_after: DateTime.add(DateTime.utc_now(), 3600, :second)]
+      )
+
+      assert Enum.map(PendingChunks.drainable(source_id), & &1.id) == [ready_id]
+    end
+  end
+
+  describe "pending_source_ids/0" do
+    test "returns distinct source_ids with at least one drainable row" do
+      source_a = Ecto.UUID.generate()
+      source_b = Ecto.UUID.generate()
+      maxed_out_source = Ecto.UUID.generate()
+
+      {:ok, _} = PendingChunks.insert_raw_all([raw_attrs(%{source_id: source_a})])
+      {:ok, _} = PendingChunks.insert_raw_all([raw_attrs(%{source_id: source_a})])
+      {:ok, _} = PendingChunks.insert_raw_all([raw_attrs(%{source_id: source_b})])
+
+      {:ok, [maxed_id]} =
+        PendingChunks.insert_raw_all([raw_attrs(%{source_id: maxed_out_source})])
+
+      Repo.update_all(PendingChunks.by_ids([maxed_id]),
+        set: [attempts: SourceOwner.max_file_attempts()]
+      )
+
+      ids = PendingChunks.pending_source_ids()
+      assert source_a in ids
+      assert source_b in ids
+      refute maxed_out_source in ids
+      assert length(ids) == length(Enum.uniq(ids))
+    end
+  end
+
+  describe "mark_attempt/1 and mark_failure/3" do
+    test "mark_attempt increments attempts and returns the updated row" do
+      {:ok, row} = PendingChunks.insert_raw(raw_attrs())
+      assert row.attempts == 0
+
+      updated = PendingChunks.mark_attempt(row)
+      assert updated.attempts == 1
+
+      updated2 = PendingChunks.mark_attempt(updated)
+      assert updated2.attempts == 2
+    end
+
+    test "mark_failure sets last_error and retry_after without touching attempts" do
+      {:ok, row} = PendingChunks.insert_raw(raw_attrs())
+      row = PendingChunks.mark_attempt(row)
+
+      retry_after = DateTime.add(DateTime.utc_now(), 120, :second)
+      assert :ok = PendingChunks.mark_failure(row, {:boom, :reason}, retry_after)
+
+      reloaded = PendingChunks.fetch!(row.id)
+      assert reloaded.last_error =~ "boom"
+      assert reloaded.attempts == 1
+      assert DateTime.compare(reloaded.retry_after, DateTime.utc_now()) == :gt
+    end
+
+    test "mark_failure truncates a very long reason to a diagnostic-length excerpt" do
+      {:ok, row} = PendingChunks.insert_raw(raw_attrs())
+      long_reason = String.duplicate("x", 10_000)
+
+      assert :ok = PendingChunks.mark_failure(row, long_reason, DateTime.utc_now())
+
+      reloaded = PendingChunks.fetch!(row.id)
+      assert byte_size(reloaded.last_error) <= 2_000
+    end
+  end
+
+  describe "failed_count/0" do
+    test "counts only rows at or past max_file_attempts" do
+      {:ok, [under_id]} = PendingChunks.insert_raw_all([raw_attrs()])
+      {:ok, [at_id]} = PendingChunks.insert_raw_all([raw_attrs()])
+
+      Repo.update_all(PendingChunks.by_ids([under_id]),
+        set: [attempts: SourceOwner.max_file_attempts() - 1]
+      )
+
+      Repo.update_all(PendingChunks.by_ids([at_id]),
+        set: [attempts: SourceOwner.max_file_attempts()]
+      )
+
+      assert PendingChunks.failed_count() == 1
+    end
+  end
+
+  describe "mark_failure/3 terminal redaction" do
+    test "a non-terminal failure keeps raw_content" do
+      {:ok, row} = PendingChunks.insert_raw(raw_attrs(%{raw_content: "secret AKIA payload"}))
+      row = %{row | attempts: 1}
+
+      :ok = PendingChunks.mark_failure(row, :boom, DateTime.add(DateTime.utc_now(), 60))
+
+      reloaded = PendingChunks.fetch!(row.id)
+      assert reloaded.raw_content == "secret AKIA payload"
+      assert reloaded.last_error =~ "boom"
+    end
+
+    test "the terminal failure (attempts at the ceiling) nulls raw_content but keeps the marker" do
+      {:ok, row} = PendingChunks.insert_raw(raw_attrs(%{raw_content: "secret AKIA payload"}))
+      row = %{row | attempts: SourceOwner.max_file_attempts()}
+
+      :ok = PendingChunks.mark_failure(row, :boom, DateTime.add(DateTime.utc_now(), 60))
+
+      reloaded = PendingChunks.fetch!(row.id)
+      assert is_nil(reloaded.raw_content)
+      assert reloaded.last_error =~ "boom"
+    end
   end
 end
