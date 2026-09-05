@@ -300,13 +300,26 @@ defmodule RetrievalNode.Ingest.PendingChunks do
   """
   @spec mark_failure(PendingChunk.t(), term(), DateTime.t()) :: :ok
   def mark_failure(%PendingChunk{} = row, reason, retry_after) do
-    Repo.update_all(by_ids([row.id]),
-      set: [
-        last_error: reason |> inspect() |> truncate_utf8(@max_error_bytes),
-        retry_after: retry_after,
-        updated_at: DateTime.utc_now()
-      ]
-    )
+    set = [
+      last_error: reason |> inspect() |> truncate_utf8(@max_error_bytes),
+      retry_after: retry_after,
+      updated_at: DateTime.utc_now()
+    ]
+
+    # Terminal give-up (this attempt reached the ceiling): drop the raw payload.
+    # A permanently-failed row is excluded from `drainable/2` forever, so its
+    # `raw_content` — which can hold UN-REDACTED secrets, since scrubbing only
+    # happens inside a successful `FileIngest.apply/2` — must not linger in
+    # staging indefinitely. The failure marker (attempts/last_error) stays for
+    # diagnostics; `content_hash` (not the secret) satisfies its CHECK.
+    set =
+      if row.attempts >= SourceOwner.max_file_attempts() do
+        Keyword.put(set, :raw_content, nil)
+      else
+        set
+      end
+
+    Repo.update_all(by_ids([row.id]), set: set)
 
     :ok
   end

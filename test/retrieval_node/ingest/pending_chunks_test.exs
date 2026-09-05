@@ -293,4 +293,28 @@ defmodule RetrievalNode.Ingest.PendingChunksTest do
       assert PendingChunks.failed_count() == 1
     end
   end
+
+  describe "mark_failure/3 terminal redaction" do
+    test "a non-terminal failure keeps raw_content" do
+      {:ok, row} = PendingChunks.insert_raw(raw_attrs(%{raw_content: "secret AKIA payload"}))
+      row = %{row | attempts: 1}
+
+      :ok = PendingChunks.mark_failure(row, :boom, DateTime.add(DateTime.utc_now(), 60))
+
+      reloaded = PendingChunks.fetch!(row.id)
+      assert reloaded.raw_content == "secret AKIA payload"
+      assert reloaded.last_error =~ "boom"
+    end
+
+    test "the terminal failure (attempts at the ceiling) nulls raw_content but keeps the marker" do
+      {:ok, row} = PendingChunks.insert_raw(raw_attrs(%{raw_content: "secret AKIA payload"}))
+      row = %{row | attempts: SourceOwner.max_file_attempts()}
+
+      :ok = PendingChunks.mark_failure(row, :boom, DateTime.add(DateTime.utc_now(), 60))
+
+      reloaded = PendingChunks.fetch!(row.id)
+      assert is_nil(reloaded.raw_content)
+      assert reloaded.last_error =~ "boom"
+    end
+  end
 end
