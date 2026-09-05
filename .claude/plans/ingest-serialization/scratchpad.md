@@ -207,3 +207,15 @@ Resume with: /phx:work --continue
   demand/concurrency limit (e.g. a bounded/staggered resume, or a cap on
   concurrently-draining owners) while keeping per-source serialization.
 - PR #20 thread PRRT_kwDOTXolXc6fcSm0 left OPEN as the tracked item.
+
+## Slice-2 follow-up addendum (PR #20 Copilot round 8 suppressed, 2026-09-05)
+
+- The boot resume Task is `restart: :temporary`, so `Ingest.Supervisor`'s
+  `:rest_for_one` recovery does NOT re-run `SourceOwner.resume_all/0` if the
+  Registry or SourceSupervisor later crashes and takes active owners down.
+  Durable rows then wait for their source's next sync tick (<=15m) instead of
+  being re-kicked immediately. Not data loss — an optimization gap.
+- Bundle with the resume-concurrency-bound follow-up (thread PRRT_...cSm0):
+  a long-lived, restartable resume coordinator would fix both — re-kick on
+  recovery AND a place to bound concurrent owner starts. Do together in the
+  resume-hardening follow-up.
