@@ -118,6 +118,48 @@ defmodule RetrievalNode.Ingest.SourceOwnerTest do
     assert stats.skipped == 0
   end
 
+  test "collapse is source-wide, not per-page: an older version spanning a page boundary is never applied",
+       %{source: source} do
+    # Fill a first page (@rows_per_pass = 50) with distinct files, then stage an
+    # OLD version of a target file inside that page and a NEWER version well past
+    # it. A per-page collapse would apply the old content first; the source-wide
+    # collapse must drop it so only the newest is ever indexed.
+    seed_raw(source, "repo:x:target.py", "target.py", "OLD CONTENT
+", content_hash: "old")
+
+    for n <- 1..60 do
+      seed_raw(source, "repo:x:f#{n}.py", "f#{n}.py", "file #{n}
+")
+    end
+
+    seed_raw(source, "repo:x:target.py", "target.py", "NEW CONTENT
+", content_hash: "new")
+
+    assert {:ok, _stats} = SourceOwner.drain(source.id)
+
+    chunks = chunks_for(source, "target.py")
+    assert length(chunks) == 1
+    assert hd(chunks).content =~ "NEW CONTENT"
+    refute hd(chunks).content =~ "OLD CONTENT"
+    assert Repo.aggregate(PendingChunk, :count, :id) == 0
+  end
+
+  test "a merged force flag is persisted on the surviving row before superseded rows are deleted",
+       %{source: source} do
+    # A forced row superseded by a later plain row: collapse_source must write
+    # force=true onto the survivor in the DB (not just an in-memory struct), so a
+    # crash/retry can't lose the re-derive. Assert the persisted row directly.
+    seed_raw(source, "repo:x:d.py", "d.py", "x
+", content_hash: "h", force: true)
+    seed_raw(source, "repo:x:d.py", "d.py", "x
+", content_hash: "h")
+
+    assert 1 = PendingChunks.collapse_source(source.id)
+
+    [survivor] = Repo.all(PendingChunk)
+    assert survivor.force == true
+  end
+
   # --- 2. deletion / re-add ordering ------------------------------------
 
   test "deletion after content removes chunks; content after deletion re-indexes", %{

@@ -99,13 +99,13 @@ defmodule RetrievalNode.Ingest.SourceOwner do
   @spec notify(source_id()) :: :ok
   def notify(source_id) do
     cond do
-      not notify_enabled?() ->
+      not owner_starts_enabled?() ->
         :ok
 
       is_nil(Process.whereis(RetrievalNode.Ingest.SourceSupervisor)) ->
         Logger.warning(
           "Ingest.SourceOwner.notify/1: SourceSupervisor not running in this VM " <>
-            "(admin task, or dev node mid-restart) — rows are durable, source_id=#{source_id}"
+            "(dev node mid-restart) — rows are durable, source_id=#{source_id}"
         )
 
         :ok
@@ -115,8 +115,21 @@ defmodule RetrievalNode.Ingest.SourceOwner do
     end
   end
 
-  defp notify_enabled?,
-    do: Application.get_env(:retrieval_node, :source_owner_notify, true)
+  # Whether THIS VM may start owners in response to a notify. In production
+  # (`:source_owner_notify` unset) this is gated on the VM actually running
+  # ingest queues — `Application` starts `Ingest.Supervisor` (and thus
+  # `SourceSupervisor`) on every VM, so the supervisor being up is NOT proof
+  # this VM runs ingest; a `queues: []` admin/`iex` VM must never start an
+  # owner and become a second writer. Tests set `:source_owner_notify`
+  # explicitly (false to suppress owner spawns in discovery-worker tests, true
+  # to exercise the real notify path) — an explicit value overrides the
+  # queue check, since the test Oban runs in `testing: :manual`.
+  defp owner_starts_enabled? do
+    case Application.get_env(:retrieval_node, :source_owner_notify) do
+      nil -> RetrievalNode.Ingest.Supervisor.running_ingest_queues?()
+      override -> override
+    end
+  end
 
   # Fire-and-forget by design: `start_child` drains a fresh owner via
   # `handle_continue`; an already-running owner is woken with a non-blocking
@@ -280,56 +293,38 @@ defmodule RetrievalNode.Ingest.SourceOwner do
   # --- one pass ------------------------------------------------------------
 
   defp pass(source_id) do
+    # Reduce the WHOLE source to one row per file (newest per identity, force
+    # carried forward) durably in SQL BEFORE taking a page, so "newest per file"
+    # holds across the whole mailbox, not just this 50-row page, and a merged
+    # force survives a crash (see PendingChunks.collapse_source/1).
+    superseded = PendingChunks.collapse_source(source_id)
+
     rows = PendingChunks.drainable(source_id, limit: @rows_per_pass)
     full_batch? = length(rows) == @rows_per_pass
 
-    {kept, superseded} = collapse(rows)
-
     stats =
-      Enum.reduce(kept, %{empty_stats() | superseded: superseded}, fn row, stats ->
+      Enum.reduce(rows, %{empty_stats() | superseded: superseded}, fn row, stats ->
         apply_row(source_id, row, stats)
       end)
 
     # A pass that touched no rows (a `notify/1` on a source with nothing new —
     # e.g. a routine sync tick that staged nothing) is logged at debug, not
     # info, so idle notifies don't flood production logs.
-    log_pass(source_id, stats, kept)
+    log_pass(source_id, stats, rows)
 
     {stats, full_batch?}
   end
 
-  defp log_pass(source_id, stats, kept) do
+  defp log_pass(source_id, stats, drained) do
     message =
       "Ingest.SourceOwner pass source_id=#{source_id} applied=#{stats.applied} " <>
         "skipped=#{stats.skipped} failed=#{stats.failed} superseded=#{stats.superseded} " <>
         "embedded=#{stats.embedded} reused=#{stats.reused}"
 
-    if kept == [] and stats.superseded == 0, do: Logger.debug(message), else: Logger.info(message)
+    if drained == [] and stats.superseded == 0,
+      do: Logger.debug(message),
+      else: Logger.info(message)
   end
-
-  # Group the pass's rows by file identity, keep only the newest (highest id)
-  # per group, and delete the superseded older rows in one shot — they're
-  # never applied at all. A superseded row's `force: true` carries forward
-  # onto the kept row: a backfill request racing a later plain sync must not
-  # be silently dropped just because the plain sync's row arrived after it.
-  defp collapse(rows) do
-    {kept, superseded_ids} =
-      rows
-      |> Enum.group_by(&collapse_key/1)
-      |> Enum.reduce({[], []}, fn {_key, group}, {kept_acc, superseded_acc} ->
-        [newest | rest] = Enum.sort_by(group, & &1.id, :desc)
-        force? = newest.force or Enum.any?(rest, & &1.force)
-
-        {[%{newest | force: force?} | kept_acc], Enum.map(rest, & &1.id) ++ superseded_acc}
-      end)
-
-    if superseded_ids != [], do: PendingChunks.delete_by_ids(superseded_ids)
-
-    {Enum.sort_by(kept, & &1.id), length(superseded_ids)}
-  end
-
-  defp collapse_key(row),
-    do: RetrievalNode.Ingest.file_identity(row.source_type, row.metadata) || row.natural_key
 
   defp apply_row(source_id, row, stats) do
     force? = row.force

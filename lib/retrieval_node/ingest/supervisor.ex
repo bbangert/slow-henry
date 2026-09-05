@@ -71,7 +71,15 @@ defmodule RetrievalNode.Ingest.Supervisor do
       running_ingest_queues?()
   end
 
-  defp running_ingest_queues? do
+  @doc """
+  True only on a VM that actually runs ingest queues — a non-empty Oban
+  `:queues` list and NOT `testing: :manual`. `SourceOwner.notify/1` gates on
+  this so an admin/`queues: []` VM never starts an owner and becomes a second
+  writer, and this module ANDs it with `:ingest_resume_on_boot` for the
+  boot-resume kick.
+  """
+  @spec running_ingest_queues?() :: boolean()
+  def running_ingest_queues? do
     oban_config = Application.get_env(:retrieval_node, Oban) || []
     queues = Keyword.get(oban_config, :queues, [])
     queues != [] and not Keyword.has_key?(oban_config, :testing)

@@ -37,6 +37,15 @@ config :retrieval_node,
 # `sync: 3` is I/O-bound (git/HTTP), so 3 concurrent discovery jobs is plenty.
 # Pruner keeps 14d of job history; Lifeline rescues jobs orphaned >20m. Repo
 # pool_size is raised (dev/runtime) to num_queues + sum(limits) + buffer.
+#
+# CUTOVER PRECONDITION: the retired `chunk`/`embed`/`upsert` queues are gone,
+# and `Ingest.SourceOwner` only ever drains `raw`/`deleted` staging rows. Any
+# `pending_chunks` rows left in a legacy intermediate state (a partially
+# chunked/embedded row from the old pipeline) would strand once these queues
+# are removed. Deploy this ONLY after the old pipeline has drained
+# `pending_chunks` to just `raw`/`deleted` rows and emptied the legacy queues
+# — verified empty on the dev corpus before this shipped. A fresh install has
+# nothing to drain.
 config :retrieval_node, Oban,
   repo: RetrievalNode.Repo,
   queues: [sync: 3],
