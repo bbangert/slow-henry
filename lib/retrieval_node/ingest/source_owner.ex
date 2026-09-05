@@ -205,25 +205,6 @@ defmodule RetrievalNode.Ingest.SourceOwner do
   @spec whereis(source_id()) :: pid() | nil
   def whereis(source_id), do: GenServer.whereis(via(source_id))
 
-  @doc """
-  Notifies every source with at least one drainable row
-  (`PendingChunks.pending_source_ids/0`) — called by `Ingest.Supervisor`'s
-  boot Task (gated so it only runs on a VM that actually processes ingest;
-  see that module's moduledoc) so rows staged before a restart aren't
-  silently stuck until their source's next discovery run.
-  """
-  @spec resume_all() :: :ok
-  def resume_all do
-    source_ids = PendingChunks.pending_source_ids()
-
-    Logger.info(
-      "Ingest.SourceOwner.resume_all/0: notifying #{length(source_ids)} source(s) with pending work"
-    )
-
-    Enum.each(source_ids, &notify/1)
-    :ok
-  end
-
   defp via(source_id), do: {:via, Registry, {RetrievalNode.Ingest.SourceRegistry, source_id}}
 
   # --- callbacks ---------------------------------------------------------
