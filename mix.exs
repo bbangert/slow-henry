@@ -71,21 +71,21 @@ defmodule RetrievalNode.MixProject do
       {:phoenix_ecto, "~> 4.5"},
       {:ecto_sql, "~> 3.13"},
       {:postgrex, ">= 0.0.0"},
-      {:phoenix_live_dashboard, "~> 0.8.3"},
+      {:phoenix_live_dashboard, "~> 0.9.1"},
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},
-      {:gettext, "~> 0.26"},
+      {:gettext, "~> 1.0"},
       {:jason, "~> 1.2"},
-      {:dns_cluster, "~> 0.2.0"},
+      {:dns_cluster, "~> 0.3.1"},
       {:bandit, "~> 1.5"},
 
       # Retrieval Node stack
-      {:anubis_mcp, "~> 1.6"},
+      {:anubis_mcp, "~> 2.0"},
       {:oban, "~> 2.18"},
       {:pgvector, "~> 0.3"},
-      {:bumblebee, "~> 0.7"},
-      {:nx, "~> 0.9"},
-      {:exla, "~> 0.9"},
+      {:bumblebee, "~> 0.8"},
+      {:nx, "~> 1.0"},
+      {:exla, "~> 1.0"},
       {:tree_sitter_language_pack, "~> 1.12"},
       {:req, "~> 0.5"},
       # Explicit dep: we start Finch ourselves in the supervision tree (shared
@@ -94,10 +94,11 @@ defmodule RetrievalNode.MixProject do
       {:finch, "~> 0.23"},
       {:sourceror, "~> 1.0"},
 
-      # Tooling used by per-phase verification (mix credo/sobelow) and CI (dialyzer)
+      # Tooling used by per-phase verification (mix credo/sobelow) and CI (dialyzer, argus)
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false},
-      {:dialyxir, "~> 1.4", only: [:dev], runtime: false}
+      {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
+      {:argus_beam, "~> 0.20", only: [:dev, :test], runtime: false}
     ]
   end
 

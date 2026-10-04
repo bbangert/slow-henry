@@ -19,7 +19,10 @@ defmodule RetrievalNode.Application do
         {Finch, name: RetrievalNode.Finch},
         # Runs tree-sitter parses (see Chunking.TreeSitterImpl) isolated from
         # their callers via async_nolink + yield/shutdown.
-        {Task.Supervisor, name: RetrievalNode.ChunkTaskSupervisor}
+        {Task.Supervisor, name: RetrievalNode.ChunkTaskSupervisor},
+        # Runs Ingest.GitMirror's git subprocess tasks, likewise unlinked from
+        # their callers (async_nolink + yield/shutdown).
+        {Task.Supervisor, name: RetrievalNode.GitTaskSupervisor}
       ] ++
         embedding_children() ++
         [
