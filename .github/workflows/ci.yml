@@ -162,8 +162,7 @@ jobs:
 
   argus:
     name: Argus
-    # Souffle's PPA package needs libffi7, which Ubuntu 24.04 no longer ships.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     env:
       MIX_ENV: dev
     steps:
@@ -171,6 +170,11 @@ jobs:
       - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
       - name: Install Souffle
         run: |
+          # Souffle's PPA package links against libffi7, which Ubuntu 24.04
+          # dropped; install the Ubuntu 20.04 build (checksum-pinned) first.
+          curl -fsSLo /tmp/libffi7.deb http://archive.ubuntu.com/ubuntu/pool/main/libf/libffi/libffi7_3.3-4_amd64.deb
+          echo "4584aa8fef1bf5086168ce2f7078cd2ebd78fdc4cc0d86d958d795d4e0b0f50d  /tmp/libffi7.deb" | sha256sum -c -
+          sudo apt-get install -y /tmp/libffi7.deb
           sudo wget https://souffle-lang.github.io/ppa/souffle-key.public -O /usr/share/keyrings/souffle-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/souffle-archive-keyring.gpg] https://souffle-lang.github.io/ppa/ubuntu/ stable main" | sudo tee /etc/apt/sources.list.d/souffle.list
           sudo apt-get update
@@ -179,14 +183,14 @@ jobs:
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
-      # Separate cache key from the ubuntu-latest jobs: NIFs built here link
-      # against 22.04's glibc and must not be shared with the 24.04 runners.
+      # Separate cache key from the ubuntu-latest jobs: this job pins its
+      # image, so NIFs built here must not be shared if ubuntu-latest moves.
       - uses: actions/cache@v6
         with:
           path: |
             deps
             _build/dev
-          key: ${{ runner.os }}-ubuntu-22.04-dev-${{ hashFiles('mix.lock') }}
-          restore-keys: ${{ runner.os }}-ubuntu-22.04-dev-
+          key: ${{ runner.os }}-ubuntu-24.04-argus-dev-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-ubuntu-24.04-argus-dev-
       - run: mix deps.get
       - run: mix argus --fail-above 0
