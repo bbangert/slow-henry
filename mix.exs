@@ -96,7 +96,7 @@ defmodule RetrievalNode.MixProject do
 
       # Tooling used by per-phase verification (mix credo/sobelow) and CI (dialyzer, argus)
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false},
+      {:sobelow, "~> 0.14", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
       {:argus_beam, "~> 0.20", only: [:dev, :test], runtime: false}
     ]

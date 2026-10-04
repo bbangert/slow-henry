@@ -13,26 +13,8 @@ env:
   APT_PACKAGES: build-essential automake autoconf pkg-config libssl-dev
 
 jobs:
-  format:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: ${{ env.ELIXIR_VERSION }}
-          otp-version: ${{ env.OTP_VERSION }}
-      - uses: actions/cache@v6
-        with:
-          path: deps
-          key: ${{ runner.os }}-deps-${{ hashFiles('mix.lock') }}
-          restore-keys: ${{ runner.os }}-deps-
-      - run: mix deps.get
-      - run: mix format --check-formatted
-
   compile:
-    name: Compile (warnings as errors)
+    name: Compile · Format
     runs-on: ubuntu-latest
     env:
       MIX_ENV: dev
@@ -52,6 +34,7 @@ jobs:
           restore-keys: ${{ runner.os }}-dev-
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
+      - run: mix format --check-formatted
 
   credo:
     name: Credo
@@ -74,6 +57,35 @@ jobs:
           restore-keys: ${{ runner.os }}-dev-
       - run: mix deps.get
       - run: mix credo --strict
+
+  sobelow:
+    name: Sobelow
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: dev
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build/dev
+          key: ${{ runner.os }}-dev-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-dev-
+      - run: mix deps.get
+      # Config.HTTPS ignored deliberately (mirrors .sobelow-conf, which keeps
+      # local `mix sobelow` runs in step): v1 serves plain HTTP on the LAN with
+      # no auth and no TLS terminator in the deployment (url scheme "http" in
+      # config/runtime.exs). TLS lands with a Cloudflare/Tailscale tunnel as a
+      # fast-follow alongside auth; drop this ignore when that ships. Inline
+      # `# sobelow_skip` comments (honoured by --skip) cover reviewed
+      # low-confidence Traversal/CI.System hits in lib/retrieval_node/ingest.
+      - run: mix sobelow --skip --exit --threshold medium --ignore Config.HTTPS
 
   test:
     name: Test
