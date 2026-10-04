@@ -85,7 +85,7 @@ jobs:
       # fast-follow alongside auth; drop this ignore when that ships. Inline
       # `# sobelow_skip` comments (honoured by --skip) cover reviewed
       # low-confidence Traversal/CI.System hits in lib/retrieval_node/ingest.
-      - run: mix sobelow --skip --exit --threshold medium --ignore Config.HTTPS
+      - run: mix sobelow --private --skip --exit --threshold medium --ignore Config.HTTPS
 
   test:
     name: Test
