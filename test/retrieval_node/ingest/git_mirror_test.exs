@@ -323,6 +323,17 @@ defmodule RetrievalNode.Ingest.GitMirrorTest do
     end
   end
 
+  describe "git tasks are not linked to the caller" do
+    test "a caller trapping exits gets no stray :EXIT from a finished git task" do
+      Process.flag(:trap_exit, true)
+
+      assert {:ok, _} = GitMirror.show("acme/app", "app.py")
+      assert {:ok, _, _} = GitMirror.grep("acme/app", "hello")
+
+      refute_receive {:EXIT, _pid, _reason}, 200
+    end
+  end
+
   describe "timeouts are per-command" do
     test "the short default bounds show/grep but network ops use the longer one", %{url: url} do
       # 0ms = poll once; a freshly-spawned git can't have finished, so any call on

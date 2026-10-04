@@ -40,6 +40,12 @@ defmodule RetrievalNode.Ingest.GitMirror do
   @allowed_url_schemes ~w(https:// http:// ssh:// git:// file://)
   @max_file_bytes 5_000_000
 
+  # Each git invocation runs in a task under this supervisor (started in
+  # RetrievalNode.Application) via async_nolink, so a crashed task reaches
+  # Task.yield as {:exit, reason} instead of killing the caller over a link,
+  # and a caller that traps exits never gets a stray {:EXIT, pid, :normal}.
+  @task_supervisor RetrievalNode.GitTaskSupervisor
+
   @doc "Root directory holding the `<slug>.git` bare mirrors."
   @spec mirror_root() :: String.t()
   def mirror_root do
@@ -411,7 +417,9 @@ defmodule RetrievalNode.Ingest.GitMirror do
   defp run_git(git, args, ok_codes, timeout) do
     parent = self()
     ref = make_ref()
-    task = Task.async(fn -> exec_git(git, args, parent, ref) end)
+
+    task =
+      Task.Supervisor.async_nolink(@task_supervisor, fn -> exec_git(git, args, parent, ref) end)
 
     case Task.yield(task, timeout) do
       {:ok, {out, code}} ->
@@ -444,14 +452,16 @@ defmodule RetrievalNode.Ingest.GitMirror do
     end
   end
 
-  # `grep`'s streaming counterpart to `run_git/4`. Same Task.async/yield/shutdown
+  # `grep`'s streaming counterpart to `run_git/4`. Same async_nolink/yield/shutdown
   # + os_pid SIGKILL wrapper on timeout, but the task body reads the Port itself
   # (via stream_grep/4 / grep_receive/5) instead of buffering to completion, so
   # it can also stop early — and SIGKILL — on a byte/match budget.
   defp run_grep(git, args) do
     parent = self()
     ref = make_ref()
-    task = Task.async(fn -> stream_grep(git, args, parent, ref) end)
+
+    task =
+      Task.Supervisor.async_nolink(@task_supervisor, fn -> stream_grep(git, args, parent, ref) end)
 
     case Task.yield(task, default_timeout()) do
       {:ok, result} ->
