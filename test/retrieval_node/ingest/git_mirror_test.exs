@@ -332,6 +332,76 @@ defmodule RetrievalNode.Ingest.GitMirrorTest do
 
       refute_receive {:EXIT, _pid, _reason}, 200
     end
+
+    test "returns an error tuple, not a crash, while the task supervisor is down" do
+      sup = RetrievalNode.GitTaskSupervisor
+      :ok = Supervisor.terminate_child(RetrievalNode.Supervisor, sup)
+      on_exit(fn -> {:ok, _} = Supervisor.restart_child(RetrievalNode.Supervisor, sup) end)
+
+      assert {:error, :git_supervisor_down} = GitMirror.show("acme/app", "app.py")
+      assert {:error, :git_supervisor_down} = GitMirror.grep("acme/app", "hello")
+    end
+
+    @tag :tmp_dir
+    test "a caller killed mid-call does not leak the git process", %{tmp_dir: tmp} do
+      # A fake `git` that records its OS pid and then hangs, found first on PATH.
+      pidfile = Path.join(tmp, "git.pid")
+      fake = Path.join(tmp, "git")
+      File.write!(fake, "#!/bin/sh\necho $$ > '#{pidfile}'\nexec sleep 30\n")
+      File.chmod!(fake, 0o755)
+
+      path = System.get_env("PATH")
+      System.put_env("PATH", tmp <> ":" <> path)
+      on_exit(fn -> System.put_env("PATH", path) end)
+
+      # Far longer than the test: only caller-death handling can stop git here.
+      Application.put_env(:retrieval_node, :git_timeout_ms, 60_000)
+      on_exit(fn -> Application.delete_env(:retrieval_node, :git_timeout_ms) end)
+
+      for call <- [
+            fn -> GitMirror.show("acme/app", "app.py") end,
+            fn -> GitMirror.grep("acme/app", "hello") end
+          ] do
+        File.rm(pidfile)
+        caller = spawn(call)
+        os_pid = eventually(fn -> read_pid(pidfile) end)
+        assert os_alive?(os_pid)
+
+        Process.exit(caller, :kill)
+
+        assert eventually(fn -> not os_alive?(os_pid) end),
+               "git OS process #{os_pid} outlived its killed caller"
+      end
+    end
+  end
+
+  defp read_pid(pidfile) do
+    with {:ok, contents} <- File.read(pidfile),
+         {pid, "\n"} <- Integer.parse(contents) do
+      pid
+    else
+      _ -> nil
+    end
+  end
+
+  defp os_alive?(os_pid) do
+    {_, code} = System.cmd("kill", ["-0", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    code == 0
+  end
+
+  # Polls `fun` for up to ~3s, returning its first truthy result (or false).
+  defp eventually(fun, attempts \\ 60) do
+    case fun.() do
+      result when result not in [nil, false] ->
+        result
+
+      _ when attempts > 0 ->
+        Process.sleep(50)
+        eventually(fun, attempts - 1)
+
+      _ ->
+        false
+    end
   end
 
   describe "timeouts are per-command" do

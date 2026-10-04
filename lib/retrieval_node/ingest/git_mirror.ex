@@ -30,6 +30,7 @@ defmodule RetrievalNode.Ingest.GitMirror do
           | :invalid_url
           | :file_too_large
           | :git_timeout
+          | :git_supervisor_down
           | :empty_repo
           | {:git, integer(), String.t()}
 
@@ -369,8 +370,8 @@ defmodule RetrievalNode.Ingest.GitMirror do
     {port, os_pid}
   end
 
-  # exec_git/4 and stream_grep/4 send `{:git_os_pid, ref, os_pid}` to `parent`
-  # right after opening their port — before doing any further work — so it's
+  # git_task/6 sends `{:git_os_pid, ref, os_pid}` to the caller right after
+  # opening its port — before doing any further work — so it's
   # already in the mailbox by the time Task.yield/2 returns, whichever branch it
   # returns on. `ref` (made fresh per call) is what keeps this from ever matching
   # a message left over from some other concurrent git op the same process
@@ -415,73 +416,120 @@ defmodule RetrievalNode.Ingest.GitMirror do
   # reviews/p6a-security.md and reviews/p7-security.md.
   # sobelow_skip ["CI.System"]
   defp run_git(git, args, ok_codes, timeout) do
-    parent = self()
-    ref = make_ref()
-
-    task =
-      Task.Supervisor.async_nolink(@task_supervisor, fn -> exec_git(git, args, parent, ref) end)
-
-    case Task.yield(task, timeout) do
+    case run_git_task(git, args, timeout, fn port, os_pid, guard ->
+           collect_git(port, os_pid, guard, [])
+         end) do
       {:ok, {out, code}} ->
-        flush_os_pid_message(ref)
         if code in ok_codes, do: {:ok, out}, else: {:error, {:git, code, String.trim(out)}}
 
-      # nil = still running (timed out); {:exit, _} = the task crashed. Either way
-      # kill the task (closing the port) and explicitly SIGKILL the OS process —
-      # closing the port alone doesn't terminate git promptly enough (see grep/3
-      # doc and @default_git_timeout above).
-      _ ->
-        Task.shutdown(task, :brutal_kill)
-        kill_pending_os_pid(ref)
-        {:error, :git_timeout}
+      {:error, _} = error ->
+        error
     end
   end
 
-  # Runs `git` to completion, buffering its output — the non-streaming
-  # counterpart to stream_grep/4.
-  defp exec_git(git, args, parent, ref) do
-    {port, os_pid} = open_git_port(git, args)
-    send(parent, {:git_os_pid, ref, os_pid})
-    collect_git(port, [])
-  end
-
-  defp collect_git(port, chunks) do
-    receive do
-      {^port, {:data, chunk}} -> collect_git(port, [chunk | chunks])
-      {^port, {:exit_status, status}} -> {raw_output(chunks), status}
-    end
-  end
-
-  # `grep`'s streaming counterpart to `run_git/4`. Same async_nolink/yield/shutdown
-  # + os_pid SIGKILL wrapper on timeout, but the task body reads the Port itself
-  # (via stream_grep/4 / grep_receive/5) instead of buffering to completion, so
-  # it can also stop early — and SIGKILL — on a byte/match budget.
+  # `grep`'s streaming counterpart to `run_git/4`. Same task wrapper, but the
+  # task body reads the Port itself (via grep_receive/6) instead of buffering to
+  # completion, so it can also stop early — and SIGKILL — on a byte/match budget.
   defp run_grep(git, args) do
-    parent = self()
+    case run_git_task(git, args, default_timeout(), fn port, os_pid, guard ->
+           grep_receive(port, os_pid, guard, [], 0, 0)
+         end) do
+      {:ok, result} -> result
+      {:error, _} = error -> error
+    end
+  end
+
+  # Runs one git command in a task under @task_supervisor and waits up to
+  # `timeout` for `reader`'s result.
+  #
+  # Cleanup is owned on BOTH sides, because async_nolink decouples the task's
+  # lifetime from the caller's:
+  #   * caller side: on timeout (yield -> nil) or task crash ({:exit, _}) the
+  #     caller kills the task (closing the port) and explicitly SIGKILLs the OS
+  #     process — closing the port alone doesn't terminate git promptly enough
+  #     (see grep/3 doc and @default_git_timeout above);
+  #   * task side: the task monitors the caller and enforces the same deadline
+  #     itself (collect_git/4, grep_receive/6), so if the caller dies mid-call
+  #     — where nobody is left to run the caller-side cleanup — the task still
+  #     closes the port, SIGKILLs git and exits, keeping git bounded by timeout.
+  defp run_git_task(git, args, timeout, reader) do
+    caller = self()
     ref = make_ref()
 
-    task =
-      Task.Supervisor.async_nolink(@task_supervisor, fn -> stream_grep(git, args, parent, ref) end)
+    with {:ok, task} <-
+           start_git_task(fn -> git_task(git, args, caller, ref, timeout, reader) end) do
+      case Task.yield(task, timeout) do
+        {:ok, result} ->
+          flush_os_pid_message(ref)
+          {:ok, result}
 
-    case Task.yield(task, default_timeout()) do
-      {:ok, result} ->
-        flush_os_pid_message(ref)
-        result
-
-      _ ->
-        Task.shutdown(task, :brutal_kill)
-        kill_pending_os_pid(ref)
-        {:error, :git_timeout}
+        _ ->
+          Task.shutdown(task, :brutal_kill)
+          kill_pending_os_pid(ref)
+          {:error, :git_timeout}
+      end
     end
   end
 
-  defp stream_grep(git, args, parent, ref) do
-    {port, os_pid} = open_git_port(git, args)
-    send(parent, {:git_os_pid, ref, os_pid})
-    grep_receive(port, os_pid, [], 0, 0)
+  # If the supervisor is absent — never started, or mid-restart under the
+  # application's :one_for_one strategy — async_nolink exits :noproc in THIS
+  # process, before any task exists for Task.yield to isolate. Catch it at the
+  # source (same idiom as Chunking.TreeSitterImpl.start_task/1) so the caller
+  # still gets an error tuple.
+  defp start_git_task(fun) do
+    {:ok, Task.Supervisor.async_nolink(@task_supervisor, fun)}
+  catch
+    :exit, {:noproc, _} -> {:error, :git_supervisor_down}
   end
 
-  defp grep_receive(port, os_pid, chunks, total_bytes, total_matches) do
+  defp git_task(git, args, caller, ref, timeout, reader) do
+    guard = %{
+      caller_mref: Process.monitor(caller),
+      deadline: System.monotonic_time(:millisecond) + timeout
+    }
+
+    {port, os_pid} = open_git_port(git, args)
+    send(caller, {:git_os_pid, ref, os_pid})
+    reader.(port, os_pid, guard)
+  end
+
+  # Task-side cleanup for a caller that died or a deadline that passed: nobody
+  # is waiting for a result, so release the port, SIGKILL git, and exit :normal
+  # (a :temporary task exiting normally logs nothing).
+  defp abandon_git(port, os_pid) do
+    Port.close(port)
+    kill_os_pid(os_pid)
+    exit(:normal)
+  end
+
+  defp remaining_ms(%{deadline: deadline}),
+    do: max(deadline - System.monotonic_time(:millisecond), 0)
+
+  # Buffers git's output to completion (the non-streaming counterpart to
+  # grep_receive/6), bailing out via abandon_git/2 on caller death or deadline.
+  defp collect_git(port, os_pid, %{caller_mref: mref} = guard, chunks) do
+    receive do
+      {^port, {:data, chunk}} ->
+        collect_git(port, os_pid, guard, [chunk | chunks])
+
+      {^port, {:exit_status, status}} ->
+        {raw_output(chunks), status}
+
+      {:DOWN, ^mref, :process, _, _} ->
+        abandon_git(port, os_pid)
+    after
+      remaining_ms(guard) -> abandon_git(port, os_pid)
+    end
+  end
+
+  defp grep_receive(
+         port,
+         os_pid,
+         %{caller_mref: mref} = guard,
+         chunks,
+         total_bytes,
+         total_matches
+       ) do
     receive do
       {^port, {:data, chunk}} ->
         total_bytes = total_bytes + byte_size(chunk)
@@ -500,7 +548,7 @@ defmodule RetrievalNode.Ingest.GitMirror do
           kill_os_pid(os_pid)
           {:ok, complete_records(chunks), true}
         else
-          grep_receive(port, os_pid, chunks, total_bytes, total_matches)
+          grep_receive(port, os_pid, guard, chunks, total_bytes, total_matches)
         end
 
       {^port, {:exit_status, status}} ->
@@ -509,6 +557,11 @@ defmodule RetrievalNode.Ingest.GitMirror do
         else
           {:error, {:git, status, chunks |> raw_output() |> String.trim()}}
         end
+
+      {:DOWN, ^mref, :process, _, _} ->
+        abandon_git(port, os_pid)
+    after
+      remaining_ms(guard) -> abandon_git(port, os_pid)
     end
   end
 
