@@ -40,3 +40,5 @@ retrieval_node-*.tar
 /.claude/deps-audit/
 /.claude/deps-update/
 
+# Local secrets (DB connection, tokens). Template: .env.example
+/.env
