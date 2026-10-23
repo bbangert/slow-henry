@@ -31,6 +31,18 @@ defmodule RetrievalNodeWeb.MCPEndpointTest do
     assert conn.state == :sent
   end
 
+  test "GET /mcp is refused with 405 so clients never open a standalone SSE stream",
+       %{conn: conn} do
+    conn =
+      conn
+      |> put_req_header("accept", "text/event-stream")
+      |> get("/mcp")
+
+    assert conn.status == 405
+    assert get_resp_header(conn, "allow") == ["POST, DELETE"]
+    assert conn.halted
+  end
+
   test "a non-/mcp path flows past MCPPlug to the Phoenix router", %{conn: conn} do
     # MCPPlug only intercepts /mcp; anything else reaches the router, which has no
     # matching route → a normal 404. That it 404s (rather than the transport
