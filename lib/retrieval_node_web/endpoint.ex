@@ -24,11 +24,14 @@ defmodule RetrievalNodeWeb.Endpoint do
     at: "/",
     from: :retrieval_node,
     gzip: not code_reloading?,
-    only: RetrievalNodeWeb.static_paths()
+    only: RetrievalNodeWeb.static_paths(),
+    raise_on_missing_only: code_reloading?
 
   # Code reloading can be explicitly enabled under the
   # :code_reloader configuration of your endpoint.
   if code_reloading? do
+    socket "/phoenix/live_reload/socket", Phoenix.LiveReloader.Socket
+    plug Phoenix.LiveReloader
     plug Phoenix.CodeReloader
     plug Phoenix.Ecto.CheckRepoStatus, otp_app: :retrieval_node
   end

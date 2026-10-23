@@ -93,6 +93,10 @@ log "staging grammar cache into rel/overlays/grammar-cache"
 mkdir -p rel/overlays/grammar-cache
 cp -a "$XDG_CACHE_HOME/." rel/overlays/grammar-cache/
 
+log "mix assets.setup && mix assets.deploy (LiveView UI css/js, digested)"
+mix assets.setup
+mix assets.deploy
+
 log "mix release --overwrite"
 mix release --overwrite
 

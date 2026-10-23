@@ -42,3 +42,8 @@ retrieval_node-*.tar
 
 # Local secrets (DB connection, tokens). Template: .env.example
 /.env
+
+# LiveView UI build output (mix assets.build / assets.deploy)
+/priv/static/assets/
+/priv/static/cache_manifest.json
+/assets/node_modules/

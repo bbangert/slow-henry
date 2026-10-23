@@ -12,6 +12,7 @@ defmodule RetrievalNode.MixProject do
       deps: deps(),
       dialyzer: dialyzer(),
       releases: releases(),
+      compilers: [:phoenix_live_view] ++ Mix.compilers(),
       listeners: [Phoenix.CodeReloader]
     ]
   end
@@ -69,6 +70,26 @@ defmodule RetrievalNode.MixProject do
     [
       {:phoenix, "~> 1.8.0"},
       {:phoenix_ecto, "~> 4.5"},
+      {:phoenix_html, "~> 4.1"},
+      {:phoenix_live_view, "~> 1.2.0"},
+      {:phoenix_live_reload, "~> 1.2", only: :dev},
+      {:lazy_html, ">= 0.1.0", only: :test},
+      {:esbuild, "~> 0.10", runtime: Mix.env() == :dev},
+      {:tailwind, "~> 0.5", runtime: Mix.env() == :dev},
+      {:heroicons,
+       github: "tailwindlabs/heroicons",
+       tag: "v2.2.0",
+       sparse: "optimized",
+       app: false,
+       compile: false,
+       depth: 1},
+      {:daisyui,
+       github: "saadeghi/daisyui",
+       tag: "v5.5.20",
+       sparse: "packages/bundle",
+       app: false,
+       compile: false,
+       depth: 1},
       {:ecto_sql, "~> 3.13"},
       {:postgrex, ">= 0.0.0"},
       {:phoenix_live_dashboard, "~> 0.9.1"},
@@ -110,9 +131,16 @@ defmodule RetrievalNode.MixProject do
   # See the documentation for `Mix` for more info on aliases.
   defp aliases do
     [
-      setup: ["deps.get", "ecto.setup"],
+      setup: ["deps.get", "ecto.setup", "assets.setup", "assets.build"],
       "ecto.setup": ["ecto.create", "ecto.migrate", "run priv/repo/seeds.exs"],
       "ecto.reset": ["ecto.drop", "ecto.setup"],
+      "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
+      "assets.build": ["compile", "tailwind retrieval_node", "esbuild retrieval_node"],
+      "assets.deploy": [
+        "tailwind retrieval_node --minify",
+        "esbuild retrieval_node --minify",
+        "phx.digest"
+      ],
       test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"],
       precommit: ["compile --warnings-as-errors", "deps.unlock --unused", "format", "test"]
     ]

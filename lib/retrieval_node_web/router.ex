@@ -1,12 +1,37 @@
 defmodule RetrievalNodeWeb.Router do
   use RetrievalNodeWeb, :router
 
+  pipeline :browser do
+    plug :accepts, ["html"]
+    plug :fetch_session
+    plug :fetch_live_flash
+    plug :put_root_layout, html: {RetrievalNodeWeb.Layouts, :root}
+    plug :protect_from_forgery
+    # The root layout's inline theme script and LiveView's style attributes
+    # need 'unsafe-inline'; everything else is same-origin.
+    plug :put_secure_browser_headers, %{
+      "content-security-policy" =>
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; " <>
+          "style-src 'self' 'unsafe-inline'; img-src 'self' data:; " <>
+          "connect-src 'self'; frame-ancestors 'none'"
+    }
+  end
+
   pipeline :api do
     plug :accepts, ["json"]
   end
 
   scope "/api", RetrievalNodeWeb do
     pipe_through :api
+  end
+
+  # Index inspection UI — LAN-only, no auth, like the MCP endpoint.
+  scope "/", RetrievalNodeWeb do
+    pipe_through :browser
+
+    live "/", SourcesLive, :index
+    live "/sources/:id", SourceLive, :show
+    live "/search", SearchLive, :index
   end
 
   # Readiness probe — top-level (not under /api), no auth: a LAN-only slice
