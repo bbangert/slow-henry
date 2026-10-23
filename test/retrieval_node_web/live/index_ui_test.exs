@@ -143,6 +143,14 @@ defmodule RetrievalNodeWeb.IndexUITest do
       # A later valid search clears the stale error.
       refute render_patch(view, ~p"/search?q=anything") =~ "Unknown source filter."
     end
+
+    test "a 16-byte source filter (castable as a raw UUID) is rejected, not crashed on",
+         %{conn: conn} do
+      {:ok, view, html} = live(conn, ~p"/search?q=anything&source=abcdefghijklmnop")
+
+      assert html =~ "Unknown source filter."
+      refute has_element?(view, "#results")
+    end
   end
 
   describe "layout" do

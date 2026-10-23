@@ -11,6 +11,7 @@ defmodule RetrievalNode.Inventory do
 
   import Ecto.Query
 
+  alias RetrievalNode.Ingest
   alias RetrievalNode.Ingest.Workers.{DriveSync, JiraSync, RepoSync}
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.{Chunk, PendingChunk, SecretFinding, Source, SyncState}
@@ -91,7 +92,7 @@ defmodule RetrievalNode.Inventory do
   end
 
   @doc """
-  Files of a source with their chunk count and size, optionally filtered by a
+  Files of a source with their chunk count, optionally filtered by a
   case-insensitive substring of the file key (or Drive doc name).
   """
   def list_files(source_id, filter \\ "") do
@@ -105,7 +106,6 @@ defmodule RetrievalNode.Inventory do
           name: max(fragment("?->>'name'", c.metadata)),
           lang: max(c.lang),
           chunks: count(c.id),
-          bytes: sum(fragment("length(?)", c.content)),
           redacted: filter(count(c.id), c.secrets_status == :redacted),
           fallback: filter(count(c.id), c.parse_status != :ok),
           updated_at: max(c.updated_at)
@@ -130,13 +130,19 @@ defmodule RetrievalNode.Inventory do
     Repo.all(query)
   end
 
-  @doc "Chunks of one file of a source, in insertion order."
-  def file_chunks(source_id, key) do
-    from(c in Chunk,
-      where: c.source_id == ^source_id and file_key(c.metadata) == ^key,
-      order_by: [c.inserted_at, c.id]
-    )
-    |> Repo.all()
+  @doc """
+  Chunks of one file of a source, in insertion order. Scoped through
+  `Ingest.file_chunks_query/3` so the lookup uses the per-identity
+  `chunks_file_identity_*` indexes.
+  """
+  def file_chunks(%Source{id: source_id, source_type: source_type}, key) do
+    # file_identity/2 picks the field for this source type; offer the key under each.
+    identity = Map.new(~w(path doc_id issue_key), &{&1, key})
+
+    case Ingest.file_chunks_query(source_id, to_string(source_type), identity) do
+      nil -> []
+      query -> query |> order_by([c], [c.inserted_at, c.id]) |> Repo.all()
+    end
   end
 
   @doc "Full chunks for the given ids, as a map of id => chunk."

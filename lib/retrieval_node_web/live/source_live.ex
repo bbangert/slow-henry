@@ -28,7 +28,7 @@ defmodule RetrievalNodeWeb.SourceLive do
        form: to_form(%{"q" => q}),
        file: file,
        files: Inventory.list_files(source.id, q),
-       chunks: if(file, do: Inventory.file_chunks(source.id, file), else: [])
+       chunks: if(file, do: Inventory.file_chunks(source, file), else: [])
      )}
   end
 

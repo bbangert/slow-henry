@@ -37,7 +37,9 @@ defmodule RetrievalNodeWeb.SearchLive do
       not connected?(socket) ->
         {:noreply, assign(socket, :results, nil)}
 
-      source_id != "" and Ecto.UUID.cast(source_id) == :error ->
+      # Only ids of listed sources reach the query: a cast alone would accept any
+      # 16-byte binary as a raw UUID and still crash in `Ecto.UUID.dump!/1`.
+      source_id != "" and not Map.has_key?(socket.assigns.source_names, source_id) ->
         {:noreply,
          socket
          |> put_flash(:error, "Unknown source filter.")
