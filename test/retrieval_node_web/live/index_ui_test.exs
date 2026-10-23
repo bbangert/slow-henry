@@ -6,6 +6,7 @@ defmodule RetrievalNodeWeb.IndexUITest do
 
   alias RetrievalNode.Embedding.StubImpl
   alias RetrievalNode.Ingest.Workers.RepoSync
+  alias RetrievalNode.Inventory
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.{Chunk, Source}
 
@@ -68,6 +69,33 @@ defmodule RetrievalNodeWeb.IndexUITest do
     end
   end
 
+  describe "sync eligibility" do
+    test "inactive and denied sources are not enqueued", %{source: source} do
+      inactive = Repo.update!(Ecto.Changeset.change(source, active: false))
+      denied = Repo.update!(Ecto.Changeset.change(source, active: true, policy: :deny))
+
+      assert {:error, :ineligible} = Inventory.enqueue_sync(inactive)
+      assert {:error, :ineligible} = Inventory.enqueue_sync(denied)
+      refute_enqueued(worker: RepoSync)
+    end
+
+    test "an active allow source is enqueued", %{source: source} do
+      assert {:ok, _job} = Inventory.enqueue_sync(source)
+      assert_enqueued(worker: RepoSync, args: %{"source_id" => source.id})
+    end
+
+    test "the sync button on an inactive source flashes and enqueues nothing", %{
+      conn: conn,
+      source: source
+    } do
+      Repo.update!(Ecto.Changeset.change(source, active: false))
+      {:ok, view, _html} = live(conn, ~p"/")
+
+      assert render_click(view, "sync", %{"id" => source.id}) =~ "inactive or denied by policy"
+      refute_enqueued(worker: RepoSync)
+    end
+  end
+
   describe "source page" do
     test "filters files and shows the chunks of the selected file", %{conn: conn, source: source} do
       {:ok, view, html} = live(conn, ~p"/sources/#{source.id}")
@@ -102,6 +130,31 @@ defmodule RetrievalNodeWeb.IndexUITest do
       assert_patched(view, ~p"/search?#{[q: "staging VPN", source: source.id, top_k: "10"]}")
       assert html =~ "Services reach staging through the VPN."
       assert html =~ "decisions/0001-staging.md"
+    end
+
+    test "an invalid source filter shows an error and does not search", %{conn: conn} do
+      {:ok, view, html} = live(conn, ~p"/search?q=anything&source=not-a-uuid")
+
+      assert html =~ "Unknown source filter."
+      assert has_element?(view, "#search-form")
+      refute has_element?(view, "#results")
+      refute render(view) =~ "No result."
+
+      # A later valid search clears the stale error.
+      refute render_patch(view, ~p"/search?q=anything") =~ "Unknown source filter."
+    end
+  end
+
+  describe "layout" do
+    test "theme toggle buttons have accessible names", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/")
+
+      for theme <- ~w(system light dark) do
+        assert has_element?(
+                 view,
+                 ~s(button[data-phx-theme="#{theme}"][aria-label="Use #{theme} theme"])
+               )
+      end
     end
   end
 end

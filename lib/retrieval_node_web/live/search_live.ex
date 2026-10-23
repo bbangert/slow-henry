@@ -31,10 +31,24 @@ defmodule RetrievalNodeWeb.SearchLive do
     source_id = Map.get(params, "source", "")
     top_k = if params["top_k"] in @top_k_options, do: params["top_k"], else: "10"
 
-    {:noreply,
-     socket
-     |> assign(form: to_form(%{"q" => q, "source" => source_id, "top_k" => top_k}))
-     |> assign(:results, search(q, source_id, String.to_integer(top_k)))}
+    socket = assign(socket, form: to_form(%{"q" => q, "source" => source_id, "top_k" => top_k}))
+
+    cond do
+      not connected?(socket) ->
+        {:noreply, assign(socket, :results, nil)}
+
+      source_id != "" and Ecto.UUID.cast(source_id) == :error ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "Unknown source filter.")
+         |> assign(:results, nil)}
+
+      true ->
+        {:noreply,
+         socket
+         |> clear_flash(:error)
+         |> assign(:results, search(q, source_id, String.to_integer(top_k)))}
+    end
   end
 
   @impl true
@@ -81,9 +95,15 @@ defmodule RetrievalNodeWeb.SearchLive do
         phx-submit="search"
         class="grid items-end gap-2 sm:grid-cols-[minmax(0,1fr)_14rem_6rem_auto]"
       >
-        <.input field={@form[:q]} type="search" placeholder="Search the index…" autocomplete="off" />
-        <.input field={@form[:source]} type="select" options={@source_options} />
-        <.input field={@form[:top_k]} type="select" options={@top_k_options} />
+        <.input
+          field={@form[:q]}
+          type="search"
+          label="Query"
+          placeholder="Search the index…"
+          autocomplete="off"
+        />
+        <.input field={@form[:source]} type="select" label="Source" options={@source_options} />
+        <.input field={@form[:top_k]} type="select" label="Results" options={@top_k_options} />
         <div class="mb-2">
           <.button variant="primary" phx-disable-with="Searching…">
             <.icon name="hero-magnifying-glass" class="size-4" /> Search

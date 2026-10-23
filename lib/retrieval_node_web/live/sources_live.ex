@@ -20,19 +20,34 @@ defmodule RetrievalNodeWeb.SourcesLive do
   @impl true
   def handle_event("sync", %{"id" => id}, socket) do
     socket =
-      with %{source: source} <- Inventory.get_source(id),
-           {:ok, job} <- Inventory.enqueue_sync(source) do
+      case Inventory.get_source(id) do
+        %{source: source} -> enqueue(socket, source)
+        nil -> put_flash(socket, :error, "Could not queue a sync for this source.")
+      end
+
+    {:noreply, load(socket)}
+  end
+
+  defp enqueue(socket, source) do
+    case Inventory.enqueue_sync(source) do
+      {:ok, job} ->
         msg =
           if job.conflict?,
             do: "A sync for #{source.name} is already queued.",
             else: "Sync queued for #{source.name}."
 
         put_flash(socket, :info, msg)
-      else
-        _ -> put_flash(socket, :error, "Could not queue a sync for this source.")
-      end
 
-    {:noreply, load(socket)}
+      {:error, :ineligible} ->
+        put_flash(
+          socket,
+          :error,
+          "#{source.name} is inactive or denied by policy; it is not synced."
+        )
+
+      _ ->
+        put_flash(socket, :error, "Could not queue a sync for this source.")
+    end
   end
 
   defp load(socket) do
@@ -120,6 +135,7 @@ defmodule RetrievalNodeWeb.SourcesLive do
                     phx-click="sync"
                     phx-value-id={row.source.id}
                     class="btn btn-ghost btn-xs"
+                    disabled={!(row.source.active and row.source.policy == :allow)}
                   >
                     <.icon name="hero-arrow-path" class="size-4" /> Sync
                   </button>

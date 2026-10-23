@@ -164,11 +164,19 @@ defmodule RetrievalNode.Inventory do
     %{counts: counts, errored: errored}
   end
 
-  @doc "Enqueue a sync for a source, collapsing onto an already queued one."
-  def enqueue_sync(%Source{} = source) do
+  @doc """
+  Enqueue a sync for a source, collapsing onto an already queued one.
+
+  Only active sources with `policy: :allow` are synced (the same rule as the
+  cron scheduler); any other source returns `{:error, :ineligible}` and no job
+  is inserted.
+  """
+  def enqueue_sync(%Source{active: true, policy: :allow} = source) do
     worker = Map.fetch!(@sync_workers, source.source_type)
     Oban.insert(worker.new(%{"source_id" => source.id}))
   end
+
+  def enqueue_sync(%Source{}), do: {:error, :ineligible}
 
   defp escape_like(term), do: String.replace(term, ~w(\\ % _), &("\\" <> &1))
 end
