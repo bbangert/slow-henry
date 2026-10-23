@@ -99,7 +99,9 @@ defmodule Mix.Tasks.Rn.Seed do
   # (dev server / systemd), never inside this short-lived task process. If this
   # process's own queues raced to claim a job and then the task exited mid
   # `git clone --mirror`, it would leave a corrupt bare mirror behind.
-  defp boot do
+  # Shared with `mix rn.sources`.
+  @doc false
+  def boot do
     Mix.Task.run("app.config")
 
     Application.put_env(:retrieval_node, :embedding_serving_start, false)

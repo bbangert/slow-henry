@@ -1,0 +1,17 @@
+# Git repos indexed by Slow Henry.
+# Copy to sources.toml (git-ignored) and apply with `mix rn.sources`
+# (--dry-run to preview). SOURCES_FILE=path points at another file.
+#
+# Removing an entry deactivates the source (its chunks stay searchable);
+# `active = false` does the same while keeping it listed here.
+# Format and rules: RetrievalNode.SourcesFile.
+
+[[git]]
+name = "my-repo"                                  # mirror slug + MCP `repo` filter
+url = "https://github.com/my-org/my-repo.git"     # clone URL (the source identity)
+
+[[git]]
+name = "old-repo"
+url = "https://github.com/my-org/old-repo.git"
+active = false
+
