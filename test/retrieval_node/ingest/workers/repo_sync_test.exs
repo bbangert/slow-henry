@@ -185,6 +185,35 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     assert state.cursor["last_sha"] == head
   end
 
+  test "lockfiles, minified bundles and oversized files are staged as deletions, not content",
+       ctx do
+    big = String.duplicate("line of generated text\n", 12_000)
+
+    commit(ctx.src, [
+      {"yarn.lock", "lodash@^4: version 4.17.21\n"},
+      {"app.min.js", "var a=1;\n"},
+      {"dump.txt", big},
+      {"app.py", "def a(): pass\n"}
+    ])
+
+    assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+    raws = Repo.all(from p in PendingChunk, where: p.status == "raw")
+    assert Enum.map(raws, & &1.natural_key) == ["repo:#{ctx.source.id}:app.py"]
+
+    deleted =
+      Repo.all(from p in PendingChunk, where: p.status == "deleted", select: p.metadata["path"])
+
+    assert Enum.sort(deleted) == ["app.min.js", "dump.txt", "yarn.lock"]
+  end
+
+  test "indexable?/2 keeps regular source files" do
+    assert RepoSync.indexable?("lib/app.ex", "defmodule App do\nend\n")
+    assert RepoSync.indexable?("docs/lock.md", "# Locking\n")
+    refute RepoSync.indexable?("frontend/package-lock.json", "{}")
+    refute RepoSync.indexable?("infra/.terraform.lock.hcl", "provider {}")
+  end
+
   test "a repo with invalid-UTF-8-but-no-NUL content stages it as a deletion entry too", ctx do
     File.write!(Path.join(ctx.src, "mystery.bin"), <<255, 254>> <> "not valid utf8")
     commit(ctx.src, [{"app.py", "def a(): pass\n"}])
