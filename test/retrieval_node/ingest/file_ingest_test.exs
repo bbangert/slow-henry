@@ -360,6 +360,29 @@ defmodule RetrievalNode.Ingest.FileIngestTest do
     refute Repo.get(PendingChunk, raw2.id)
   end
 
+  test "each chunk records its position in the file as metadata.chunk_index", %{source: source} do
+    force_chunk(
+      chunk_result([
+        {"chunk a", "a", 1, 1},
+        {"chunk b", "b", 2, 2},
+        {"chunk c", "c", 3, 3}
+      ])
+    )
+
+    raw = seed_raw(source, "v1", "repo:acme/app:order.py", "order.py")
+    assert {:ok, _} = FileIngest.apply(raw, [])
+
+    by_content =
+      Chunk
+      |> Repo.all()
+      |> Enum.filter(&(&1.source_id == source.id and &1.metadata["path"] == "order.py"))
+      |> Map.new(&{&1.content, &1.metadata})
+
+    assert %{"path" => "order.py", "chunk_index" => 0} = by_content["chunk a"]
+    assert %{"chunk_index" => 1} = by_content["chunk b"]
+    assert %{"chunk_index" => 2} = by_content["chunk c"]
+  end
+
   test "reconcile deletes stale keys after a boundary shift", %{source: source} do
     natural_key = "repo:acme/app:shift.py"
 
