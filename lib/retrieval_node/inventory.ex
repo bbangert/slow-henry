@@ -131,17 +131,27 @@ defmodule RetrievalNode.Inventory do
   end
 
   @doc """
-  Chunks of one file of a source, in insertion order. Scoped through
-  `Ingest.file_chunks_query/3` so the lookup uses the per-identity
-  `chunks_file_identity_*` indexes.
+  Chunks of one file of a source, in file order (`metadata.chunk_index`, written
+  by `Ingest.FileIngest`; chunks ingested before it existed fall back to
+  insertion order). Scoped through `Ingest.file_chunks_query/3` so the lookup
+  uses the per-identity `chunks_file_identity_*` indexes.
   """
   def file_chunks(%Source{id: source_id, source_type: source_type}, key) do
     # file_identity/2 picks the field for this source type; offer the key under each.
     identity = Map.new(~w(path doc_id issue_key), &{&1, key})
 
     case Ingest.file_chunks_query(source_id, to_string(source_type), identity) do
-      nil -> []
-      query -> query |> order_by([c], [c.inserted_at, c.id]) |> Repo.all()
+      nil ->
+        []
+
+      query ->
+        query
+        |> order_by([c],
+          asc_nulls_last: fragment("(?->>'chunk_index')::int", c.metadata),
+          asc: c.inserted_at,
+          asc: c.id
+        )
+        |> Repo.all()
     end
   end
 

@@ -21,7 +21,7 @@ defmodule RetrievalNodeWeb.IndexUITest do
     %{source: source}
   end
 
-  defp chunk(source, path, content) do
+  defp chunk(source, path, content, metadata \\ nil) do
     Repo.insert!(%Chunk{
       source_id: source.id,
       source_type: :git_repo,
@@ -30,7 +30,7 @@ defmodule RetrievalNodeWeb.IndexUITest do
       content_hash: "hash-#{System.unique_integer([:positive])}",
       content: content,
       context_breadcrumb: path,
-      metadata: %{"path" => path},
+      metadata: metadata || %{"path" => path},
       embedding: Pgvector.new(StubImpl.embed(content))
     })
   end
@@ -110,6 +110,23 @@ defmodule RetrievalNodeWeb.IndexUITest do
       assert html =~ "Services reach staging through the VPN."
       assert html =~ "Production access requires a second approval."
       refute html =~ "Architecture decision records"
+    end
+
+    test "a file's chunks are shown in chunk_index order, not insertion order", %{
+      source: source
+    } do
+      # Inserted out of document order; a legacy chunk without chunk_index sorts last.
+      for {content, index} <- [{"third", 2}, {"legacy", nil}, {"first", 0}, {"second", 1}] do
+        metadata =
+          if index,
+            do: %{"path" => "ordered.md", "chunk_index" => index},
+            else: %{"path" => "ordered.md"}
+
+        chunk(source, "ordered.md", content, metadata)
+      end
+
+      assert source |> Inventory.file_chunks("ordered.md") |> Enum.map(& &1.content) ==
+               ~w(first second third legacy)
     end
 
     test "redirects home for an unknown source", %{conn: conn} do

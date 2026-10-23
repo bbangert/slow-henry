@@ -222,6 +222,9 @@ defmodule RetrievalNode.Ingest.FileIngest do
 
         %{
           chunk_key: chunk_key(row, chunk, index),
+          # Position in the file — every chunk of a batch shares inserted_at and
+          # ids are random, so this is the only record of document order.
+          index: index,
           breadcrumb: Breadcrumb.build(file_prefix(row), chunk.breadcrumb),
           text: text,
           # Chunk.content_hash is the hash of the CHUNK (row.content_hash, used
@@ -375,7 +378,7 @@ defmodule RetrievalNode.Ingest.FileIngest do
       content_hash: entry.content_hash,
       content: entry.text,
       context_breadcrumb: entry.breadcrumb,
-      metadata: row.metadata,
+      metadata: Map.put(row.metadata || %{}, "chunk_index", entry.index),
       embedding: Map.fetch!(embeddings_by_key, entry.chunk_key),
       parse_status: to_enum(:parse_status, parse_status),
       secrets_status: to_enum(:secrets_status, opts[:secrets_status]),
