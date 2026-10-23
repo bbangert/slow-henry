@@ -30,7 +30,7 @@ defmodule RetrievalNode.SourcesFile do
 
   import Ecto.Query
 
-  alias RetrievalNode.Ingest.Workers.RepoSync
+  alias RetrievalNode.Inventory
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.Source
 
@@ -138,9 +138,10 @@ defmodule RetrievalNode.SourcesFile do
   end
 
   @doc """
-  Applies `plan/1` in one transaction. The `RepoSync` job for every added or
-  re-activated source is inserted inside that same transaction, so a failed
-  enqueue rolls the source writes back. Requires a running Oban instance.
+  Applies `plan/1` in one transaction. The sync job for every added or
+  re-activated source is inserted (via `Inventory.enqueue_sync/1`) inside that
+  same transaction, so a failed enqueue rolls the source writes back. A source
+  with `policy: :deny` is written but not enqueued. Requires a running Oban instance.
   """
   @spec apply([entry()]) :: {:ok, [change()]} | {:error, term()}
   def apply(entries) do
@@ -191,8 +192,9 @@ defmodule RetrievalNode.SourcesFile do
   defp needs_sync?(_), do: false
 
   defp enqueue!(source) do
-    case Oban.insert(RepoSync.new(%{"source_id" => source.id})) do
+    case Inventory.enqueue_sync(source) do
       {:ok, _job} -> :ok
+      {:error, :ineligible} -> :ok
       {:error, reason} -> Repo.rollback(reason)
     end
   end

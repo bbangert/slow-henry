@@ -125,6 +125,24 @@ defmodule RetrievalNode.SourcesFileTest do
       refute_enqueued(worker: RepoSync, args: %{"source_id" => renamed.id})
     end
 
+    test "re-activating a deny-policy source updates it but queues no sync" do
+      denied =
+        Repo.insert!(%Source{
+          source_type: :git_repo,
+          name: "snitun",
+          identifier: @url_b,
+          active: false,
+          policy: :deny
+        })
+
+      {:ok, entries} = SourcesFile.parse(%{"git" => [git("snitun", @url_b)]})
+
+      assert {:ok, _} = SourcesFile.apply(entries)
+
+      assert %{active: true, policy: :deny} = Repo.get!(Source, denied.id)
+      refute_enqueued(worker: RepoSync)
+    end
+
     test "leaves non-git sources alone" do
       jira =
         Repo.insert!(%Source{

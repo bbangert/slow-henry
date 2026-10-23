@@ -77,7 +77,7 @@ defmodule Mix.Tasks.Rn.Sources do
       [
         s.name != e.name && rename(s, e),
         s.active != e.active && "active #{s.active} -> #{e.active}",
-        (e.active and not s.active) && "sync"
+        (e.active and not s.active) && sync_note(s)
       ]
       |> Enum.filter(& &1)
 
@@ -86,6 +86,9 @@ defmodule Mix.Tasks.Rn.Sources do
 
   defp describe({:deactivate, s}), do: "- #{s.name}: not in file, deactivated (chunks kept)"
   defp describe({:unchanged, s}), do: "= #{s.name}"
+
+  defp sync_note(%{policy: :allow}), do: "sync"
+  defp sync_note(%{policy: policy}), do: "not synced (policy #{policy})"
 
   defp rename(s, e) do
     case SourcesFile.pinned_slug(s, e) do
