@@ -188,10 +188,28 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
     end)
   end
 
+  # Lockfiles, minified bundles and other generated or oversized text add
+  # thousands of useless chunks (one yarn.lock is ~550 KB) and monopolise the
+  # shared embedding serving. Like binaries, they are staged as deletions so
+  # chunks from a previous, smaller version get reconciled away.
+  @skip_basenames ~w(yarn.lock package-lock.json pnpm-lock.yaml npm-shrinkwrap.json
+                     mix.lock poetry.lock uv.lock Pipfile.lock Cargo.lock go.sum
+                     Gemfile.lock composer.lock flake.lock .terraform.lock.hcl)
+  @skip_suffixes ~w(.min.js .min.css .map .snap .svg)
+  @max_indexed_bytes 256 * 1024
+
+  @doc false
+  def indexable?(path, content) do
+    base = Path.basename(path)
+
+    byte_size(content) <= @max_indexed_bytes and base not in @skip_basenames and
+      not String.ends_with?(base, @skip_suffixes)
+  end
+
   defp raw_row(source, slug, path, new_sha) do
     case GitMirror.show(slug, path, new_sha) do
       {:ok, content} ->
-        if Chunking.binary_content?(content) do
+        if Chunking.binary_content?(content) or not indexable?(path, content) do
           # The file is present but its new content can't be staged as text —
           # a deletion entry reconciles away whatever chunks it had under its
           # old (text) content instead of leaving them indexed forever.
