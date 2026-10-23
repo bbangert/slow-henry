@@ -6,8 +6,8 @@ on:
   pull_request:
 
 env:
-  ELIXIR_VERSION: "1.20.2-otp-29"
-  OTP_VERSION: "29.0.3"
+  ELIXIR_VERSION: "1.20.4-otp-29"
+  OTP_VERSION: "29.1.2"
   # System packages needed to compile NIFs pulled in by mix deps.get — chiefly
   # EXLA (builds a C++ shim against a downloaded XLA archive).
   APT_PACKAGES: build-essential automake autoconf pkg-config libssl-dev
