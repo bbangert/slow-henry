@@ -85,6 +85,19 @@ defmodule RetrievalNode.Search.HybridQueryTest do
   end
 
   describe "search/1 filter isolation" do
+    test "a source_id filter (string UUID, as callers hold it) keeps only that source" do
+      a = source_fixture("repo-a")
+      b = source_fixture("repo-b")
+
+      in_a = chunk_fixture(a, repo: "repo-a", content: "quick brown fox", embedding: axis(0))
+      _in_b = chunk_fixture(b, repo: "repo-b", content: "quick brown fox", embedding: axis(0))
+
+      results =
+        HybridQuery.search(embedding: axis(0), text_query: "quick brown fox", source_id: a.id)
+
+      assert Enum.map(results, & &1.chunk_id) == [in_a.id]
+    end
+
     test "a repo filter cannot surface the globally-best chunk from another repo" do
       source = source_fixture("repo-a")
 
