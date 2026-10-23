@@ -124,7 +124,7 @@ defmodule RetrievalNode.Search.HybridQuery do
       text_query,
       @rrf_k,
       top_k,
-      opts[:source_id],
+      dump_uuid(opts[:source_id]),
       opts[:repo],
       opts[:lang],
       opts[:source_type]
@@ -155,4 +155,9 @@ defmodule RetrievalNode.Search.HybridQuery do
   # request an unbounded or nonsensical LIMIT.
   defp clamp_top_k(k) when is_integer(k) and k >= 1, do: min(k, @max_top_k)
   defp clamp_top_k(_), do: @default_top_k
+
+  # Raw `Repo.query!` binds `$5::uuid` as Postgrex's 16-byte binary, not the
+  # 36-char string form callers hold.
+  defp dump_uuid(nil), do: nil
+  defp dump_uuid(id), do: Ecto.UUID.dump!(id)
 end
