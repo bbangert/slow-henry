@@ -21,7 +21,7 @@ defmodule Mix.Tasks.Rn.Sources do
   @spec run([binary()]) :: no_return()
   @impl Mix.Task
   def run(args) do
-    {opts, _args, _invalid} = OptionParser.parse(args, strict: @switches)
+    opts = parse_args!(args)
     path = opts[:file] || SourcesFile.default_path()
 
     entries =
@@ -33,14 +33,13 @@ defmodule Mix.Tasks.Rn.Sources do
     # Same boot as rn.seed: Repo + Oban insert path only, no queues, no model.
     Seed.boot()
 
+    result = if opts[:dry_run], do: SourcesFile.plan(entries), else: SourcesFile.apply(entries)
+
     changes =
-      if opts[:dry_run] do
-        SourcesFile.plan(entries)
-      else
-        case SourcesFile.apply(entries) do
-          {:ok, changes} -> changes
-          {:error, reason} -> Mix.raise("could not apply #{path}: #{inspect(reason)}")
-        end
+      case result do
+        {:ok, changes} -> changes
+        {:error, msg} when is_binary(msg) -> Mix.raise("#{path}: #{msg}")
+        {:error, reason} -> Mix.raise("could not apply #{path}: #{inspect(reason)}")
       end
 
     Mix.shell().info(
@@ -52,13 +51,31 @@ defmodule Mix.Tasks.Rn.Sources do
     System.halt(0)
   end
 
+  @doc false
+  @spec parse_args!([binary()]) :: keyword()
+  def parse_args!(args) do
+    case OptionParser.parse(args, strict: @switches) do
+      {opts, [], []} ->
+        opts
+
+      {_, _, [_ | _] = invalid} ->
+        Mix.raise("invalid option(s): #{Enum.map_join(invalid, " ", &format_invalid/1)}")
+
+      {_, positional, []} ->
+        Mix.raise("unexpected argument(s): #{Enum.join(positional, " ")}")
+    end
+  end
+
+  defp format_invalid({switch, nil}), do: switch
+  defp format_invalid({switch, value}), do: "#{switch}=#{value}"
+
   defp describe({:add, e}),
     do: "+ #{e.name} (#{e.identifier})#{if e.active, do: ", first sync", else: ", inactive"}"
 
   defp describe({:update, s, e}) do
     diffs =
       [
-        s.name != e.name && "name #{s.name} -> #{e.name}",
+        s.name != e.name && rename(s, e),
         s.active != e.active && "active #{s.active} -> #{e.active}",
         (e.active and not s.active) && "sync"
       ]
@@ -69,4 +86,11 @@ defmodule Mix.Tasks.Rn.Sources do
 
   defp describe({:deactivate, s}), do: "- #{s.name}: not in file, deactivated (chunks kept)"
   defp describe({:unchanged, s}), do: "= #{s.name}"
+
+  defp rename(s, e) do
+    case SourcesFile.pinned_slug(s, e) do
+      nil -> "name #{s.name} -> #{e.name}"
+      slug -> "name #{s.name} -> #{e.name} (slug #{inspect(slug)} kept)"
+    end
+  end
 end

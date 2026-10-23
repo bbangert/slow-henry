@@ -138,6 +138,109 @@ defmodule RetrievalNode.SourcesFileTest do
     end
   end
 
+  describe "config and slugs" do
+    test "an unchanged entry leaves a source's config intact" do
+      s =
+        Repo.insert!(%Source{
+          source_type: :git_repo,
+          name: "adr",
+          identifier: @url_a,
+          config: %{"mirror_slug" => "adr-old", "other" => 1}
+        })
+
+      {:ok, entries} = SourcesFile.parse(%{"git" => [git("adr", @url_a)]})
+
+      assert {:ok, [{:unchanged, _}]} = SourcesFile.plan(entries)
+      assert {:ok, _} = SourcesFile.apply(entries)
+      assert %{config: %{"mirror_slug" => "adr-old", "other" => 1}} = Repo.get!(Source, s.id)
+    end
+
+    test "renaming pins the old slug, keeping other config" do
+      s =
+        Repo.insert!(%Source{
+          source_type: :git_repo,
+          name: "adr-old",
+          identifier: @url_a,
+          config: %{"other" => 1}
+        })
+
+      {:ok, entries} = SourcesFile.parse(%{"git" => [git("adr", @url_a)]})
+      assert {:ok, _} = SourcesFile.apply(entries)
+
+      assert %{name: "adr", config: %{"mirror_slug" => "adr-old", "other" => 1}} =
+               Repo.get!(Source, s.id)
+    end
+
+    test "renaming leaves an existing mirror_slug alone" do
+      s =
+        Repo.insert!(%Source{
+          source_type: :git_repo,
+          name: "adr-old",
+          identifier: @url_a,
+          config: %{"mirror_slug" => "pinned"}
+        })
+
+      {:ok, entries} = SourcesFile.parse(%{"git" => [git("adr", @url_a)]})
+      assert {:ok, _} = SourcesFile.apply(entries)
+
+      assert %{name: "adr", config: %{"mirror_slug" => "pinned"}} = Repo.get!(Source, s.id)
+    end
+
+    test "an add that reuses an inactive source's slug is rejected" do
+      source!("adr", @url_a, false)
+      {:ok, entries} = SourcesFile.parse(%{"git" => [git("adr", @url_b)]})
+
+      assert {:error, msg} = SourcesFile.plan(entries)
+      assert msg =~ ~s|name "adr" is already the mirror slug of #{@url_a} (inactive)|
+      assert {:error, ^msg} = SourcesFile.apply(entries)
+      refute Repo.get_by(Source, identifier: @url_b)
+    end
+
+    test "changing a url while keeping the name is rejected" do
+      source!("adr", @url_a)
+      {:ok, entries} = SourcesFile.parse(%{"git" => [git("adr", @url_b)]})
+
+      assert {:error, msg} = SourcesFile.plan(entries)
+      assert msg =~ "#{@url_a} (active)"
+      assert %{active: true} = Repo.get_by!(Source, identifier: @url_a)
+    end
+
+    test "an add that reuses a renamed source's pinned slug is rejected" do
+      Repo.insert!(%Source{
+        source_type: :git_repo,
+        name: "adr",
+        identifier: @url_a,
+        config: %{"mirror_slug" => "adr-old"}
+      })
+
+      {:ok, entries} =
+        SourcesFile.parse(%{"git" => [git("adr", @url_a), git("adr-old", @url_b)]})
+
+      assert {:error, "name \"adr-old\" is already the mirror slug of " <> _} =
+               SourcesFile.plan(entries)
+    end
+  end
+
+  describe "Mix.Tasks.Rn.Sources.parse_args!/1" do
+    alias Mix.Tasks.Rn.Sources, as: Task
+
+    test "accepts known switches" do
+      assert [dry_run: true, file: "x.toml"] = Task.parse_args!(["--dry-run", "--file", "x.toml"])
+    end
+
+    test "rejects invalid switches, missing values and positional args" do
+      assert_raise Mix.Error, ~r/invalid option.*--dryrun/, fn ->
+        Task.parse_args!(["--dryrun"])
+      end
+
+      assert_raise Mix.Error, ~r/invalid option.*--file/, fn -> Task.parse_args!(["--file"]) end
+
+      assert_raise Mix.Error, ~r/unexpected argument.*extra/, fn ->
+        Task.parse_args!(["extra"])
+      end
+    end
+  end
+
   defp strip({:deactivate, s}), do: {:deactivate, %{id: s.id}}
   defp strip(other), do: other
 end

@@ -4,10 +4,12 @@
 #
 # Removing an entry deactivates the source (its chunks stay searchable);
 # `active = false` does the same while keeping it listed here.
+# `name` sets the mirror slug + MCP `repo` filter when the source is created;
+# a later rename only changes the display name (the original slug is kept).
 # Format and rules: RetrievalNode.SourcesFile.
 
 [[git]]
-name = "my-repo"                                  # mirror slug + MCP `repo` filter
+name = "my-repo"                                  # display name (slug at creation)
 url = "https://github.com/my-org/my-repo.git"     # clone URL (the source identity)
 
 [[git]]
