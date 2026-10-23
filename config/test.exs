@@ -8,8 +8,9 @@ import Config
 config :retrieval_node, RetrievalNode.Repo,
   username: "postgres",
   password: "postgres",
+  # Always localhost (the devcontainer's Postgres 18 + pgvector), never PGHOST
+  # from .env: tests must not touch a real database. PGPORT still overrides.
   hostname: "localhost",
-  # PostgreSQL 18 + pgvector on the standard port 5432 (see .devcontainer/).
   port: String.to_integer(System.get_env("PGPORT") || "5432"),
   database: "retrieval_node_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,

@@ -2,13 +2,13 @@ import Config
 
 # Configure your database
 config :retrieval_node, RetrievalNode.Repo,
-  username: "postgres",
-  password: "postgres",
-  hostname: "localhost",
-  # PostgreSQL 18 + pgvector, installed and started by the devcontainer on the
-  # standard port 5432 (see .devcontainer/). Override with PGPORT if needed.
+  # Connection comes from the standard libpq PG* variables, loaded from .env by
+  # mise (see .env.example). Defaults hit the devcontainer's local Postgres 18.
+  username: System.get_env("PGUSER") || "postgres",
+  password: System.get_env("PGPASSWORD") || "postgres",
+  hostname: System.get_env("PGHOST") || "localhost",
   port: String.to_integer(System.get_env("PGPORT") || "5432"),
-  database: "retrieval_node_dev",
+  database: System.get_env("PGDATABASE") || "retrieval_node_dev",
   stacktrace: true,
   show_sensitive_data_on_connection_error: true,
   # sync queue (3) + concurrent SourceOwner transactions (one per source
