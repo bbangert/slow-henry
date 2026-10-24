@@ -108,7 +108,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   ### Limits
 
-  The item cap and the symbol-size limit are enforced only in `add_entity/2` and
+  The item cap, the symbol-size limit and storability (no control characters,
+  e.g. a decoded NUL) are enforced only in `add_entity/2` and
   `add_reference/2`, the single emission choke point. The walkers' `at_cap?/1`
   checks are early exits, never the enforcement.
 
@@ -1691,6 +1692,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
        when hi in 0xD800..0xDBFF and lo in 0xDC00..0xDFFF,
        do: join_js_parts(rest, [<<0x10000 + (hi - 0xD800) * 0x400 + (lo - 0xDC00)::utf8>> | acc])
 
+  # An unpaired surrogate or an out-of-range escape: not a valid string value.
+  defp join_js_parts([{:cu, :invalid} | _rest], _acc), do: nil
   defp join_js_parts([{:cu, cu} | _rest], _acc) when cu in 0xD800..0xDFFF, do: nil
   defp join_js_parts([{:cu, cu} | rest], acc), do: join_js_parts(rest, [<<cu::utf8>> | acc])
   defp join_js_parts([part | rest], acc), do: join_js_parts(rest, [part | acc])
@@ -1727,12 +1730,12 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp decode_js_escape("\\" <> char), do: char
 
-  # Out-of-range code points (> U+10FFFF) can't be encoded; treat as a lone
-  # surrogate so the literal is rejected.
+  # Out-of-range code points (> U+10FFFF) can't be encoded: a distinct :invalid
+  # marker that join_js_parts/2 rejects (never a pairable surrogate).
   defp hex(digits) do
     case Integer.parse(digits, 16) do
       {cp, ""} when cp <= 0x10FFFF -> cp
-      _ -> 0xD800
+      _ -> :invalid
     end
   end
 
@@ -1803,14 +1806,25 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp add_entity(acc, %{qualified_name: qname}) when byte_size(qname) > @max_symbol_bytes,
     do: acc
 
-  defp add_entity(acc, entity),
-    do: %{acc | entities: [entity | acc.entities], count: acc.count + 1}
+  defp add_entity(acc, %{qualified_name: qname} = entity) do
+    if storable_name?(qname),
+      do: %{acc | entities: [entity | acc.entities], count: acc.count + 1},
+      else: acc
+  end
 
   defp add_reference(%{count: count} = acc, _reference) when count >= @max_items, do: acc
 
   defp add_reference(acc, %{name: name}) when byte_size(name) > @max_symbol_bytes,
     do: acc
 
-  defp add_reference(acc, reference),
-    do: %{acc | references: [reference | acc.references], count: acc.count + 1}
+  defp add_reference(acc, %{name: name} = reference) do
+    if storable_name?(name),
+      do: %{acc | references: [reference | acc.references], count: acc.count + 1},
+      else: acc
+  end
+
+  # Decoded names can carry control characters (`\x00`, `\0`); NUL can't be
+  # stored in a Postgres text column, and no real symbol contains any C0/C1
+  # control or DEL, so such a name is skipped for every language here.
+  defp storable_name?(name), do: not String.match?(name, ~r/[\x{0}-\x{1F}\x{7F}-\x{9F}]/u)
 end

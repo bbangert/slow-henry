@@ -73,6 +73,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
     assert not String.match?(name, ~r/\s/),
            "#{label}: must not contain whitespace, got #{inspect(name)}"
 
+    assert not String.match?(name, ~r/[\x{0}-\x{1F}\x{7F}-\x{9F}]/u),
+           "#{label}: must not contain control characters, got #{inspect(name)}"
+
     for {desc, bad} <- forbidden do
       assert not String.contains?(name, bad),
              "#{label}: must not contain #{desc}, got #{inspect(name)}"
@@ -1345,6 +1348,24 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
         %{entities: e} = extract(src, lang)
         assert e |> Enum.map(& &1.qualified_name) |> Enum.sort() == ["C", "C.\u{1D49C}"]
       end
+    end
+
+    test "js/ts: decoded NULs and out-of-range escapes never become names" do
+      for lang <- ["javascript", "typescript"] do
+        src = ~S"""
+        import "pkg\x00";
+        import "ok";
+        class C { "a\u{110000}\uDC00"() {} "\u{10000}"() {} }
+        """
+
+        %{entities: e, references: r} = extract(src, lang)
+        assert for(%{kind: :import, name: n} <- r, do: n) == ["ok"]
+        # The out-of-range escape is rejected, not turned into a valid U+10000.
+        refute find(e, "C.a\u{10000}")
+      end
+
+      %{entities: e} = extract(~S|declare module "m\0x" { export function f() {} }|, "typescript")
+      refute Enum.any?(e, &String.contains?(&1.qualified_name, <<0>>))
     end
 
     test "javascript: legacy octal escapes decode with ECMAScript digit limits" do
