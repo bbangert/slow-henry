@@ -112,6 +112,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     },
     "rust" => %{
       "function_item" => :function_like,
+      "function_signature_item" => :function_like,
       "struct_item" => :class_like,
       "enum_item" => :class_like,
       "trait_item" => :class_like,
@@ -161,7 +162,14 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     import_kinds = Map.get(@import_kinds, language, [])
     lang_ctx = %{def_kinds: def_kinds, call_kind: call_kind, import_kinds: import_kinds}
 
-    state = %{scope: [], container_kind: nil, enclosing_qname: nil, class_qname: nil}
+    state = %{
+      scope: [],
+      container_kind: nil,
+      enclosing_qname: nil,
+      class_qname: nil,
+      self_name: nil
+    }
+
     acc = %{entities: [], references: [], count: 0}
 
     acc = walk(root, source, language, lang_ctx, state, acc)
@@ -199,10 +207,21 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       kind in lang_ctx.import_kinds ->
         handle_import(child, source, language, state, acc)
 
+      this_rebinding?(language, kind) ->
+        walk(child, source, language, lang_ctx, %{state | class_qname: nil}, acc)
+
       true ->
         walk(child, source, language, lang_ctx, state, acc)
     end
   end
+
+  # Ordinary js/ts functions bind their own `this`; arrow functions inherit
+  # it lexically, so only the former drop the enclosing class receiver.
+  defp this_rebinding?(language, kind) when language in ["javascript", "typescript"],
+    do:
+      kind in ~w(function_declaration generator_function_declaration function_expression generator_function)
+
+  defp this_rebinding?(_language, _kind), do: false
 
   defp maybe_walk(acc, child, source, language, lang_ctx, state) do
     if at_cap?(acc), do: acc, else: walk(child, source, language, lang_ctx, state, acc)
@@ -335,6 +354,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
           end
       end
 
+    # Trait-qualified scope names the definitions, but `self.x()` resolves to
+    # the impl's TYPE, where the inherent members live.
+    state = %{state | self_name: type_name}
     handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
   end
 
@@ -434,7 +456,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
           entity = %{qualified_name: qname, kind: entity_kind, line: line(child)}
 
           class_qname =
-            if category in [:class_like, :module_like], do: qname, else: state.class_qname
+            if category in [:class_like, :module_like],
+              do: Enum.join(state.scope ++ [state.self_name || name], "."),
+              else: state.class_qname
 
           {state.scope ++ [name], qname, class_qname, add_entity(acc, entity)}
       end
@@ -446,7 +470,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         scope: new_scope,
         container_kind: category,
         enclosing_qname: new_enclosing_qname,
-        class_qname: new_class_qname
+        class_qname:
+          if(this_rebinding?(language, TS.node_kind(child)), do: nil, else: new_class_qname),
+        self_name: nil
       }
 
       walk_definition_body(child, category, language, source, lang_ctx, new_state, acc)
@@ -526,7 +552,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp callee_name(call_node, source, "rust") do
-    with fn_node when not is_nil(fn_node) <- TS.node_child_by_field_name(call_node, "function") do
+    with fn_node when not is_nil(fn_node) <- TS.node_child_by_field_name(call_node, "function"),
+         fn_node <- rust_unwrap_generic_callee(fn_node) do
       if TS.node_kind(fn_node) == "field_expression" do
         rust_field_expression_callee(fn_node, source)
       else
@@ -560,6 +587,17 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp callee_name(_call_node, _source, _language), do: nil
+
+  # `parse::<u32>()` / `self.helper::<u32>()`: the callee is a
+  # `generic_function` wrapping the real callee in its "function" field.
+  defp rust_unwrap_generic_callee(fn_node) do
+    with "generic_function" <- TS.node_kind(fn_node),
+         inner when not is_nil(inner) <- TS.node_child_by_field_name(fn_node, "function") do
+      rust_unwrap_generic_callee(inner)
+    else
+      _ -> fn_node
+    end
+  end
 
   defp rust_field_expression_callee(fn_node, source) do
     self? =
@@ -903,7 +941,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end)
   end
 
-  defp strip_quotes(text), do: text |> String.trim() |> String.trim("\"") |> String.trim("'")
+  defp strip_quotes(text),
+    do: text |> String.trim() |> String.trim("\"") |> String.trim("'") |> String.trim("`")
 
   # --- shared node/accumulator helpers ---------------------------------
 
@@ -975,7 +1014,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp name_field(node, "rust", "impl_item", source) do
     case TS.node_child_by_field_name(node, "type") do
       nil -> nil
-      type_node -> slice(source, type_node)
+      type_node -> type_node |> rust_base_type_node() |> then(&slice(source, &1))
     end
   end
 
@@ -983,6 +1022,16 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     case TS.node_child_by_field_name(node, "name") do
       nil -> nil
       name_node -> slice(source, name_node)
+    end
+  end
+
+  # `Foo<T>` -> `Foo`: type arguments are not part of a symbol's identity.
+  defp rust_base_type_node(type_node) do
+    with "generic_type" <- TS.node_kind(type_node),
+         inner when not is_nil(inner) <- TS.node_child_by_field_name(type_node, "type") do
+      inner
+    else
+      _ -> type_node
     end
   end
 

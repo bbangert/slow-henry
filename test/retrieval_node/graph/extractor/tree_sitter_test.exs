@@ -143,6 +143,28 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
                Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
     end
 
+    test "nested function rebinds this (bare callee); nested arrow inherits it" do
+      %{references: refs} =
+        extract(
+          """
+          class C {
+            m(other) {
+              function cb() { this.helper(); }
+              const arrow = () => { this.viaArrow(); };
+              const fe = function () { this.viaExpr(); };
+              cb.call(other);
+            }
+          }
+          """,
+          "javascript"
+        )
+
+      names = refs |> Enum.filter(&(&1.kind == :call)) |> Enum.map(& &1.name)
+      assert "helper" in names
+      assert "viaExpr" in names
+      assert "C.viaArrow" in names
+    end
+
     test "import: source string with quotes stripped" do
       %{references: refs} = extract(@src, "javascript")
 
@@ -263,6 +285,12 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
         )
 
       assert %{qualified_name: "P.Run", kind: :method} = find(entities, "P.Run")
+    end
+
+    test "import: raw-string (backtick) path stripped" do
+      %{references: refs} = extract("package main\n\nimport `fmt`\n", "go")
+
+      assert Enum.any?(refs, &(&1.kind == :import and &1.name == "fmt"))
     end
 
     test "grouped type declaration: each type_spec is its own entity, not just the first" do
@@ -634,8 +662,53 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       assert %{qualified_name: "Foo", kind: :class} = find(entities, "Foo")
       assert %{qualified_name: "Foo.helper", kind: :method} = find(entities, "Foo.helper")
 
-      assert %{name: "Foo.Display.helper", kind: :call, from: "Foo.Display.fmt"} =
-               Enum.find(refs, &(&1.kind == :call and &1.name == "Foo.Display.helper"))
+      # self-receiver resolves to the impl's TYPE, where inherent methods live
+      assert %{name: "Foo.helper", kind: :call, from: "Foo.Display.fmt"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "Foo.helper"))
+    end
+
+    test "bodyless trait method signatures are method entities under the trait" do
+      %{entities: entities} = extract("trait Worker { fn run(&self); }\n", "rust")
+
+      assert %{qualified_name: "Worker", kind: :class} = find(entities, "Worker")
+      assert %{qualified_name: "Worker.run", kind: :method} = find(entities, "Worker.run")
+    end
+
+    test "turbofish calls unwrap the generic callee: free function and self method" do
+      %{references: refs} =
+        extract(
+          """
+          impl Foo {
+              fn run(&self) {
+                  let n = parse::<u32>();
+                  self.helper::<u32>();
+              }
+          }
+          """,
+          "rust"
+        )
+
+      names = refs |> Enum.filter(&(&1.kind == :call)) |> Enum.map(& &1.name) |> Enum.sort()
+      assert names == ["Foo.helper", "parse"]
+    end
+
+    test "generic impl blocks with differently named params share one symbol identity" do
+      %{entities: entities, references: refs} =
+        extract(
+          """
+          impl<T> Foo<T> {
+              fn run(&self) { self.helper(); }
+          }
+
+          impl<U> Foo<U> {
+              fn helper(&self) {}
+          }
+          """,
+          "rust"
+        )
+
+      assert find(entities, "Foo.helper")
+      assert Enum.any?(refs, &(&1.kind == :call and &1.name == "Foo.helper"))
     end
   end
 
