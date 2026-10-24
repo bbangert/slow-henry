@@ -41,20 +41,22 @@ defmodule Mix.Tasks.Rn.RerankEval do
   @impl Mix.Task
   def run(args) do
     Mix.Task.run("app.config")
-    # This VM boots with its normal (non-empty) Oban queues config, so
-    # Ingest.Supervisor would otherwise start Ingest.SourceOwner processes —
-    # this task has no reason to become a second writer for a source the dev
-    # server already owns.
+    # This task must never become a second ingest writer next to the dev server,
+    # nor have sync jobs compete with the models while latency is measured. So,
+    # like `Rn.Seed.boot/0`, Oban starts with no queues and no plugins: this VM
+    # can insert jobs but never claims one (a post-start pause would leave a
+    # window where a sync job is claimed and starts a competing SourceOwner).
+    # Boot resume is off for the same single-writer reason.
+    oban_config = Application.get_env(:retrieval_node, Oban, [])
+
+    Application.put_env(
+      :retrieval_node,
+      Oban,
+      Keyword.merge(oban_config, queues: [], plugins: [])
+    )
+
     Application.put_env(:retrieval_node, :ingest_resume_on_boot, false)
     {:ok, _} = Application.ensure_all_started(:retrieval_node)
-
-    # This node's cron-driven sync jobs (RepoSync/JiraSync/DriveSync, plus
-    # embed/reindex workers they enqueue) must not compete with the model
-    # processes for CPU/GPU while we're measuring latency. `local_only:` is
-    # load-bearing: the default broadcasts the pause through the shared-DB
-    # notifier to EVERY connected node — it would silently pause the long-lived
-    # dev server's queues too, and they'd stay paused until that node restarts.
-    Oban.pause_all_queues(local_only: true)
 
     {opts, _rest} =
       OptionParser.parse!(args, strict: [queries: :string, top_k: :integer])

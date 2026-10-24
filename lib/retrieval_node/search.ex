@@ -34,7 +34,8 @@ defmodule RetrievalNode.Search do
     * `:rerank` — boolean; defaults from config `:rerank_default` (currently
       `false`). When true, runs the funnel: fetch a candidate pool of
       `max(rerank_candidates(), top_k)` (config `:rerank_candidates`, default
-      50) via RRF, load their `content`, score each with
+      50) via RRF — capped at `HybridQuery`'s 100-row maximum, which also
+      bounds the cross-encoder's per-query work — load their `content`, score each with
       `Reranking.rerank_scores/2`, and return only the top `:top_k` by *rerank*
       score. Rerank scores are raw cross-encoder logits, not RRF scores — a
       caller comparing scores across rerank on/off must use `:fused_score`
@@ -54,7 +55,7 @@ defmodule RetrievalNode.Search do
     rerank? =
       Keyword.get(opts, :rerank, Application.get_env(:retrieval_node, :rerank_default, false))
 
-    query_top_k = if rerank?, do: max(rerank_candidates(), top_k), else: top_k
+    query_top_k = if rerank?, do: candidate_pool(top_k), else: top_k
 
     query_opts =
       opts
@@ -69,6 +70,13 @@ defmodule RetrievalNode.Search do
       Enum.map(rows, &to_hit/1)
     end
   end
+
+  @doc false
+  # The RRF pool fed to the cross-encoder: at least `top_k`, explicitly capped at
+  # HybridQuery's maximum (a larger `:rerank_candidates` is not silently passed
+  # through only to be clamped inside the query). Public for SearchTest.
+  @spec candidate_pool(pos_integer()) :: pos_integer()
+  def candidate_pool(top_k), do: HybridQuery.clamp_top_k(max(rerank_candidates(), top_k))
 
   defp rerank_candidates, do: Application.get_env(:retrieval_node, :rerank_candidates, 50)
 

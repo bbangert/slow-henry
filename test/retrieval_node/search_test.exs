@@ -45,6 +45,22 @@ defmodule RetrievalNode.SearchTest do
     :ok
   end
 
+  describe "candidate_pool/1" do
+    setup do
+      original = Application.get_env(:retrieval_node, :rerank_candidates)
+      on_exit(fn -> Application.put_env(:retrieval_node, :rerank_candidates, original) end)
+    end
+
+    test "is at least top_k and at most HybridQuery's 100-row maximum" do
+      Application.put_env(:retrieval_node, :rerank_candidates, 50)
+      assert Search.candidate_pool(10) == 50
+      assert Search.candidate_pool(80) == 80
+
+      Application.put_env(:retrieval_node, :rerank_candidates, 200)
+      assert Search.candidate_pool(20) == 100
+    end
+  end
+
   describe "score_and_rank/4" do
     test "returns [] without calling the reranker when every candidate's content vanished" do
       # `rows` is non-empty (as it always is at the real call site — rows and

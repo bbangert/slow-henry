@@ -104,7 +104,8 @@ config :retrieval_node, RetrievalNode.Reranking.Serving,
 
 # Query-time reranking defaults OFF; callers opt in per request. `rerank_candidates`
 # is the RRF candidate pool size fed into the cross-encoder — roughly the
-# reranker's practical latency budget in one `batched_run/2` call.
+# reranker's practical latency budget in one `batched_run/2` call. The pool is
+# capped at 100 (HybridQuery's row maximum); larger values have no effect.
 config :retrieval_node, rerank_default: false, rerank_candidates: 50
 
 # EXLA as the global Nx default backend — without this, any tensor op NOT
