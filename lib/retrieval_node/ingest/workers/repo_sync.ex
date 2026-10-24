@@ -43,6 +43,23 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
       (mirror missing, timeout) is a different reason and still propagates.
 
   `unique` on `source_id` collapses overlapping cron/webhook triggers for one repo.
+
+  ## `args["full"]` — graph backfill
+
+  `"full" => true` (enqueued by `Ingest.force_full_resync_git_sources/0,1`)
+  diffs `HEAD` against nil regardless of the stored cursor, so EVERY file in the
+  repo is staged, each row tagged `force: true` (re-chunk/re-extract even
+  though the content hash is unchanged; `FileIngest` reuses embeddings, so
+  this is cheap). The watermark still advances to `HEAD`. A full job never
+  short-circuits on `new_sha == last_sha`. The eligibility guard, the
+  binary/generated/oversized skip rules and the unreadable-file handling all
+  apply unchanged.
+
+  The `unique` above is deliberately NOT keyed on `full`: a full sync is still
+  the sole active sync for its source. `force_full_resync_git_sources` therefore
+  inserts with `replace: [args: ...]` for the waiting states, upgrading a queued
+  plain job to a full one in place; an `executing` job can't be replaced, so
+  that source is reported busy and the backfill is re-run once it finishes.
   """
   use Oban.Worker,
     queue: :sync,
@@ -79,21 +96,21 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   }
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"source_id" => source_id}}) do
+  def perform(%Oban.Job{args: %{"source_id" => source_id} = args}) do
     source = Repo.get!(Source, source_id)
 
     if Source.syncable?(source) do
-      sync(source)
+      sync(source, Map.get(args, "full", false))
     else
       Logger.info("source=#{source.name} not syncable (inactive or denied); cancelling sync")
       {:cancel, :ineligible}
     end
   end
 
-  defp sync(%Source{id: source_id} = source) do
+  defp sync(%Source{id: source_id} = source, full?) do
     sync_state = get_or_create_sync_state(source_id)
     slug = repo_slug(source)
-    last_sha = Map.get(sync_state.cursor || %{}, "last_sha")
+    last_sha = unless full?, do: Map.get(sync_state.cursor || %{}, "last_sha")
 
     with {:ok, _path} <- GitMirror.ensure_mirror(slug, source.identifier),
          {:ok, new_sha} <- GitMirror.head_sha(slug) do
@@ -106,7 +123,7 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
         SourceOwner.notify(source.id)
         :ok
       else
-        sync_changes(source, slug, last_sha, new_sha, sync_state)
+        sync_changes(source, slug, last_sha, new_sha, sync_state, full?)
       end
     else
       {:error, :empty_repo} ->
@@ -118,7 +135,7 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
     end
   end
 
-  defp sync_changes(source, slug, last_sha, new_sha, sync_state) do
+  defp sync_changes(source, slug, last_sha, new_sha, sync_state, full?) do
     with {:ok, entries} <- GitMirror.changed_entries(slug, last_sha, new_sha) do
       # Deletions come from the diff status, NOT from probing `show` — a file that
       # still exists but is unreadable ({:error, :file_too_large}) must be skipped,
@@ -129,7 +146,7 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
         Enum.map(deleted, fn {_status, path} -> deletion_row(source, slug, path) end)
 
       with {:ok, content_rows} <-
-             build_rows(source, slug, Enum.map(present, &elem(&1, 1)), new_sha) do
+             build_rows(source, slug, Enum.map(present, &elem(&1, 1)), new_sha, full?) do
         stage_and_advance(source, sync_state, new_sha, deletion_rows ++ content_rows)
       end
     end
@@ -192,9 +209,9 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   # file forever. Known non-indexable/deterministic-per-file cases are skipped
   # instead — the file exists (or, for a gitlink that slipped through, "exists"
   # in a sense `show` can't read), there's nothing a retry would fix.
-  defp build_rows(source, slug, paths, new_sha) do
+  defp build_rows(source, slug, paths, new_sha, full?) do
     Enum.reduce_while(paths, {:ok, []}, fn path, {:ok, acc} ->
-      case raw_row(source, slug, path, new_sha) do
+      case raw_row(source, slug, path, new_sha, full?) do
         {:ok, row} -> {:cont, {:ok, [row | acc]}}
         :skip -> {:cont, {:ok, acc}}
         {:error, reason} -> {:halt, {:error, {path, reason}}}
@@ -220,7 +237,7 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
       not String.ends_with?(base, @skip_suffixes)
   end
 
-  defp raw_row(source, slug, path, new_sha) do
+  defp raw_row(source, slug, path, new_sha, full?) do
     case GitMirror.show(slug, path, new_sha) do
       {:ok, content} ->
         if Chunking.binary_content?(content) or not indexable?(path, content) do
@@ -239,7 +256,8 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
              natural_key: "repo:#{source.id}:#{path}",
              content_hash: sha256(content),
              raw_content: content,
-             metadata: %{"path" => path, "ref" => new_sha}
+             metadata: %{"path" => path, "ref" => new_sha},
+             force: full?
            }}
         end
 

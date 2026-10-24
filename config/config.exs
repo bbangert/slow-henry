@@ -60,7 +60,8 @@ config :retrieval_node, Oban,
      crontab: [
        {"*/15 * * * *", RetrievalNode.Ingest.Workers.SyncScheduler, args: %{"kind" => "git"}},
        {"0 * * * *", RetrievalNode.Ingest.Workers.SyncScheduler, args: %{"kind" => "jira"}},
-       {"*/30 * * * *", RetrievalNode.Ingest.Workers.SyncScheduler, args: %{"kind" => "drive"}}
+       {"*/30 * * * *", RetrievalNode.Ingest.Workers.SyncScheduler, args: %{"kind" => "drive"}},
+       {"30 4 * * *", RetrievalNode.Ingest.Workers.GraphGc}
      ]}
   ]
 

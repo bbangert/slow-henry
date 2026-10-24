@@ -342,4 +342,79 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     state = Repo.get_by!(SyncState, source_id: ctx.source.id)
     assert state.cursor["last_sha"] == head
   end
+
+  describe "full: true (graph backfill)" do
+    test "stages every file with force: true even when HEAD is unchanged, cursor still advances",
+         ctx do
+      commit(ctx.src, [{"a.py", "def a(): pass\n"}, {"b.py", "def b(): pass\n"}])
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+      Repo.delete_all(PendingChunk)
+
+      head = String.trim(git!(ctx.src, ["rev-parse", "HEAD"]))
+      assert Repo.get_by!(SyncState, source_id: ctx.source.id).cursor["last_sha"] == head
+
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id, "full" => true})
+
+      raws = Repo.all(from p in PendingChunk, where: p.status == "raw")
+
+      assert Enum.sort(Enum.map(raws, & &1.natural_key)) ==
+               ["repo:#{ctx.source.id}:a.py", "repo:#{ctx.source.id}:b.py"]
+
+      assert Enum.all?(raws, & &1.force)
+      assert Repo.get_by!(SyncState, source_id: ctx.source.id).cursor["last_sha"] == head
+    end
+
+    test "a plain sync stages with force: false", ctx do
+      commit(ctx.src, [{"a.py", "def a(): pass\n"}])
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+      assert [%PendingChunk{force: false}] = Repo.all(PendingChunk)
+    end
+
+    test "ignores a stale cursor and re-stages files unchanged since it, advancing it to HEAD",
+         ctx do
+      commit(ctx.src, [{"a.py", "def a(): pass\n"}])
+      first = String.trim(git!(ctx.src, ["rev-parse", "HEAD"]))
+      commit(ctx.src, [{"b.py", "def b(): pass\n"}])
+      head = String.trim(git!(ctx.src, ["rev-parse", "HEAD"]))
+
+      Repo.insert!(%SyncState{source_id: ctx.source.id, cursor: %{"last_sha" => first}})
+
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id, "full" => true})
+
+      assert Repo.all(from p in PendingChunk, select: p.natural_key) |> Enum.sort() ==
+               ["repo:#{ctx.source.id}:a.py", "repo:#{ctx.source.id}:b.py"]
+
+      assert Repo.get_by!(SyncState, source_id: ctx.source.id).cursor["last_sha"] == head
+    end
+
+    test "still applies the generated-file skip rule", ctx do
+      commit(ctx.src, [{"a.py", "def a(): pass\n"}, {"mix.lock", "%{}\n"}])
+
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id, "full" => true})
+
+      statuses = Map.new(Repo.all(PendingChunk), &{&1.natural_key, &1.status})
+
+      assert statuses == %{
+               "repo:#{ctx.source.id}:a.py" => "raw",
+               "repo:#{ctx.source.id}:mix.lock" => "deleted"
+             }
+    end
+
+    for {label, attrs} <- [inactive: %{active: false}, denied: %{policy: :deny}] do
+      test "a #{label} source is cancelled — nothing staged, cursor untouched", ctx do
+        commit(ctx.src, [{"a.py", "def a(): pass\n"}])
+
+        ctx.source
+        |> Ecto.Changeset.change(Map.to_list(unquote(Macro.escape(attrs))))
+        |> Repo.update!()
+
+        assert {:cancel, :ineligible} =
+                 perform_job(RepoSync, %{"source_id" => ctx.source.id, "full" => true})
+
+        assert Repo.aggregate(PendingChunk, :count, :id) == 0
+        assert Repo.get_by(SyncState, source_id: ctx.source.id) == nil
+      end
+    end
+  end
 end

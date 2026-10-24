@@ -14,8 +14,15 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   costs regular-scheduler fairness, and no in-VM guard catches a C-level segfault
   — that's the peer-node escape hatch's job, deferred to v1.1.
 
-  v1 covers the mainstream code languages; Elixir/HEEx/EEx fall through to the
-  heuristic chunker until the native-AST Elixir path lands (fast-follow).
+  v1 covers the mainstream code languages plus Elixir; HEEx/EEx fall through to
+  the heuristic chunker until their native-AST path lands (fast-follow).
+
+  Elixir is the one language here whose grammar has no fixed boundary-kind
+  set: `defmodule`/`def`/`defp`/... all parse as a bare `call` node (target:
+  identifier), so `chunk_boundary?/4` special-cases it with a predicate
+  (target text in `@elixir_def_forms`) instead of a kind-set lookup. The form
+  set and name canonicalisation (`defdelegate`, `Elixir.Foo` -> `Foo`) match
+  `Graph.Extractor.TreeSitter`, so chunk breadcrumbs agree with entity names.
   """
 
   @behaviour RetrievalNode.Chunking
@@ -32,12 +39,20 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   # to the tree in Phase 8; until then only tests use it (via start_supervised!).
   @supervisor RetrievalNode.ChunkTaskSupervisor
 
-  @allowed_languages ~w(python javascript typescript go rust ruby java)
+  @allowed_languages ~w(python javascript typescript go rust ruby java elixir)
+
+  # Elixir def-family forms that mark a chunk boundary when they're a `call`
+  # node's target identifier. defmodule/defprotocol/defimpl are containers
+  # (their do_block holds nested defs); the rest are leaf-most function chunks.
+  @elixir_module_forms ~w(defmodule defprotocol defimpl)
+  @elixir_function_forms ~w(def defp defmacro defmacrop defguard defguardp defdelegate)
+  @elixir_def_forms @elixir_module_forms ++ @elixir_function_forms
 
   # Node kinds that mark a chunk boundary, per language. A node is emitted as a
   # chunk only if it has no chunkable descendants (leaf-most def); a container
   # (e.g. a class) yields its members instead, with the container name in the
-  # breadcrumb — so methods are chunks scoped as "Class > method".
+  # breadcrumb — so methods are chunks scoped as "Class > method". Elixir has
+  # no entry here — see `chunk_boundary?/4`.
   @chunk_kinds %{
     "python" => ~w(function_definition class_definition),
     "javascript" =>
@@ -168,7 +183,7 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   end
 
   defp extract(node, source, language, scope) do
-    kinds = Map.fetch!(@chunk_kinds, language)
+    kinds = Map.get(@chunk_kinds, language, [])
 
     node
     |> named_children()
@@ -176,13 +191,30 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   end
 
   defp extract_child(child, source, language, scope, kinds) do
-    kind = TS.node_kind(child)
-
-    if kind in kinds do
-      emit_or_recurse(child, source, language, scope, kind)
+    if chunk_boundary?(child, source, language, kinds) do
+      emit_or_recurse(child, source, language, scope, TS.node_kind(child))
     else
       # Non-chunkable wrapper (block/body/decorator): descend, keep scope.
       extract(child, source, language, scope)
+    end
+  end
+
+  # Elixir has no fixed boundary-kind set (see moduledoc): every construct is
+  # a `call` node discriminated by its target identifier's text.
+  defp chunk_boundary?(child, source, "elixir", _kinds) do
+    TS.node_kind(child) == "call" and elixir_def_form?(child, source)
+  end
+
+  defp chunk_boundary?(child, _source, _language, kinds), do: TS.node_kind(child) in kinds
+
+  defp elixir_def_form?(call_node, source) do
+    case TS.node_child_by_field_name(call_node, "target") do
+      nil ->
+        false
+
+      target_node ->
+        TS.node_kind(target_node) == "identifier" and
+          slice(source, target_node) in @elixir_def_forms
     end
   end
 
@@ -221,10 +253,91 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
     end
   end
 
+  # Elixir boundary nodes are always kind "call"; every other language's
+  # boundary kinds carry a "name" field directly.
   defp node_name(node, source) do
+    case TS.node_kind(node) do
+      "call" -> elixir_call_name(node, source) || "call"
+      _ -> generic_node_name(node, source)
+    end
+  end
+
+  defp generic_node_name(node, source) do
     case TS.node_child_by_field_name(node, "name") do
       nil -> TS.node_kind(node)
       name_node -> slice(source, name_node)
+    end
+  end
+
+  defp elixir_call_name(call_node, source) do
+    case TS.node_child_by_field_name(call_node, "target") do
+      nil ->
+        nil
+
+      target_node ->
+        case slice(source, target_node) do
+          t when t in @elixir_module_forms -> elixir_module_name(call_node, source)
+          t when t in @elixir_function_forms -> elixir_def_name(call_node, source)
+          _ -> nil
+        end
+    end
+  end
+
+  # defmodule/defprotocol/defimpl name from the first `alias` among their
+  # arguments — `defimpl Sized, for: MyStruct` has a second alias, but it is
+  # nested under the keyword list, not a direct child of `arguments`. The
+  # absolute `Elixir.Foo` form is canonicalised to `Foo`, as in the extractor.
+  defp elixir_module_name(call_node, source) do
+    with args_node when not is_nil(args_node) <- elixir_arguments_node(call_node),
+         alias_node when not is_nil(alias_node) <-
+           args_node |> named_children() |> Enum.find(&(TS.node_kind(&1) == "alias")) do
+      case slice(source, alias_node) do
+        "Elixir." <> rest -> rest
+        name -> name
+      end
+    end
+  end
+
+  # def-family name from the first argument, in one of three shapes: a bare
+  # identifier (zero-arity no-paren def), a nested `call` (the common
+  # `def name(...)` case), or a `binary_operator` (a `when`-guard clause)
+  # whose `left:` is the name-call.
+  defp elixir_def_name(call_node, source) do
+    with args_node when not is_nil(args_node) <- elixir_arguments_node(call_node),
+         [first | _] <- named_children(args_node) do
+      elixir_def_name_from(first, source)
+    else
+      _ -> nil
+    end
+  end
+
+  # `arguments` is a plain positional child in this grammar, NOT reachable via
+  # `node_child_by_field_name` — find it by kind among the call's named children.
+  defp elixir_arguments_node(call_node) do
+    call_node
+    |> named_children()
+    |> Enum.find(&(TS.node_kind(&1) == "arguments"))
+  end
+
+  defp elixir_def_name_from(node, source) do
+    case TS.node_kind(node) do
+      "call" ->
+        case TS.node_child_by_field_name(node, "target") do
+          nil -> nil
+          target_node -> slice(source, target_node)
+        end
+
+      "identifier" ->
+        slice(source, node)
+
+      "binary_operator" ->
+        case TS.node_child_by_field_name(node, "left") do
+          nil -> nil
+          left_node -> elixir_def_name_from(left_node, source)
+        end
+
+      _ ->
+        nil
     end
   end
 

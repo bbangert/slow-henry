@@ -9,8 +9,11 @@ defmodule RetrievalNode.Ingest do
   """
   import Ecto.Query
 
+  alias RetrievalNode.Graph.{Entity, EntityEdge, EntityMention}
+  alias RetrievalNode.Ingest.PendingChunks
+  alias RetrievalNode.Ingest.Workers.RepoSync
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.{Chunk, Source}
+  alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source}
 
   @type repo_entry :: %{
           repo: String.t(),
@@ -62,6 +65,153 @@ defmodule RetrievalNode.Ingest do
 
   defp entry(%Source{} = s),
     do: %{repo: s.name, source_type: to_string(s.source_type), default_ref: nil}
+
+  @type resync_summary :: %{
+          enqueued: non_neg_integer(),
+          upgraded: non_neg_integer(),
+          busy: [Source.t()]
+        }
+
+  @doc """
+  Forces a full re-derive of every active, syncable git source by enqueueing a
+  `RepoSync` job with `"full" => true` for each. `RepoSync` diffs against nil
+  regardless of the stored cursor (see its moduledoc): it stages every file,
+  tagged `force: true`, and still advances the watermark to `HEAD`. This is how
+  newly added graph extraction (entities/mentions/edges) backfills onto a corpus
+  ingested before it existed; `FileIngest` reuses embeddings wherever
+  `(chunk_key, content_hash)` matches, so the re-derive is cheap.
+
+  Only sources passing `Source.syncable?/1` (active, `policy: :allow`) are
+  enqueued; inactive, denied and non-git sources are left alone.
+
+  `RepoSync` is unique per source for its whole active lifetime (sole active sync),
+  so a full job can never run alongside a plain one. Each source's outcome
+  therefore depends on any conflicting job:
+
+    * `:enqueued` — no active sync existed; a new full job was inserted.
+    * `:upgraded` — a plain sync still waiting (`available`/`scheduled`/`retryable`)
+      had its args replaced with the full args.
+    * `:busy` — a sync is `executing` (or suspended) and cannot be replaced; no
+      full job was inserted. Re-running after it finishes enqueues the full sync.
+  """
+  @spec force_full_resync_git_sources() :: {:ok, resync_summary()} | {:error, term()}
+  def force_full_resync_git_sources, do: force_full_resync_git_sources(:all)
+
+  @doc """
+  Like `force_full_resync_git_sources/0`, scoped to specific sources. Each entry
+  is matched against a syncable git source's `name` OR `identifier`; any entry
+  that matches none is reported as `{:error, {:unknown_sources, unmatched}}` and
+  nothing is enqueued, so a typo never resyncs a partial set.
+  """
+  @spec force_full_resync_git_sources(:all | [String.t()]) ::
+          {:ok, resync_summary()} | {:error, {:unknown_sources, [String.t()]}} | {:error, term()}
+  def force_full_resync_git_sources(:all), do: resync_sources(syncable_git_sources())
+
+  def force_full_resync_git_sources(names_or_identifiers) when is_list(names_or_identifiers) do
+    sources = syncable_git_sources()
+
+    matched =
+      Enum.filter(
+        sources,
+        &(&1.name in names_or_identifiers or &1.identifier in names_or_identifiers)
+      )
+
+    unknown =
+      Enum.reject(names_or_identifiers, fn key ->
+        Enum.any?(sources, &(&1.name == key or &1.identifier == key))
+      end)
+
+    if unknown == [], do: resync_sources(matched), else: {:error, {:unknown_sources, unknown}}
+  end
+
+  defp syncable_git_sources do
+    Source
+    |> where([s], s.source_type == :git_repo and s.active == true and s.policy == :allow)
+    |> Repo.all()
+  end
+
+  @waiting_states ~w(available scheduled retryable)
+
+  # `replace: [args: ...]` for the waiting states only: a conflicting job that
+  # is still queued is upgraded in place (Oban returns it with `conflict?`),
+  # while one already executing keeps its args and is reported busy.
+  defp resync_sources(sources) do
+    Enum.reduce_while(sources, {:ok, %{enqueued: 0, upgraded: 0, busy: []}}, fn source,
+                                                                                {:ok, acc} ->
+      job =
+        RepoSync.new(%{"source_id" => source.id, "full" => true},
+          replace: Enum.map(@waiting_states, &{String.to_existing_atom(&1), [:args]})
+        )
+
+      case Oban.insert(job) do
+        {:ok, %Oban.Job{conflict?: false}} ->
+          {:cont, {:ok, Map.update!(acc, :enqueued, &(&1 + 1))}}
+
+        {:ok, %Oban.Job{state: state}} when state in @waiting_states ->
+          {:cont, {:ok, Map.update!(acc, :upgraded, &(&1 + 1))}}
+
+        {:ok, %Oban.Job{}} ->
+          {:cont, {:ok, Map.update!(acc, :busy, &(&1 ++ [source]))}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  @doc """
+  Read-only snapshot of backfill progress: `pending_chunks` counts by status,
+  in-flight `oban_jobs` counts by queue and state, corpus-wide `graph` totals,
+  `failed_files` (`PendingChunks.failed_count/0`) and `owners` (how many
+  `SourceOwner` processes are registered on THIS VM — 0 on a short-lived admin
+  task's own boot). Used by `mix rn.graph.backfill --status`.
+  """
+  @spec backfill_status() :: %{
+          pending_chunks: %{atom() => non_neg_integer()},
+          oban_jobs: %{String.t() => %{String.t() => non_neg_integer()}},
+          graph: %{atom() => non_neg_integer()},
+          failed_files: non_neg_integer(),
+          owners: non_neg_integer()
+        }
+  def backfill_status do
+    %{
+      pending_chunks: pending_chunk_counts_by_status(),
+      oban_jobs: oban_job_counts_by_queue_and_state(),
+      graph: graph_totals(),
+      failed_files: PendingChunks.failed_count(),
+      owners: Registry.count(RetrievalNode.Ingest.SourceRegistry)
+    }
+  end
+
+  defp pending_chunk_counts_by_status do
+    PendingChunk
+    |> group_by([p], p.status)
+    |> select([p], {p.status, count(p.id)})
+    |> Repo.all()
+    |> Map.new()
+  end
+
+  @in_flight_states ~w(available scheduled executing retryable)
+
+  defp oban_job_counts_by_queue_and_state do
+    Oban.Job
+    |> where([j], j.state in @in_flight_states)
+    |> group_by([j], [j.queue, j.state])
+    |> select([j], {j.queue, j.state, count(j.id)})
+    |> Repo.all()
+    |> Enum.reduce(%{}, fn {queue, state, count}, acc ->
+      Map.update(acc, queue, %{state => count}, &Map.put(&1, state, count))
+    end)
+  end
+
+  defp graph_totals do
+    %{
+      entities: Repo.aggregate(Entity, :count, :id),
+      entity_mentions: Repo.aggregate(EntityMention, :count, :id),
+      entity_edges: Repo.aggregate(EntityEdge, :count, :id),
+      chunks: Repo.aggregate(Chunk, :count, :id)
+    }
+  end
 
   # --- file-identity chunk reconciliation ---
 
