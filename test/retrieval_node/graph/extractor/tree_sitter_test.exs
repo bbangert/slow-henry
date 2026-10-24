@@ -1291,6 +1291,24 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       end
     end
 
+    test "js/ts: literal keys use the full ECMAScript identifier sets" do
+      for lang <- ["javascript", "typescript"] do
+        %{entities: e} = extract(~s|class C { "℘"() {} ["a·b"]() {} "x‍y"() {} }|, lang)
+        assert find(e, "C.℘") && find(e, "C.a·b") && find(e, "C.x‍y")
+      end
+    end
+
+    test "js/ts: literal keys are validated on their decoded value" do
+      for lang <- ["javascript", "typescript"] do
+        src = ~S|class C { ["helper"]() {} ["'quoted'"]() {} "\u{1F600}"() {} "\uD83D"() {} }|
+        %{entities: e} = extract(src, lang)
+        # Escapes decode to `helper`; a key whose value contains quotes, a
+        # non-identifier character or a lone surrogate names no entity.
+        assert find(e, "C.helper")
+        assert e |> Enum.map(& &1.qualified_name) |> Enum.sort() == ["C", "C.helper"]
+      end
+    end
+
     test "js/ts: comments inside a computed string key don't drop the member" do
       for lang <- ["javascript", "typescript"] do
         %{entities: e} = extract(~s|class C { ["helper" /* why */]() {} }|, lang)

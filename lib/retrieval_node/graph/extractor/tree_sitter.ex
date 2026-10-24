@@ -44,7 +44,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       Unicode identifiers, `#private` names (kept with their `#`, matching the
       `this.#x` callee) and `namespace A.B`. Only LITERAL member keys are
       validated: a string literal (also inside `[...]`, comments ignored) names
-      the member when its content is a JS identifier (Unicode-aware). Any other
+      the member when its DECODED value (escapes resolved, never quote-trimmed
+      source text) is an ECMAScript IdentifierName, including the Other_ID_*
+      code points. Any other
       key (`[expr]`, `"a b"`, numbers) makes an anonymous function-like
       container: no entity, body still walked. A TS ambient module is named by
       its path string (`"pkg-a"`, `"@scope/pkg"`) when that satisfies the
@@ -1551,16 +1553,28 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # matching the `C.#helper` callee `this.#helper()` resolves to) and TS
   # `namespace A.B` (`nested_identifier`). Only LITERAL member keys are
   # validated: a string literal (also inside `[...]`, ignoring comments) names
-  # the member when its content is a JS identifier. Anything else (`[expr]`,
-  # `"a b"`, numbers) yields nil, i.e. an anonymous function-like container.
+  # the member when its DECODED value (`js_string_value/2`) is an ECMAScript
+  # IdentifierName. Anything else (`[expr]`, `"a b"`, numbers, undecodable
+  # strings) yields nil, i.e. an anonymous function-like container.
   @js_identifier_nodes ~w(identifier property_identifier type_identifier private_property_identifier nested_identifier)
-  @js_identifier ~r/\A[\p{L}\p{Nl}$_][\p{L}\p{Nl}\p{Mn}\p{Mc}\p{Nd}\p{Pc}$\x{200C}\x{200D}]*\z/u
+
+  # ECMAScript IdentifierName: ID_Start = L + Nl + Other_ID_Start (U+1885, U+1886,
+  # U+2118, U+212E, U+309B, U+309C), minus Pattern_Syntax (U+2E2F); ID_Continue
+  # adds Mn, Mc, Nd, Pc and Other_ID_Continue (U+00B7, U+0387, U+1369-U+1371,
+  # U+19DA); JS also allows `$`, `_`, ZWNJ and ZWJ.
+  @js_id_start ~S"\p{L}\p{Nl}\x{1885}\x{1886}\x{2118}\x{212E}\x{309B}\x{309C}$_"
+  @js_id_continue @js_id_start <>
+                    ~S"\p{Mn}\p{Mc}\p{Nd}\p{Pc}\x{00B7}\x{0387}\x{1369}-\x{1371}\x{19DA}\x{200C}\x{200D}"
+  @js_identifier Regex.compile!(
+                   "\\A(?!.*\\x{2E2F})[#{@js_id_start}][#{@js_id_continue}]*\\z",
+                   "u"
+                 )
 
   defp definition_name_text(name_node, source, language)
        when language in ["javascript", "typescript"] do
     case TS.node_kind(name_node) do
       kind when kind in @js_identifier_nodes -> slice(source, name_node)
-      "string" -> name_node |> string_content(source) |> literal_identifier()
+      "string" -> name_node |> js_string_value(source) |> literal_identifier()
       "computed_property_name" -> name_node |> computed_key_string(source) |> literal_identifier()
       _ -> nil
     end
@@ -1575,15 +1589,71 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp computed_key_string(node, source) do
     case node |> named_children() |> Enum.reject(&(TS.node_kind(&1) =~ "comment")) do
-      [str] -> if TS.node_kind(str) == "string", do: string_content(str, source)
+      [str] -> if TS.node_kind(str) == "string", do: js_string_value(str, source)
       _ -> nil
+    end
+  end
+
+  # The decoded value of a js/ts string literal, from its `string_fragment` and
+  # `escape_sequence` children (never by trimming quotes off the source text,
+  # which would also strip quotes that are part of the value). nil when the
+  # literal can't be decoded to valid UTF-8 (e.g. a lone surrogate escape).
+  defp js_string_value(str_node, source) do
+    str_node
+    |> named_children()
+    |> Enum.reduce_while([], fn child, acc ->
+      case TS.node_kind(child) do
+        "string_fragment" -> {:cont, [slice(source, child) | acc]}
+        "escape_sequence" -> {:cont, [decode_js_escape(slice(source, child)) | acc]}
+        _ -> {:halt, :error}
+      end
+    end)
+    |> case do
+      :error -> nil
+      parts -> parts |> Enum.reverse() |> join_js_parts([])
+    end
+  end
+
+  # Code units from \u escapes may form UTF-16 surrogate pairs; combine them.
+  defp join_js_parts([{:cu, hi}, {:cu, lo} | rest], acc)
+       when hi in 0xD800..0xDBFF and lo in 0xDC00..0xDFFF,
+       do: join_js_parts(rest, [<<0x10000 + (hi - 0xD800) * 0x400 + (lo - 0xDC00)::utf8>> | acc])
+
+  defp join_js_parts([{:cu, cu} | _rest], _acc) when cu in 0xD800..0xDFFF, do: nil
+  defp join_js_parts([{:cu, cu} | rest], acc), do: join_js_parts(rest, [<<cu::utf8>> | acc])
+  defp join_js_parts([part | rest], acc), do: join_js_parts(rest, [part | acc])
+  defp join_js_parts([], acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+
+  defp decode_js_escape("\\u{" <> rest), do: {:cu, rest |> String.trim_trailing("}") |> hex()}
+  defp decode_js_escape("\\u" <> hex4), do: {:cu, hex(hex4)}
+  defp decode_js_escape("\\x" <> hex2), do: {:cu, hex(hex2)}
+  defp decode_js_escape("\\n"), do: "\n"
+  defp decode_js_escape("\\t"), do: "\t"
+  defp decode_js_escape("\\r"), do: "\r"
+  defp decode_js_escape("\\b"), do: "\b"
+  defp decode_js_escape("\\f"), do: "\f"
+  defp decode_js_escape("\\v"), do: "\v"
+  defp decode_js_escape("\\0"), do: <<0>>
+  # A line continuation (backslash + line terminator) contributes nothing.
+  defp decode_js_escape("\\" <> rest)
+       when rest in ["\n", "\r\n", "\r", <<0x2028::utf8>>, <<0x2029::utf8>>],
+       do: ""
+
+  defp decode_js_escape("\\" <> char), do: char
+
+  # Out-of-range code points (> U+10FFFF) can't be encoded; treat as a lone
+  # surrogate so the literal is rejected.
+  defp hex(digits) do
+    case Integer.parse(digits, 16) do
+      {cp, ""} when cp <= 0x10FFFF -> cp
+      _ -> 0xD800
     end
   end
 
   # Module path strings (`pkg-a`, `@scope/pkg`) keep `-`, `@` and `/`, but must
   # still satisfy the output naming rules (see the moduledoc).
   defp module_path_name(name_node, source) do
-    text = if TS.node_kind(name_node) == "string", do: string_content(name_node, source)
+    text = if TS.node_kind(name_node) == "string", do: js_string_value(name_node, source)
 
     if is_binary(text) and text != "" and not String.match?(text, ~r/[\s"'`()]/u) and
          not String.contains?(text, ["::", ".."]) and
