@@ -61,10 +61,11 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
     end
   end
 
-  # Real tree-sitter parsing loads the NIF; excluded by default to keep the suite
-  # NIF-free. Run with `mix test --include integration`.
+  # Real tree-sitter parsing loads the NIF and needs cached grammars; excluded by
+  # default (see test_helper.exs). CI prefetches and runs it; locally run
+  # `mix test --include tree_sitter`.
   describe "real AST chunking" do
-    @describetag :integration
+    @describetag :tree_sitter
 
     # RetrievalNode.ChunkTaskSupervisor is started by the application tree
     # (lib/retrieval_node/application.ex) — no test-local start needed.
