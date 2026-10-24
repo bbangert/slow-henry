@@ -1127,6 +1127,57 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
 
       assert Enum.sort(for %{kind: :call, name: n} <- r, do: n) == ["g", "h"]
     end
+
+    test "default argument values are dependencies of the function" do
+      src = ~S"""
+      defmodule M do
+        def f(x \\ helper()), do: x
+        def g(a, b \\ Mod.build(a)) when is_integer(a), do: b
+      end
+      """
+
+      %{references: r} = extract(src, "elixir")
+      calls = for %{kind: :call, name: n, from: f} <- r, do: {n, f}
+      assert {"helper", "M.f"} in calls
+      assert {"build", "M.g"} in calls
+      # The signature and guard are not call sites.
+      refute Enum.any?(calls, fn {n, _} -> n in ~w(f g is_integer) end)
+    end
+
+    test "calls inside import forms are still collected" do
+      src = ~S"""
+      defmodule M do
+        use Foo, option: build_opts()
+        import Bar, only: compute_only()
+      end
+      """
+
+      %{references: r} = extract(src, "elixir")
+      assert Enum.sort(for %{kind: :import, name: n} <- r, do: n) == ["Bar", "Foo"]
+      calls = for %{kind: :call, name: n, from: f} <- r, do: {n, f}
+      assert {"build_opts", "M"} in calls and {"compute_only", "M"} in calls
+      refute Enum.any?(calls, fn {n, _} -> n in ~w(use import) end)
+    end
+
+    test "Elixir.-rooted aliases are canonical and absolute everywhere" do
+      src = ~S"""
+      defmodule Outer do
+        defmodule Elixir.Shared do
+          def s, do: :ok
+        end
+
+        alias Elixir.Some.Dep
+        defimpl Elixir.P, for: [Elixir.T, T] do
+          def p(_), do: :ok
+        end
+      end
+      """
+
+      %{entities: e, references: r} = extract(src, "elixir")
+      names = e |> Enum.map(& &1.qualified_name) |> Enum.sort()
+      assert names == Enum.sort(~w(Outer Shared Shared.s P.T P.T.p))
+      assert for(%{kind: :import, name: n} <- r, do: n) == ["Some.Dep"]
+    end
   end
 
   describe "review regressions" do

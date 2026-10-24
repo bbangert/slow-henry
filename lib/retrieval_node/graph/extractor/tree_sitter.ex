@@ -64,7 +64,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       (`impl X for (A, B)` names `X`); an inherent impl on such a type adds no
       scope segment.
     * Elixir: module aliases are one dotted token (`Foo.Bar`), nested modules
-      join their enclosing scope like any definition. A function is named by
+      join their enclosing scope like any definition. Aliases are canonical
+      wherever they name something (modules, protocols, `defimpl` targets,
+      imports): `Elixir.Foo` is the absolute `Foo`, rooted like Ruby `::A`. A function is named by
       its head's identifier (also under a `when` guard). A module or function
       name that is not static (`def unquote(name)()`, `defmodule unquote(m)`,
       operator heads, quoted atoms) makes the definition anonymous. `defimpl P,
@@ -86,8 +88,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       class members and object-literal methods alike.
     * Ruby superclass expressions, and the `expr` of `class << expr`.
     * Elixir has no separate header scope: a `def` head (name, parameters,
-      defaults, `when` guards) parses as calls but is not a call site, so only
-      the body (`do` block or `do:` value) is walked.
+      `when` guards) parses as calls but is not a call site, so only the body
+      (`do` block or `do:` value) and default values (the right side of
+      `arg \\\\ default`, evaluated when the function is called) are walked.
 
   ### Receiver binding
 
@@ -130,8 +133,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   identifier names nothing). `@attr value` and `@attr` are not calls, calls in
   the value are; typespec attributes (`@spec`, `@type`, ...) are skipped
   entirely. `alias`/`import`/`use`/`require` emit one import reference: the
-  first argument's module alias (`alias Foo.{A, B}` is `Foo`). The grammar
-  cannot tell `map.field` from a no-parens call, so it is a call to `field`.
+  first argument's module alias (`alias Foo.{A, B}` is `Foo`); calls in their
+  other arguments or block (`use Foo, opts: build()`) are still collected. The
+  grammar cannot tell `map.field` from a no-parens call, so it is a call to
+  `field`.
 
   ### Limits
 
@@ -1057,6 +1062,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # body is walked: the `do_block`, or the value of the keyword form
   # (`def f(x), do: expr`).
   defp walk_definition(node, :function_like, "elixir", source, lang_ctx, _outer, inner, acc) do
+    # Default values (`x \\ helper()`) are executable: evaluated when the
+    # function is called without that argument, so they belong to it.
+    acc = walk_nodes(elixir_default_values(node, source), source, "elixir", lang_ctx, inner, acc)
+
     node
     |> named_children()
     |> Enum.filter(&(TS.node_kind(&1) in ["do_block", "arguments"]))
@@ -1113,8 +1122,12 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       target in @elixir_def_forms ->
         handle_elixir_definition(call_node, target, source, language, lang_ctx, state, acc)
 
+      # The form itself is only an import; calls in its arguments or block
+      # (`use Foo, opts: build()`) are still dependencies.
       target in @elixir_import_forms ->
-        handle_elixir_import(call_node, source, state, acc)
+        call_node
+        |> handle_elixir_import(source, state, acc)
+        |> then(&maybe_walk(&1, call_node, source, language, lang_ctx, state))
 
       true ->
         acc
@@ -1169,6 +1182,13 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp handle_elixir_definition(child, target, source, language, lang_ctx, state, acc) do
     category = if target in @elixir_module_forms, do: :module_like, else: :function_like
     name = elixir_definition_name(child, category, source)
+
+    # `defmodule Elixir.Shared` inside `Outer` is the absolute `Shared`.
+    state =
+      if category == :module_like and match?({_, true}, elixir_module_alias(child, source)),
+        do: %{state | scope: []},
+        else: state
+
     handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
   end
 
@@ -1195,12 +1215,12 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   # The module name is the first argument when it is an alias (the grammar
-  # makes `Foo.Bar` one dotted token); `defmodule unquote(m)` or
-  # `__MODULE__.Foo` name nothing.
+  # makes `Foo.Bar` one dotted token), canonical per elixir_alias/2;
+  # `defmodule unquote(m)` or `__MODULE__.Foo` name nothing.
   defp elixir_definition_name(call_node, :module_like, source) do
-    case elixir_arguments(call_node) do
-      [first | _] -> if TS.node_kind(first) == "alias", do: slice(source, first)
-      [] -> nil
+    case call_node |> elixir_module_alias(source) do
+      {name, _rooted?} -> name
+      nil -> nil
     end
   end
 
@@ -1208,6 +1228,67 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     case elixir_arguments(call_node) do
       [first | _] -> elixir_def_name_from(first, source)
       [] -> nil
+    end
+  end
+
+  defp elixir_module_alias(call_node, source) do
+    case elixir_arguments(call_node) do
+      [first | _] -> elixir_alias(first, source)
+      [] -> nil
+    end
+  end
+
+  # Module aliases are canonical: `Elixir.Foo` is the absolute `Foo` (rooted,
+  # like Ruby's `::A`, so it never nests under the enclosing module). Returns
+  # {name, rooted?} for an `alias` node, nil otherwise or for bare `Elixir`.
+  defp elixir_alias(node, source) do
+    if TS.node_kind(node) == "alias" do
+      case slice(source, node) do
+        "Elixir" -> nil
+        "Elixir." <> rest -> {rest, true}
+        name -> {name, false}
+      end
+    end
+  end
+
+  # The right-hand sides of `arg \\ default` in a def head (under any `when`).
+  defp elixir_default_values(def_node, source) do
+    with [head | _] <- elixir_arguments(def_node),
+         call when not is_nil(call) <- elixir_head_call(head, source) do
+      call
+      |> elixir_arguments()
+      |> Enum.flat_map(&elixir_default_value(&1, source))
+    else
+      _ -> []
+    end
+  end
+
+  defp elixir_default_value(arg, source) do
+    with "binary_operator" <- TS.node_kind(arg),
+         op when not is_nil(op) <- TS.node_child_by_field_name(arg, "operator"),
+         "\\\\" <- slice(source, op) do
+      List.wrap(TS.node_child_by_field_name(arg, "right"))
+    else
+      _ -> []
+    end
+  end
+
+  defp elixir_head_call(head, source) do
+    case TS.node_kind(head) do
+      "call" ->
+        head
+
+      "binary_operator" ->
+        with op when not is_nil(op) <- TS.node_child_by_field_name(head, "operator"),
+             "when" <- slice(source, op),
+             left when not is_nil(left) <- TS.node_child_by_field_name(head, "left") do
+          elixir_head_call(left, source)
+        else
+          _ -> nil
+        end
+
+      _ ->
+        nil
     end
   end
 
@@ -1245,7 +1326,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp elixir_defimpl_types(node, state, source) do
     case TS.node_kind(node) do
       "alias" ->
-        [slice(source, node)]
+        case elixir_alias(node, source) do
+          {name, _rooted?} -> [name]
+          nil -> []
+        end
 
       "identifier" ->
         if slice(source, node) == "__MODULE__", do: List.wrap(state.receiver), else: []
@@ -1338,16 +1422,16 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp elixir_import_name(node, source) do
-    case TS.node_kind(node) do
-      "alias" ->
-        slice(source, node)
+    alias_node =
+      case TS.node_kind(node) do
+        "alias" -> node
+        "dot" -> TS.node_child_by_field_name(node, "left")
+        _ -> nil
+      end
 
-      "dot" ->
-        left = TS.node_child_by_field_name(node, "left")
-        if left && TS.node_kind(left) == "alias", do: slice(source, left)
-
-      _ ->
-        nil
+    case alias_node && elixir_alias(alias_node, source) do
+      {name, _rooted?} -> name
+      _ -> nil
     end
   end
 
