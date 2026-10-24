@@ -51,6 +51,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       container: no entity, body still walked. A TS ambient module is named by
       its path string (`"pkg-a"`, `"@scope/pkg"`) when that satisfies the
       output naming rules.
+    * JS/TS identifiers are canonical: `\\u` escapes inside an identifier are
+      decoded the same way for definitions and callees (`h\\u0065lper` is
+      `helper` on both sides). String values decode every escape, including
+      legacy octal (`\\157` is `o`) with ECMAScript's digit-length limits.
     * A Rust impl's type identity is its path type: references and pointers
       unwrap to the pointee, generics to their base. A type without one (tuple,
       array, slice, fn pointer, ...) makes the trait the container
@@ -1006,7 +1010,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp callee_name(call_node, source, lang) when lang in ["javascript", "typescript"] do
     with fn_node when not is_nil(fn_node) <- callee_node(call_node) do
-      qualified_or_bare(fn_node, source, "member_expression", "object", "property", &this_node?/2)
+      fn_node
+      |> qualified_or_bare(source, "member_expression", "object", "property", &this_node?/2)
+      |> decode_js_callee()
     end
   end
 
@@ -1064,6 +1070,11 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp callee_name(_call_node, _source, _language), do: nil
+
+  # Identifiers may spell characters as `\u` escapes (`this.h\u0065lper()`);
+  # canonicalize callees exactly like definition names (decode_js_identifier/1).
+  defp decode_js_callee({name, self?}), do: {decode_js_identifier(name), self?}
+  defp decode_js_callee(nil), do: nil
 
   # `(helper)()` / `(this.helper)()`: grouping parentheses don't change the callee.
   defp callee_node(call_node) do
@@ -1573,10 +1584,17 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp definition_name_text(name_node, source, language)
        when language in ["javascript", "typescript"] do
     case TS.node_kind(name_node) do
-      kind when kind in @js_identifier_nodes -> slice(source, name_node)
-      "string" -> name_node |> js_string_value(source) |> literal_identifier()
-      "computed_property_name" -> name_node |> computed_key_string(source) |> literal_identifier()
-      _ -> nil
+      kind when kind in @js_identifier_nodes ->
+        name_node |> then(&slice(source, &1)) |> decode_js_identifier()
+
+      "string" ->
+        name_node |> js_string_value(source) |> literal_identifier()
+
+      "computed_property_name" ->
+        name_node |> computed_key_string(source) |> literal_identifier()
+
+      _ ->
+        nil
     end
   end
 
@@ -1603,14 +1621,37 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     |> named_children()
     |> Enum.reduce_while([], fn child, acc ->
       case TS.node_kind(child) do
-        "string_fragment" -> {:cont, [slice(source, child) | acc]}
-        "escape_sequence" -> {:cont, [decode_js_escape(slice(source, child)) | acc]}
-        _ -> {:halt, :error}
+        "string_fragment" ->
+          {:cont, [slice(source, child) | acc]}
+
+        "escape_sequence" ->
+          {:cont, Enum.reverse(List.wrap(decode_js_escape(slice(source, child)))) ++ acc}
+
+        _ ->
+          {:halt, :error}
       end
     end)
     |> case do
       :error -> nil
       parts -> parts |> Enum.reverse() |> join_js_parts([])
+    end
+  end
+
+  # An identifier's `\uXXXX`/`\u{...}` escapes decoded to their characters (the
+  # only escapes identifiers allow), so `h\u0065lper` and `helper` are one name.
+  # Left as written if an escape doesn't decode to a valid character.
+  defp decode_js_identifier(name) when is_binary(name) do
+    if String.contains?(name, "\\u") do
+      parts =
+        Regex.split(~r/\\u\{[0-9A-Fa-f]+\}|\\u[0-9A-Fa-f]{4}/, name, include_captures: true)
+        |> Enum.map(fn
+          "\\u" <> _ = esc -> decode_js_escape(esc)
+          text -> text
+        end)
+
+      join_js_parts(parts, []) || name
+    else
+      name
     end
   end
 
@@ -1633,7 +1674,21 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp decode_js_escape("\\b"), do: "\b"
   defp decode_js_escape("\\f"), do: "\f"
   defp decode_js_escape("\\v"), do: "\v"
-  defp decode_js_escape("\\0"), do: <<0>>
+  # Legacy octal escape (non-strict JS): a leading 0-3 takes up to three octal
+  # digits, 4-7 up to two; the parser hands over the whole digit run, so any
+  # surplus digit is literal text (`\477` is `'7`). `\0` alone is NUL; `\8` and
+  # `\9` fall through to the identity escape below.
+  defp decode_js_escape(<<"\\", d, digits::binary>>) when d in ?0..?7 do
+    all = <<d>> <> digits
+
+    if all =~ ~r/\A[0-7]+\z/ do
+      {octal, rest} = String.split_at(all, if(d <= ?3, do: 3, else: 2))
+      [{:cu, String.to_integer(octal, 8)}, rest]
+    else
+      all
+    end
+  end
+
   # A line continuation (backslash + line terminator) contributes nothing.
   defp decode_js_escape("\\" <> rest)
        when rest in ["\n", "\r\n", "\r", <<0x2028::utf8>>, <<0x2029::utf8>>],

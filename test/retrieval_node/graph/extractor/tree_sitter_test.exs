@@ -1309,6 +1309,32 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       end
     end
 
+    test "js/ts: escaped identifiers canonicalize alike in definitions and callees" do
+      for lang <- ["javascript", "typescript"] do
+        src = ~S"""
+        class C {
+          "helper"() {}
+          run() { this.helper(); this.h\u{65}lper(); }
+        }
+        """
+
+        %{entities: e, references: r} = extract(src, lang)
+        assert find(e, "C.helper") && find(e, "C.run")
+        calls = for %{kind: :call} = ref <- r, do: {ref.name, ref.from}
+        assert calls == [{"C.helper", "C.run"}, {"C.helper", "C.run"}]
+      end
+    end
+
+    test "javascript: legacy octal escapes decode with ECMAScript digit limits" do
+      src = ~S"""
+      const o = { "f\157o"() {}, "\101b"() {}, "a\477b"() {}, "\8x"() {} };
+      """
+
+      # \157 -> o, \101 -> A, \477 -> ' + "7" (quote: no entity), \8 -> 8.
+      %{entities: e} = extract(src, "javascript")
+      assert e |> Enum.map(& &1.qualified_name) |> Enum.sort() == ["Ab", "foo"]
+    end
+
     test "js/ts: comments inside a computed string key don't drop the member" do
       for lang <- ["javascript", "typescript"] do
         %{entities: e} = extract(~s|class C { ["helper" /* why */]() {} }|, lang)
