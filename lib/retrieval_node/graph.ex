@@ -143,8 +143,13 @@ defmodule RetrievalNode.Graph do
   `entities` FK cascade above remains the catch-all for whatever a chunk
   deletion didn't reach (e.g. legacy NULL-`chunk_id` edge rows).
 
-  `:source_id` scopes the candidate select to one source; omitted, it scans
-  every source.
+  Always scoped to ONE source, and must run inside that source's
+  `Ingest.SourceOwner` (as `upsert_from_staged/3` does): the owner is the
+  single writer of a source's graph rows, so no ingest pass can land a new
+  mention on a candidate between this function's select and its delete. A
+  caller outside the owner could race a pass and cascade away mentions it
+  just committed, so there is deliberately no unscoped (all-sources) form;
+  a corpus-wide sweep must go source by source through each owner.
 
   Deletes in batches of `:batch_size` (default 10,000) rather than one
   statement: `entities` is sized for a many-repo corpus (can reach into the
@@ -161,11 +166,10 @@ defmodule RetrievalNode.Graph do
   and the delete, so each batch is a plain "select candidate ids, delete
   those ids" inside one transaction.
   """
-  @spec gc_orphaned_entities(keyword()) :: non_neg_integer()
-  def gc_orphaned_entities(opts \\ []) do
+  @spec gc_orphaned_entities(Ecto.UUID.t(), keyword()) :: non_neg_integer()
+  def gc_orphaned_entities(source_id, opts \\ []) when is_binary(source_id) do
     batch_size = Keyword.get(opts, :batch_size, @gc_batch_size)
     validate_positive_batch_size!(batch_size)
-    source_id = Keyword.get(opts, :source_id)
     gc_batches(batch_size, source_id, 0)
   end
 
@@ -230,11 +234,8 @@ defmodule RetrievalNode.Graph do
           from(m in EntityMention, where: m.entity_id == parent_as(:entity).id, select: 1)
         )
     )
-    |> scope_source(source_id)
+    |> where([e], e.source_id == ^source_id)
   end
-
-  defp scope_source(query, nil), do: query
-  defp scope_source(query, source_id), do: from(e in query, where: e.source_id == ^source_id)
 
   # --- staged-graph sanitation --------------------------------------------
 

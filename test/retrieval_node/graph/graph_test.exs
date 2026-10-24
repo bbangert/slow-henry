@@ -432,7 +432,7 @@ defmodule RetrievalNode.GraphTest do
     end
   end
 
-  describe "gc_orphaned_entities/1" do
+  describe "gc_orphaned_entities/2" do
     defp seed_entity(source, qualified_name) do
       Repo.insert!(%Entity{
         source_id: source.id,
@@ -457,7 +457,7 @@ defmodule RetrievalNode.GraphTest do
 
       assert count(EntityMention) == 0
       assert count(Entity) == 2
-      assert Graph.gc_orphaned_entities(source_id: source.id) == 2
+      assert Graph.gc_orphaned_entities(source.id) == 2
       assert count(Entity) == 0
     end
 
@@ -472,7 +472,7 @@ defmodule RetrievalNode.GraphTest do
       seed_edge(orphan_a, orphan_b)
       seed_edge(kept, orphan_a)
 
-      assert Graph.gc_orphaned_entities(source_id: source.id) == 2
+      assert Graph.gc_orphaned_entities(source.id) == 2
 
       assert Repo.all(from e in Entity, select: e.qualified_name) == ["kept"]
       assert Repo.all(EntityEdge) == []
@@ -481,24 +481,30 @@ defmodule RetrievalNode.GraphTest do
     test "loops across batches: batch_size 1 with 3 orphans deletes all 3", %{source: source} do
       for n <- 1..3, do: seed_entity(source, "orphan_#{n}")
 
-      assert Graph.gc_orphaned_entities(batch_size: 1, source_id: source.id) == 3
+      assert Graph.gc_orphaned_entities(source.id, batch_size: 1) == 3
       assert Repo.aggregate(from(e in Entity, where: e.source_id == ^source.id), :count, :id) == 0
     end
 
-    test "a non-positive batch_size raises ArgumentError" do
+    test "a non-positive batch_size raises ArgumentError", %{source: source} do
       for bad <- [0, -5] do
         assert_raise ArgumentError, ~r/batch_size/, fn ->
-          Graph.gc_orphaned_entities(batch_size: bad)
+          Graph.gc_orphaned_entities(source.id, batch_size: bad)
         end
       end
     end
 
-    test "source_id: scopes the sweep to one source", %{source: source} do
+    test "there is no unscoped (all-sources) form" do
+      # A sweep must go source by source through each owner (single writer).
+      assert_raise FunctionClauseError, fn -> Graph.gc_orphaned_entities(nil) end
+      refute function_exported?(Graph, :gc_orphaned_entities, 0)
+    end
+
+    test "the sweep is scoped to its one source", %{source: source} do
       other = source_fixture()
       seed_entity(source, "orphan_here")
       seed_entity(other, "orphan_there")
 
-      assert Graph.gc_orphaned_entities(source_id: source.id) == 1
+      assert Graph.gc_orphaned_entities(source.id) == 1
       assert Repo.all(from e in Entity, select: e.qualified_name) == ["orphan_there"]
     end
   end
