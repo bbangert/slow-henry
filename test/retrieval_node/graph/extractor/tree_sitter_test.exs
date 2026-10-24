@@ -1036,6 +1036,46 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
     end
   end
 
+  describe "review regressions, round 6" do
+    test "python: a class body keeps the outer receiver; its methods bind the class" do
+      src = """
+      class Factory:
+          def build(self):
+              class Product:
+                  value = self.helper()
+
+                  def run(self):
+                      self.go()
+      """
+
+      assert call_names(src, "python") == [
+               {"Factory.helper", "Factory.build.Product"},
+               {"Factory.build.Product.go", "Factory.build.Product.run"}
+             ]
+
+      assert [{"K.x", "K.m"}] =
+               call_names("class K:\n    def m(self):\n        self.x()\n", "python")
+    end
+
+    test "js/ts: class heritage evaluates in the enclosing scope" do
+      src = "class Outer { make() { class Inner extends this.base() { run() { this.go(); } } } }"
+
+      for lang <- ["javascript", "typescript"] do
+        assert call_names(src, lang) == [
+                 {"Outer.base", "Outer.make"},
+                 {"Outer.make.Inner.go", "Outer.make.Inner.run"}
+               ]
+      end
+    end
+
+    test "go: parenthesized callees are unwrapped" do
+      assert call_names("package p\nfunc main() { (helper)() }", "go") == [{"helper", "main"}]
+
+      plain = call_names("package p\nfunc main() { pkg.Helper() }", "go")
+      assert call_names("package p\nfunc main() { (pkg.Helper)() }", "go") == plain
+    end
+  end
+
   defp find(entities, qualified_name),
     do: Enum.find(entities, &(&1.qualified_name == qualified_name))
 end

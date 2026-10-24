@@ -178,6 +178,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       container_kind: nil,
       enclosing_qname: nil,
       class_qname: nil,
+      pending_class: nil,
       self_name: nil
     }
 
@@ -658,6 +659,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
           {state.scope ++ [name], qname, class_qname, add_entity(acc, entity)}
       end
 
+    {new_class_qname, pending_class} =
+      python_class_receiver(language, category, state, new_class_qname)
+
     if at_cap?(acc) do
       acc
     else
@@ -671,14 +675,36 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
             do: nil,
             else: new_class_qname
           ),
+        pending_class: pending_class,
         self_name: nil
       }
 
-      if language == "python",
-        do: walk_python_def(child, source, language, lang_ctx, state, new_state, acc),
-        else: walk_definition_body(child, category, language, source, lang_ctx, new_state, acc)
+      walk_definition(child, category, language, source, lang_ctx, state, new_state, acc)
     end
   end
+
+  # A class heritage (`extends <expr>`) is evaluated in the ENCLOSING scope.
+  defp walk_js_class(node, source, language, lang_ctx, outer_state, inner_state, acc) do
+    Enum.reduce_while(named_children(node), acc, fn child, acc ->
+      state = if TS.node_kind(child) == "class_heritage", do: outer_state, else: inner_state
+
+      if at_cap?(acc),
+        do: {:halt, acc},
+        else: {:cont, process_child(child, source, language, lang_ctx, state, acc)}
+    end)
+  end
+
+  # Entering a python class does not bind `self`: its direct statements keep the
+  # outer receiver and only functions defined directly in the body get the
+  # class (held in `pending_class` meanwhile) as theirs.
+  defp python_class_receiver("python", :class_like, state, class_qname),
+    do: {state.class_qname, class_qname}
+
+  defp python_class_receiver("python", :function_like, %{container_kind: :class_like} = state, _) do
+    {state.pending_class || state.class_qname, nil}
+  end
+
+  defp python_class_receiver(_language, _category, _state, class_qname), do: {class_qname, nil}
 
   # Python evaluates a definition's header (parameter defaults, annotations,
   # class bases) in the ENCLOSING scope (outer receiver and `from`); only the
@@ -735,11 +761,17 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     target != nil and TS.node_kind(target) == "identifier" and slice(source, target) == "self"
   end
 
+  defp walk_definition(node, _category, "python", source, lang_ctx, outer, inner, acc),
+    do: walk_python_def(node, source, "python", lang_ctx, outer, inner, acc)
+
+  defp walk_definition(node, :class_like, lang, source, lang_ctx, outer, inner, acc)
+       when lang in ["javascript", "typescript"],
+       do: walk_js_class(node, source, lang, lang_ctx, outer, inner, acc)
+
   # Walks the whole definition node: these grammars give the parameter list its
   # own dedicated node kind, so there's no ambiguity to worry about.
-  defp walk_definition_body(child, _category, language, source, lang_ctx, state, acc) do
-    walk(child, source, language, lang_ctx, state, acc)
-  end
+  defp walk_definition(node, _category, lang, source, lang_ctx, _outer, inner, acc),
+    do: walk(node, source, lang, lang_ctx, inner, acc)
 
   defp entity_kind_for(:class_like, _container), do: :class
   defp entity_kind_for(:module_like, _container), do: :module
@@ -798,7 +830,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp callee_name(call_node, source, "go") do
-    with fn_node when not is_nil(fn_node) <- TS.node_child_by_field_name(call_node, "function") do
+    with fn_node when not is_nil(fn_node) <- callee_node(call_node) do
       # Go has no `self`/`this` keyword (receivers are user-named), so the
       # object side is never scope-resolvable here.
       qualified_or_bare(fn_node, source, "selector_expression", "operand", "field", fn _, _ ->
