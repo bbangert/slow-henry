@@ -827,6 +827,62 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
     end
   end
 
+  describe "review regressions, round 2" do
+    test "rust: rooted impl inside a function resolves against the module, not the fn" do
+      src = "struct Foo; fn init() { impl self::Foo { fn run(&self) { self.go(); } } }"
+      %{entities: e, references: r} = extract(src, "rust")
+      assert find(e, "Foo.run")
+      refute find(e, "init.Foo.run")
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "Foo.go"))
+    end
+
+    test "rust: whitespace around :: in impl paths is trimmed" do
+      src =
+        "mod a { impl m :: Foo { fn run(&self) { self.helper(); } } }\nimpl crate :: a :: Bar { fn x(&self) {} }"
+
+      %{entities: e, references: r} = extract(src, "rust")
+      assert find(e, "a.m.Foo.run")
+      assert find(e, "a.Bar.x")
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "a.m.Foo.helper"))
+      refute Enum.any?(e, &String.contains?(&1.qualified_name, " "))
+    end
+
+    test "ruby: singleton methods are qualified by receiver" do
+      src =
+        "def A.run; end\ndef B.run; end\nclass C; def self.go; helper; self.other; end; end\ndef A.use; self.run; end"
+
+      %{entities: e, references: r} = extract(src, "ruby")
+      assert %{kind: :method} = find(e, "A.run")
+      assert %{kind: :method} = find(e, "B.run")
+      assert %{kind: :method} = find(e, "C.go")
+      refute find(e, "run")
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "C.other"))
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "A.run" and &1.from == "A.use"))
+    end
+
+    test "python: nested def rebinding self drops the class receiver; closures keep it" do
+      src = """
+      class K:
+          def m(self):
+              def inner(self):
+                  return self.helper()
+              def closure():
+                  return self.other()
+      """
+
+      %{references: r} = extract(src, "python")
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "helper"))
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "K.other"))
+    end
+
+    test "ruby: interpolated require is a plain call, literal require an import" do
+      src = ~S|require "adapters/#{backend}/driver"| <> "\nrequire \"json\"\n"
+      %{references: r} = extract(src, "ruby")
+      assert [%{name: "json"}] = Enum.filter(r, &(&1.kind == :import))
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "require"))
+    end
+  end
+
   describe "oversized symbols" do
     # Mirrors @max_symbol_bytes in the extractor: identifiers past the cap are
     # minified/generated junk and would blow the entities unique btree index

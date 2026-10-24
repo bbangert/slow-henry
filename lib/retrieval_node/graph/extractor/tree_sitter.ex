@@ -170,6 +170,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
     state = %{
       scope: [],
+      mod_scope: [],
       container_kind: nil,
       enclosing_qname: nil,
       class_qname: nil,
@@ -389,7 +390,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     {scope, type_name} =
       case name_field(child, language, kind, source) do
         nil -> {state.scope, nil}
-        raw -> rust_resolve_path(raw, state.scope)
+        raw -> rust_resolve_path(raw, state)
       end
 
     state = %{state | scope: scope}
@@ -430,22 +431,64 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
   end
 
+  # Ruby `def A.run` qualifies the method by its statically named receiver
+  # (`self` receivers keep the enclosing-class behavior of the generic clause).
+  defp handle_definition(
+         child,
+         "singleton_method" = kind,
+         source,
+         "ruby" = language,
+         lang_ctx,
+         state,
+         acc
+       ) do
+    name = name_field(child, language, kind, source)
+    object = TS.node_child_by_field_name(child, "object")
+
+    if name && object && TS.node_kind(object) in ["constant", "scope_resolution"] do
+      receiver = source |> slice(object) |> ruby_dotted()
+      state = %{state | self_name: receiver}
+
+      handle_definition_category(
+        child,
+        :method_like,
+        receiver <> "." <> name,
+        source,
+        language,
+        lang_ctx,
+        state,
+        acc
+      )
+    else
+      handle_definition_category(
+        child,
+        :function_like,
+        name,
+        source,
+        language,
+        lang_ctx,
+        state,
+        acc
+      )
+    end
+  end
+
   defp handle_definition(child, kind, source, language, lang_ctx, state, acc) do
     category = Map.fetch!(lang_ctx.def_kinds, kind)
     name = name_field(child, language, kind, source)
     handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
   end
 
-  # Resolves a rooted impl path against the enclosing module scope. Assumes
-  # `scope` holds module names only at the point an impl is declared:
-  # `crate::` restarts at the crate root, `self::` stays in the current module,
-  # each `super::` pops one module. Any other path is relative to the scope.
-  defp rust_resolve_path(dotted, scope) do
+  # Resolves a rooted impl path against the enclosing MODULE path (`mod_scope`,
+  # never function/impl names): `crate::` restarts at the crate root, `self::`
+  # stays in the current module, each `super::` pops one module. Any other path
+  # is relative to the lexical `scope`.
+  defp rust_resolve_path(dotted, %{scope: scope, mod_scope: mod_scope}) do
     {scope, segs} =
       case String.split(dotted, ".") do
         ["crate" | rest] -> {[], rest}
-        ["self" | rest] -> {scope, rest}
-        ["super" | _] = segs -> rust_pop_supers(segs, scope)
+        ["self" | rest] -> {mod_scope, rest}
+        ["super" | _] = segs -> rust_pop_supers(segs, mod_scope)
         segs -> {scope, segs}
       end
 
@@ -545,7 +588,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
           entity = %{qualified_name: qname, kind: entity_kind, line: line(child)}
 
           class_qname =
-            if category in [:class_like, :module_like],
+            if receiver_owner?(category, state.self_name),
               do: Enum.join(state.scope ++ [state.self_name || name], "."),
               else: state.class_qname
 
@@ -557,10 +600,11 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     else
       new_state = %{
         scope: new_scope,
+        mod_scope: next_mod_scope(state.mod_scope, language, category, name),
         container_kind: category,
         enclosing_qname: new_enclosing_qname,
         class_qname:
-          if(receiver_boundary?(child, language, category, name),
+          if(receiver_boundary?(child, source, language, category, name, state),
             do: nil,
             else: new_class_qname
           ),
@@ -571,11 +615,44 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
+  defp receiver_owner?(category, _self_name) when category in [:class_like, :module_like],
+    do: true
+
+  defp receiver_owner?(:method_like, self_name), do: not is_nil(self_name)
+  defp receiver_owner?(_category, _self_name), do: false
+
+  defp next_mod_scope(mod_scope, "rust", :module_like, name) when is_binary(name),
+    do: mod_scope ++ [name]
+
+  defp next_mod_scope(mod_scope, _language, _category, _name), do: mod_scope
+
   # Definitions that bind their own `this`, or (unnamed classes) have no graph
   # identity to resolve a receiver to.
-  defp receiver_boundary?(node, language, category, name) do
+  defp receiver_boundary?(node, source, language, category, name, state) do
     this_rebinding?(language, TS.node_kind(node)) or object_literal_method?(node) or
-      (is_nil(name) and category == :class_like)
+      (is_nil(name) and category == :class_like) or
+      python_rebinds_self?(node, source, language, state)
+  end
+
+  # A python function nested in a function (not a direct method) that takes its
+  # own `self` parameter shadows the outer receiver.
+  defp python_rebinds_self?(node, source, "python", %{container_kind: container})
+       when container != :class_like do
+    case TS.node_child_by_field_name(node, "parameters") do
+      nil -> false
+      params -> params |> named_children() |> Enum.any?(&self_param?(&1, source))
+    end
+  end
+
+  defp python_rebinds_self?(_node, _source, _language, _state), do: false
+
+  defp self_param?(param, source) do
+    target =
+      if TS.node_kind(param) == "identifier",
+        do: param,
+        else: param |> named_children() |> List.first()
+
+    target != nil and TS.node_kind(target) == "identifier" and slice(source, target) == "self"
   end
 
   # Walks the whole definition node: these grammars give the parameter list its
@@ -769,7 +846,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp first_string_arg(call_node, source) do
     with args_node when not is_nil(args_node) <-
            TS.node_child_by_field_name(call_node, "arguments"),
-         [str_node | _] <- Enum.filter(named_children(args_node), &(TS.node_kind(&1) == "string")) do
+         [str_node | _] <- Enum.filter(named_children(args_node), &(TS.node_kind(&1) == "string")),
+         false <- Enum.any?(named_children(str_node), &(TS.node_kind(&1) == "interpolation")) do
       string_content(str_node, source)
     else
       _ -> nil
@@ -1116,7 +1194,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp name_field(node, "rust", "impl_item", source) do
     case TS.node_child_by_field_name(node, "type") do
       nil -> nil
-      type_node -> source |> slice(rust_base_type_node(type_node)) |> String.replace("::", ".")
+      type_node -> source |> slice(rust_base_type_node(type_node)) |> rust_dotted()
     end
   end
 
@@ -1133,6 +1211,14 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       do: string_content(name_node, source),
       else: slice(source, name_node)
   end
+
+  defp rust_dotted(path),
+    do:
+      path
+      |> String.split("::")
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.join(".")
 
   defp ruby_dotted(name), do: name |> String.split("::") |> Enum.map_join(".", &String.trim/1)
 
