@@ -959,6 +959,26 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
     end
   end
 
+  describe "review regressions, round 4" do
+    test "go: interface method elements are methods of the interface" do
+      %{entities: e} = extract("package p\ntype Worker interface { Run() }", "go")
+      assert %{kind: :method} = find(e, "Worker.Run")
+    end
+
+    test "python: a self-rebinding nested def evaluates defaults in the outer scope" do
+      src = """
+      class K:
+          def m(self):
+              def inner(self=self.helper()):
+                  return self.other()
+      """
+
+      %{references: r} = extract(src, "python")
+      assert Enum.any?(r, &(&1.name == "K.helper" and &1.from == "K.m"))
+      assert Enum.any?(r, &(&1.name == "other" and &1.from == "K.m.inner"))
+    end
+  end
+
   defp find(entities, qualified_name),
     do: Enum.find(entities, &(&1.qualified_name == qualified_name))
 end

@@ -116,6 +116,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     "go" => %{
       "function_declaration" => :function_like,
       "method_declaration" => :function_like,
+      # Interface members (`type W interface { Run() }`) inherit the type's scope.
+      "method_elem" => :function_like,
       "type_declaration" => :class_like
     },
     "rust" => %{
@@ -654,8 +656,20 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         self_name: nil
       }
 
-      walk_definition_body(child, category, language, source, lang_ctx, new_state, acc)
+      if python_rebinds_self?(child, source, language, state),
+        do: walk_python_self_def(child, source, language, lang_ctx, state, new_state, acc),
+        else: walk_definition_body(child, category, language, source, lang_ctx, new_state, acc)
     end
+  end
+
+  # Like `walk_python_lambda/6`: a nested def binding its own `self` shadows the
+  # receiver in its body only; parameter defaults and the return annotation are
+  # evaluated in the enclosing scope (outer receiver and `from`).
+  defp walk_python_self_def(node, source, language, lang_ctx, outer_state, inner_state, acc) do
+    outer = Enum.map(~w(parameters return_type), &TS.node_child_by_field_name(node, &1))
+    acc = walk_nodes(Enum.reject(outer, &is_nil/1), source, language, lang_ctx, outer_state, acc)
+    body = TS.node_child_by_field_name(node, "body")
+    walk_nodes(List.wrap(body), source, language, lang_ctx, inner_state, acc)
   end
 
   defp receiver_owner?(category, _self_name) when category in [:class_like, :module_like],
