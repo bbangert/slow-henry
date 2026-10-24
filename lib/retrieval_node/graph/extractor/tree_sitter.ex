@@ -10,43 +10,124 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   Unlike chunking's boundary-only walk (which only descends until it finds a
   chunk-boundary kind, then treats that subtree as opaque chunk text), this is
   a full-tree walk: every named node is visited, including deep inside
-  function bodies, because calls and imports live there. Two pieces of state
-  thread down the walk:
-
-    * `scope` — the list of enclosing NAMED definitions, joined with "." to
-      build `qualified_name`.
-    * `container_kind` — the category (`:function_like` / `:class_like` /
-      `:module_like`) of the nearest enclosing definition, used to decide
-      `:function` vs `:method` (a function-ish node directly inside a
-      class-like container is a method).
-    * `enclosing_qname` — the qualified_name of the nearest NAMED enclosing
-      definition, used as `from` on references. An anonymous definition (no
-      `name` field — e.g. a JS arrow function) does not become an entity and
-      does not update `enclosing_qname`, but it DOES update `container_kind`
-      so a method nested directly inside it is still classified correctly.
-      Because `extract/3` walks exactly one already-parsed file's root node
-      per call, `enclosing_qname` — and therefore every reference's `from` —
-      can only ever name a definition from THIS file, never another file of
-      the same source.
-    * `class_qname` — the qualified_name of the nearest NAMED enclosing
-      class-like/module-like definition (set on entering one, carried
-      unchanged through nested function-likes so a method's inner helper
-      still knows its class). Used to resolve `self.x()`/`this.x()` calls: in
-      python/rust/ruby (`self`) and javascript/typescript/java (`this`), the
-      receiver is statically the enclosing class -- no type inference needed
-      -- so the callee name is scoped to `<class_qname>.<member>` instead of
-      the bare rightmost member. Every other receiver shape keeps the
-      rightmost-member best-effort below; full receiver resolution would
-      require type inference, deliberately out of scope.
+  function bodies, because calls and imports live there. The per-node context
+  threaded down the walk (scope, enclosing definition, receiver, ...) is
+  `RetrievalNode.Graph.Extractor.TreeSitter.WalkState`; its moduledoc defines
+  every field. Because `extract/3` walks exactly one already-parsed file's root
+  node per call, every reference's `from` can only ever name a definition from
+  THIS file.
 
   Defensive cap: at most `@max_items` combined entities+references are
   collected per file; a generated/minified file could otherwise produce
   millions of rows downstream. Collection (and further descent into the
   subtree that would exceed it) stops once the cap is hit.
+
+  ## Extraction rules
+
+  Every change to this module must follow these rules.
+
+  ### Naming
+
+    * A `qualified_name` is the enclosing scope's segments plus the definition's
+      own name, joined with ".". Segments come from AST name fields, not from
+      splitting arbitrary source text.
+    * Language path separators (`::`, Ruby `A::B`, Rust `a::B`) are normalized
+      to ".".
+    * Type arguments are not part of identity: `Foo<T>` is `Foo` (Rust impl
+      types and trait names, Go generic receivers).
+    * Quoted member names are unquoted (`"helper"() {}` is `helper`).
+    * Output names never contain `::`, whitespace, quotes, backticks,
+      parentheses or `..`, and never start or end with ".". Import references
+      are module/path strings and are exempt from the `::`/`..`/dot rules. The
+      test helper asserts all of this on every result.
+    * JS/TS names the parser recognises as identifiers are taken as-is:
+      Unicode identifiers, `#private` names (kept with their `#`, matching the
+      `this.#x` callee) and `namespace A.B`. Only LITERAL member keys are
+      validated: a string literal (also inside `[...]`, comments ignored) names
+      the member when its DECODED value (escapes resolved, never quote-trimmed
+      source text) is an ECMAScript IdentifierName, including the Other_ID_*
+      code points. Any other
+      key (`[expr]`, `"a b"`, numbers) makes an anonymous function-like
+      container: no entity, body still walked. A TS ambient module is named by
+      its path string (`"pkg-a"`, `"@scope/pkg"`) when that satisfies the
+      output naming rules.
+    * JS/TS identifiers are canonical: `\\u` escapes inside an identifier are
+      decoded the same way EVERYWHERE a name is emitted: definitions, callees,
+      and import specifiers/default imports (`h\\u0065lper` is `helper` in
+      all three). String values (literal keys, module names, import sources)
+      decode every escape, including legacy octal (`\\157` is `o`) with
+      ECMAScript's digit-length limits; an undecodable or non-hygienic import
+      source is omitted.
+    * A Rust impl's type identity is its path type: references and pointers
+      unwrap to the pointee, generics to their base. A type without one (tuple,
+      array, slice, fn pointer, ...) makes the trait the container
+      (`impl X for (A, B)` names `X`); an inherent impl on such a type adds no
+      scope segment.
+    * Remaining source-text splitting is confined to nodes whose text is
+      already a path (Ruby `constant`/`scope_resolution`, Rust path types and
+      impl paths, callee fallback), where `::`/`.` are the only separators.
+
+  ### Evaluation scope
+
+  A definition's header is evaluated in the ENCLOSING scope (the outer
+  receiver and `from`); only its body sees the new scope.
+
+    * Python parameter defaults, annotations and class bases.
+    * JS/TS class heritage (`extends <expr>`) and computed member keys, for
+      class members and object-literal methods alike.
+    * Ruby superclass expressions, and the `expr` of `class << expr`.
+
+  ### Receiver binding
+
+  The receiver is what `self`/`this` calls qualify to (`WalkState.receiver`).
+  An unresolved receiver leaves the callee bare; never guess.
+  A class or module with no emitted name (unnamed, or its name rejected as
+  oversized/unstorable) has no identity for `self` to resolve to, so it is a
+  receiver boundary in every language, except a Python class BODY, which
+  never binds `self` (its `self`-taking methods stay unresolved instead).
+
+    * Python: a method binds its class only if it takes `self`. A class body
+      keeps the outer receiver. A nested def or lambda that takes `self`
+      shadows the outer one.
+    * JS/TS: ordinary functions (declarations, expressions, generators) and
+      object-literal methods rebind `this`, so it is unresolved inside them.
+      Arrow functions inherit it. Anonymous classes are boundaries.
+    * Java: anonymous class bodies (`new T() { ... }`, enum constant bodies)
+      are boundaries.
+    * Rust: `self` calls in `impl Trait for T` target `T`, where the inherent
+      members live, while definitions are scoped `T.Trait`. A rooted impl type
+      path (`crate::`, `self::`, `super::`) resolves against the enclosing
+      MODULE path only, never function or impl names.
+    * Ruby: `def self.x` binds the class. `def A.x` binds `A` (not re-prefixed
+      when already inside `A`). Singleton methods and singleton classes on an
+      unresolvable receiver clear it. A nested `def` defines on the containing
+      class, not on the enclosing method.
+
+  ### Callees
+
+  Only identifier, path and member callees are named, after unwrapping
+  grouping parentheses and Rust generic/turbofish wrappers. Any other callee
+  expression emits no reference, but the calls nested inside it are still
+  collected.
+
+  ### Limits
+
+  The item cap, the symbol-size limit and storability (no control characters,
+  e.g. a decoded NUL) are enforced only in `add_entity/2` and
+  `add_reference/2`, the single emission choke point. The walkers' `at_cap?/1`
+  checks are early exits, never the enforcement. A definition whose name would
+  be rejected there is treated as anonymous, so it never becomes scope, `from`
+  or receiver: every reference's `from` names an emitted entity.
+
+  ### Change discipline
+
+  A fix states the rule it implements and checks the same construct in every
+  language this module handles.
   """
 
   @behaviour RetrievalNode.Graph.Extractor
 
+  alias RetrievalNode.Graph.Extractor.TreeSitter.WalkState
   alias TreeSitterLanguagePack, as: TS
 
   @max_items 10_000
@@ -172,15 +253,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     import_kinds = Map.get(@import_kinds, language, [])
     lang_ctx = %{def_kinds: def_kinds, call_kind: call_kind, import_kinds: import_kinds}
 
-    state = %{
-      scope: [],
-      mod_scope: [],
-      container_kind: nil,
-      enclosing_qname: nil,
-      class_qname: nil,
-      pending_class: nil,
-      self_name: nil
-    }
+    state = %WalkState{}
 
     acc = %{entities: [], references: [], count: 0}
 
@@ -220,8 +293,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         handle_import(child, source, language, state, acc)
 
       anonymous_function?(language, kind) ->
-        class_qname = if this_rebinding?(language, kind), do: nil, else: state.class_qname
-        state = %{state | container_kind: :function_like, class_qname: class_qname}
+        receiver = if this_rebinding?(language, kind), do: nil, else: state.receiver
+        state = %{state | container_kind: :function_like, receiver: receiver}
         walk(child, source, language, lang_ctx, state, acc)
 
       true ->
@@ -232,7 +305,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp process_scope_child(child, kind, source, language, lang_ctx, state, acc) do
     cond do
       this_rebinding?(language, kind) ->
-        walk(child, source, language, lang_ctx, %{state | class_qname: nil}, acc)
+        walk(child, source, language, lang_ctx, %{state | receiver: nil}, acc)
 
       python_self_lambda?(child, kind, source, language) ->
         walk_python_lambda(child, source, language, lang_ctx, state, acc)
@@ -241,7 +314,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         walk_ruby_singleton_class(child, source, language, lang_ctx, state, acc)
 
       java_anonymous_class_body?(language, kind, child) ->
-        state = %{state | container_kind: :class_like, class_qname: nil}
+        state = %{state | container_kind: :class_like, receiver: nil}
         walk(child, source, language, lang_ctx, state, acc)
 
       true ->
@@ -276,10 +349,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
               do: base,
               else: base ++ segs
 
-          %{state | scope: scope, class_qname: Enum.join(scope, ".")}
+          %{state | scope: scope, receiver: Enum.join(scope, ".")}
 
         _ ->
-          %{state | class_qname: nil}
+          %{state | receiver: nil}
       end
 
     walk_nodes(List.wrap(body), source, language, lang_ctx, inner, acc)
@@ -300,7 +373,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     params = TS.node_child_by_field_name(node, "parameters")
     body = TS.node_child_by_field_name(node, "body")
     acc = walk(params, source, language, lang_ctx, state, acc)
-    walk_nodes(List.wrap(body), source, language, lang_ctx, %{state | class_qname: nil}, acc)
+    walk_nodes(List.wrap(body), source, language, lang_ctx, %{state | receiver: nil}, acc)
   end
 
   # Ordinary js/ts functions bind their own `this`; arrow functions inherit
@@ -468,21 +541,24 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
     state = %{state | scope: scope}
 
-    name =
-      case type_name && TS.node_child_by_field_name(child, "trait") do
-        nil ->
-          type_name
+    trait_name =
+      case TS.node_child_by_field_name(child, "trait") do
+        nil -> nil
+        trait_node -> rust_trait_name(trait_node, source)
+      end
 
-        trait_node ->
-          case rust_trait_name(trait_node, source) do
-            nil -> type_name
-            trait_name -> type_name <> "." <> trait_name
-          end
+    # A type without path identity makes the trait the container; with neither
+    # there is no impl scope segment.
+    name =
+      case {type_name, trait_name} do
+        {nil, trait} -> trait
+        {type, nil} -> type
+        {type, trait} -> type <> "." <> trait
       end
 
     # Trait-qualified scope names the definitions, but `self.x()` resolves to
     # the impl's TYPE, where the inherent members live.
-    state = %{state | self_name: type_name}
+    state = %{state | self_target: type_name}
     handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
   end
 
@@ -529,7 +605,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
              Enum.reverse(String.split(receiver, "."))
            ),
            do: {state, name},
-           else: {%{state | self_name: receiver}, receiver <> "." <> name}
+           else: {%{state | self_target: receiver}, receiver <> "." <> name}
 
       handle_definition_category(
         child,
@@ -544,7 +620,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     else
       # `def other.run`: `self` inside is an unresolvable object.
       state =
-        if object && TS.node_kind(object) != "self", do: %{state | class_qname: nil}, else: state
+        if object && TS.node_kind(object) != "self", do: %{state | receiver: nil}, else: state
 
       handle_definition_category(
         child,
@@ -567,12 +643,12 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
          source,
          "ruby" = language,
          lang_ctx,
-         %{container_kind: container, class_qname: class_qname} = state,
+         %{container_kind: container, receiver: receiver} = state,
          acc
        )
-       when container in [:function_like, :method_like] and is_binary(class_qname) do
+       when container in [:function_like, :method_like] and is_binary(receiver) do
     name = name_field(child, language, kind, source)
-    state = %{state | scope: String.split(class_qname, ".")}
+    state = %{state | scope: String.split(receiver, ".")}
     handle_definition_category(child, :method_like, name, source, language, lang_ctx, state, acc)
   end
 
@@ -677,45 +753,52 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
-  # Scope/qname/class_qname threading, identical once `category` and `name`
+  # Scope/qname/receiver threading, identical once `category` and `name`
   # are known regardless of how they were derived.
   defp handle_definition_category(child, category, name, source, language, lang_ctx, state, acc) do
-    {new_scope, new_enclosing_qname, new_class_qname, acc} =
+    # A name that can't be emitted (oversized, or carrying control characters)
+    # must never become scope, `from` or receiver either: the definition is
+    # treated as anonymous, so every `from` names an emitted entity.
+    name = if name && emittable_name?(Enum.join(state.scope ++ [name], ".")), do: name
+
+    {new_scope, new_enclosing_qname, new_receiver, acc} =
       case name do
         nil ->
-          {state.scope, state.enclosing_qname, state.class_qname, acc}
+          {state.scope, state.enclosing_qname, state.receiver, acc}
 
         _ ->
           qname = Enum.join(state.scope ++ [name], ".")
           entity_kind = entity_kind_for(category, state.container_kind)
           entity = %{qualified_name: qname, kind: entity_kind, line: line(child)}
 
-          class_qname =
-            if receiver_owner?(category, state.self_name),
-              do: Enum.join(state.scope ++ [state.self_name || name], "."),
-              else: state.class_qname
+          receiver =
+            if receiver_owner?(category, state.self_target),
+              do: Enum.join(state.scope ++ [state.self_target || name], "."),
+              else: state.receiver
 
-          {state.scope ++ [name], qname, class_qname, add_entity(acc, entity)}
+          {state.scope ++ [name], qname, receiver, add_entity(acc, entity)}
       end
 
-    {new_class_qname, pending_class} =
-      python_class_receiver(language, category, state, new_class_qname, child, source)
+    {new_receiver, pending_receiver} =
+      python_class_receiver(language, category, state, new_receiver, child, source)
+
+    pending_receiver = unresolved_if_anonymous_class(pending_receiver, language, category, name)
 
     if at_cap?(acc) do
       acc
     else
-      new_state = %{
+      new_state = %WalkState{
         scope: new_scope,
         mod_scope: next_mod_scope(state.mod_scope, language, category, name),
         container_kind: category,
         enclosing_qname: new_enclosing_qname,
-        class_qname:
+        receiver:
           if(receiver_boundary?(child, source, language, category, name, state),
             do: nil,
-            else: new_class_qname
+            else: new_receiver
           ),
-        pending_class: pending_class,
-        self_name: nil
+        pending_receiver: pending_receiver,
+        self_target: nil
       }
 
       walk_definition(child, category, language, source, lang_ctx, state, new_state, acc)
@@ -753,7 +836,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
             acc
 
           Map.has_key?(lang_ctx.def_kinds, TS.node_kind(member)) ->
-            keys_state = Map.put(inner_state, :keys_done, true)
+            keys_state = %{inner_state | keys_done: true}
             process_child(member, source, language, lang_ctx, keys_state, acc)
 
           true ->
@@ -768,9 +851,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   # Entering a python class does not bind `self`: its direct statements keep the
   # outer receiver and only functions defined directly in the body get the
-  # class (held in `pending_class` meanwhile) as theirs.
-  defp python_class_receiver("python", :class_like, state, class_qname, _node, _source),
-    do: {state.class_qname, class_qname}
+  # class (held in `pending_receiver` meanwhile) as theirs.
+  defp python_class_receiver("python", :class_like, state, receiver, _node, _source),
+    do: {state.receiver, receiver}
 
   defp python_class_receiver(
          "python",
@@ -781,12 +864,22 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
          source
        ) do
     if python_binds_self?(node, source),
-      do: {state.pending_class || state.class_qname, nil},
-      else: {state.class_qname, nil}
+      do: {self_receiver(state), nil},
+      else: {state.receiver, nil}
   end
 
-  defp python_class_receiver(_language, _category, _state, class_qname, _node, _source),
-    do: {class_qname, nil}
+  defp python_class_receiver(_language, _category, _state, receiver, _node, _source),
+    do: {receiver, nil}
+
+  # A python class whose name was rejected (not emittable) has no identity for
+  # `self` in its methods to resolve to: they stay unresolved, never falling
+  # back to an outer receiver. Its BODY still keeps the outer receiver.
+  defp unresolved_if_anonymous_class(_pending, "python", :class_like, nil), do: :unresolved
+  defp unresolved_if_anonymous_class(pending, _language, _category, _name), do: pending
+
+  defp self_receiver(%WalkState{pending_receiver: :unresolved}), do: nil
+  defp self_receiver(%WalkState{pending_receiver: nil, receiver: receiver}), do: receiver
+  defp self_receiver(%WalkState{pending_receiver: pending}), do: pending
 
   defp python_binds_self?(node, source) do
     case TS.node_child_by_field_name(node, "parameters") do
@@ -810,11 +903,11 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     walk_nodes(List.wrap(body), source, language, lang_ctx, inner_state, acc)
   end
 
-  defp receiver_owner?(category, _self_name) when category in [:class_like, :module_like],
+  defp receiver_owner?(category, _self_target) when category in [:class_like, :module_like],
     do: true
 
-  defp receiver_owner?(:method_like, self_name), do: not is_nil(self_name)
-  defp receiver_owner?(_category, _self_name), do: false
+  defp receiver_owner?(:method_like, self_target), do: not is_nil(self_target)
+  defp receiver_owner?(_category, _self_target), do: false
 
   defp next_mod_scope(mod_scope, "rust", :module_like, name) when is_binary(name),
     do: mod_scope ++ [name]
@@ -825,9 +918,21 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # identity to resolve a receiver to.
   defp receiver_boundary?(node, source, language, category, name, state) do
     this_rebinding?(language, TS.node_kind(node)) or object_literal_method?(node) or
-      (is_nil(name) and category == :class_like) or
+      anonymous_container?(name, category, language) or
       python_rebinds_self?(node, source, language, state)
   end
+
+  # An unnamed (or rejected-name) class or module has no identity for `self` to
+  # resolve to, in every language; except a Python class body, which never binds
+  # `self` at all and keeps the outer receiver (its methods are handled via
+  # `:unresolved` pending_receiver).
+  defp anonymous_container?(nil, :class_like, "python"), do: false
+
+  defp anonymous_container?(nil, category, _language)
+       when category in [:class_like, :module_like],
+       do: true
+
+  defp anonymous_container?(_name, _category, _language), do: false
 
   # A python function nested in a function (not a direct method) that takes its
   # own `self` parameter shadows the outer receiver.
@@ -855,7 +960,16 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
        do: walk_js_class(node, source, lang, lang_ctx, outer, inner, acc)
 
   # A class member's computed key was already walked in the class's enclosing state.
-  defp walk_definition(node, _category, lang, source, lang_ctx, %{keys_done: true}, inner, acc)
+  defp walk_definition(
+         node,
+         _category,
+         lang,
+         source,
+         lang_ctx,
+         %WalkState{keys_done: true},
+         inner,
+         acc
+       )
        when lang in ["javascript", "typescript"] do
     children = node |> named_children() |> Enum.reject(&computed_key?/1)
     walk_nodes(children, source, lang, lang_ctx, inner, acc)
@@ -908,7 +1022,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
           :not_import ->
             add_reference(acc, %{
-              name: scoped_callee_name(name, self_receiver?, state.class_qname),
+              name: scoped_callee_name(name, self_receiver?, state.receiver),
               kind: :call,
               from: state.enclosing_qname,
               line: line(child)
@@ -922,10 +1036,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # lexically the enclosing class. Scoped only when a class-like/module-like
   # ancestor is actually in scope (e.g. a top-level JS `this.x()` has none --
   # falls back to the bare name).
-  defp scoped_callee_name(name, true, class_qname) when is_binary(class_qname),
-    do: class_qname <> "." <> name
+  defp scoped_callee_name(name, true, receiver) when is_binary(receiver),
+    do: receiver <> "." <> name
 
-  defp scoped_callee_name(name, _self_receiver?, _class_qname), do: name
+  defp scoped_callee_name(name, _self_receiver?, _receiver), do: name
 
   defp callee_name(call_node, source, "python") do
     with fn_node when not is_nil(fn_node) <- callee_node(call_node) do
@@ -935,7 +1049,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp callee_name(call_node, source, lang) when lang in ["javascript", "typescript"] do
     with fn_node when not is_nil(fn_node) <- callee_node(call_node) do
-      qualified_or_bare(fn_node, source, "member_expression", "object", "property", &this_node?/2)
+      fn_node
+      |> qualified_or_bare(source, "member_expression", "object", "property", &this_node?/2)
+      |> decode_js_callee()
     end
   end
 
@@ -993,6 +1109,11 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp callee_name(_call_node, _source, _language), do: nil
+
+  # Identifiers may spell characters as `\u` escapes (`this.h\u0065lper()`);
+  # canonicalize callees exactly like definition names (decode_js_identifier/1).
+  defp decode_js_callee({name, self?}), do: {decode_js_identifier(name), self?}
+  defp decode_js_callee(nil), do: nil
 
   # `(helper)()` / `(this.helper)()`: grouping parentheses don't change the callee.
   defp callee_node(call_node) do
@@ -1184,8 +1305,15 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
       src_node ->
         ln = line(node)
-        module_ref = {strip_quotes(slice(source, src_node)), ln}
-        [module_ref | js_import_symbol_refs(node, source, ln)]
+        # The source is a string literal: decoded like any js/ts string value,
+        # and omitted when it doesn't decode to a usable import path.
+        module_refs =
+          case js_import_path(js_string_value(src_node, source)) do
+            nil -> []
+            path -> [{path, ln}]
+          end
+
+        module_refs ++ js_import_symbol_refs(node, source, ln)
     end
   end
 
@@ -1254,6 +1382,14 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp import_refs(_node, _source, _language), do: []
+
+  # Import paths may be relative (`./x`) or scoped (`@s/p`) but, like every
+  # emitted name, contain no whitespace, quotes, backticks or parentheses.
+  defp js_import_path(path) when is_binary(path) do
+    if path != "" and not String.match?(path, ~r/[\s"'`()]/u), do: path
+  end
+
+  defp js_import_path(_path), do: nil
 
   defp rust_use_paths(node, prefix, source) do
     case TS.node_kind(node) do
@@ -1338,7 +1474,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp js_clause_child_refs(child, source, ln) do
     case TS.node_kind(child) do
       "identifier" ->
-        [{slice(source, child), ln}]
+        [{decode_js_identifier(slice(source, child)), ln}]
 
       "named_imports" ->
         child
@@ -1351,10 +1487,21 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
+  # Specifier names are canonical like every js/ts identifier; an ES2022 string
+  # specifier (`{ "a-b" as x }`) is its decoded value when that is an
+  # identifier, otherwise it names nothing.
   defp import_specifier_ref(spec, source, ln) do
     case TS.node_child_by_field_name(spec, "name") do
-      nil -> []
-      name_node -> [{slice(source, name_node), ln}]
+      nil ->
+        []
+
+      name_node ->
+        name =
+          if TS.node_kind(name_node) == "string",
+            do: name_node |> js_string_value(source) |> literal_identifier(),
+            else: decode_js_identifier(slice(source, name_node))
+
+        if name, do: [{name, ln}], else: []
     end
   end
 
@@ -1457,22 +1604,185 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp name_field(node, "rust", "impl_item", source) do
     case TS.node_child_by_field_name(node, "type") do
       nil -> nil
-      type_node -> source |> slice(rust_base_type_node(type_node)) |> rust_dotted()
+      type_node -> rust_impl_type_name(type_node, source)
     end
   end
 
-  defp name_field(node, _language, _kind, source) do
+  # A TS ambient module (`declare module "pkg-a" {}`) is named by its module
+  # path string; keep it when the path is a hygienic symbol, else anonymous.
+  defp name_field(node, "typescript", "module", source) do
     case TS.node_child_by_field_name(node, "name") do
       nil -> nil
-      name_node -> definition_name_text(name_node, source)
+      name_node -> module_path_name(name_node, source)
     end
   end
 
-  # js/ts allow string-literal method names (`"helper"() {}`).
-  defp definition_name_text(name_node, source) do
-    if TS.node_kind(name_node) == "string",
-      do: string_content(name_node, source),
-      else: slice(source, name_node)
+  defp name_field(node, language, _kind, source) do
+    case TS.node_child_by_field_name(node, "name") do
+      nil -> nil
+      name_node -> definition_name_text(name_node, source, language)
+    end
+  end
+
+  # js/ts definition names. A name node the PARSER recognised as an identifier
+  # is taken as-is: Unicode identifiers, `#private` names (kept with their `#`,
+  # matching the `C.#helper` callee `this.#helper()` resolves to) and TS
+  # `namespace A.B` (`nested_identifier`). Only LITERAL member keys are
+  # validated: a string literal (also inside `[...]`, ignoring comments) names
+  # the member when its DECODED value (`js_string_value/2`) is an ECMAScript
+  # IdentifierName. Anything else (`[expr]`, `"a b"`, numbers, undecodable
+  # strings) yields nil, i.e. an anonymous function-like container.
+  @js_identifier_nodes ~w(identifier property_identifier type_identifier private_property_identifier nested_identifier)
+
+  # ECMAScript IdentifierName: ID_Start = L + Nl + Other_ID_Start (U+1885, U+1886,
+  # U+2118, U+212E, U+309B, U+309C), minus Pattern_Syntax (U+2E2F); ID_Continue
+  # adds Mn, Mc, Nd, Pc and Other_ID_Continue (U+00B7, U+0387, U+1369-U+1371,
+  # U+19DA); JS also allows `$`, `_`, ZWNJ and ZWJ.
+  @js_id_start ~S"\p{L}\p{Nl}\x{1885}\x{1886}\x{2118}\x{212E}\x{309B}\x{309C}$_"
+  @js_id_continue @js_id_start <>
+                    ~S"\p{Mn}\p{Mc}\p{Nd}\p{Pc}\x{00B7}\x{0387}\x{1369}-\x{1371}\x{19DA}\x{200C}\x{200D}"
+  @js_identifier Regex.compile!(
+                   "\\A(?!.*\\x{2E2F})[#{@js_id_start}][#{@js_id_continue}]*\\z",
+                   "u"
+                 )
+
+  defp definition_name_text(name_node, source, language)
+       when language in ["javascript", "typescript"] do
+    case TS.node_kind(name_node) do
+      kind when kind in @js_identifier_nodes ->
+        name_node |> then(&slice(source, &1)) |> decode_js_identifier()
+
+      "string" ->
+        name_node |> js_string_value(source) |> literal_identifier()
+
+      "computed_property_name" ->
+        name_node |> computed_key_string(source) |> literal_identifier()
+
+      _ ->
+        nil
+    end
+  end
+
+  defp definition_name_text(name_node, source, _language), do: slice(source, name_node)
+
+  defp literal_identifier(text) when is_binary(text),
+    do: if(text =~ @js_identifier, do: text)
+
+  defp literal_identifier(_text), do: nil
+
+  defp computed_key_string(node, source) do
+    case node |> named_children() |> Enum.reject(&(TS.node_kind(&1) =~ "comment")) do
+      [str] -> if TS.node_kind(str) == "string", do: js_string_value(str, source)
+      _ -> nil
+    end
+  end
+
+  # The decoded value of a js/ts string literal, from its `string_fragment` and
+  # `escape_sequence` children (never by trimming quotes off the source text,
+  # which would also strip quotes that are part of the value). nil when the
+  # literal can't be decoded to valid UTF-8 (e.g. a lone surrogate escape).
+  defp js_string_value(str_node, source) do
+    str_node
+    |> named_children()
+    |> Enum.reduce_while([], fn child, acc ->
+      case TS.node_kind(child) do
+        "string_fragment" ->
+          {:cont, [slice(source, child) | acc]}
+
+        "escape_sequence" ->
+          {:cont, Enum.reverse(List.wrap(decode_js_escape(slice(source, child)))) ++ acc}
+
+        _ ->
+          {:halt, :error}
+      end
+    end)
+    |> case do
+      :error -> nil
+      # Line continuations decode to ""; drop them so a surrogate pair split
+      # by one (`\\uD835\\<newline>\\uDC9C`) still pairs.
+      parts -> parts |> Enum.reverse() |> Enum.reject(&(&1 == "")) |> join_js_parts([])
+    end
+  end
+
+  # An identifier's `\uXXXX`/`\u{...}` escapes decoded to their characters (the
+  # only escapes identifiers allow), so `h\u0065lper` and `helper` are one name.
+  # Left as written if an escape doesn't decode to a valid character.
+  defp decode_js_identifier(name) when is_binary(name) do
+    if String.contains?(name, "\\u") do
+      parts =
+        Regex.split(~r/\\u\{[0-9A-Fa-f]+\}|\\u[0-9A-Fa-f]{4}/, name, include_captures: true)
+        |> Enum.map(fn
+          "\\u" <> _ = esc -> decode_js_escape(esc)
+          text -> text
+        end)
+
+      join_js_parts(parts, []) || name
+    else
+      name
+    end
+  end
+
+  # Code units from \u escapes may form UTF-16 surrogate pairs; combine them.
+  defp join_js_parts([{:cu, hi}, {:cu, lo} | rest], acc)
+       when hi in 0xD800..0xDBFF and lo in 0xDC00..0xDFFF,
+       do: join_js_parts(rest, [<<0x10000 + (hi - 0xD800) * 0x400 + (lo - 0xDC00)::utf8>> | acc])
+
+  # An unpaired surrogate or an out-of-range escape: not a valid string value.
+  defp join_js_parts([{:cu, :invalid} | _rest], _acc), do: nil
+  defp join_js_parts([{:cu, cu} | _rest], _acc) when cu in 0xD800..0xDFFF, do: nil
+  defp join_js_parts([{:cu, cu} | rest], acc), do: join_js_parts(rest, [<<cu::utf8>> | acc])
+  defp join_js_parts([part | rest], acc), do: join_js_parts(rest, [part | acc])
+  defp join_js_parts([], acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+
+  defp decode_js_escape("\\u{" <> rest), do: {:cu, rest |> String.trim_trailing("}") |> hex()}
+  defp decode_js_escape("\\u" <> hex4), do: {:cu, hex(hex4)}
+  defp decode_js_escape("\\x" <> hex2), do: {:cu, hex(hex2)}
+  defp decode_js_escape("\\n"), do: "\n"
+  defp decode_js_escape("\\t"), do: "\t"
+  defp decode_js_escape("\\r"), do: "\r"
+  defp decode_js_escape("\\b"), do: "\b"
+  defp decode_js_escape("\\f"), do: "\f"
+  defp decode_js_escape("\\v"), do: "\v"
+  # Legacy octal escape (non-strict JS): a leading 0-3 takes up to three octal
+  # digits, 4-7 up to two; the parser hands over the whole digit run, so any
+  # surplus digit is literal text (`\477` is `'7`). `\0` alone is NUL; `\8` and
+  # `\9` fall through to the identity escape below.
+  defp decode_js_escape(<<"\\", d, digits::binary>>) when d in ?0..?7 do
+    all = <<d>> <> digits
+
+    if all =~ ~r/\A[0-7]+\z/ do
+      {octal, rest} = String.split_at(all, if(d <= ?3, do: 3, else: 2))
+      [{:cu, String.to_integer(octal, 8)}, rest]
+    else
+      all
+    end
+  end
+
+  # A line continuation (backslash + line terminator) contributes nothing.
+  defp decode_js_escape("\\" <> rest)
+       when rest in ["\n", "\r\n", "\r", <<0x2028::utf8>>, <<0x2029::utf8>>],
+       do: ""
+
+  defp decode_js_escape("\\" <> char), do: char
+
+  # Out-of-range code points (> U+10FFFF) can't be encoded: a distinct :invalid
+  # marker that join_js_parts/2 rejects (never a pairable surrogate).
+  defp hex(digits) do
+    case Integer.parse(digits, 16) do
+      {cp, ""} when cp <= 0x10FFFF -> cp
+      _ -> :invalid
+    end
+  end
+
+  # Module path strings (`pkg-a`, `@scope/pkg`) keep `-`, `@` and `/`, but must
+  # still satisfy the output naming rules (see the moduledoc).
+  defp module_path_name(name_node, source) do
+    text = if TS.node_kind(name_node) == "string", do: js_string_value(name_node, source)
+
+    if is_binary(text) and text != "" and not String.match?(text, ~r/[\s"'`()]/u) and
+         not String.contains?(text, ["::", ".."]) and
+         not (String.starts_with?(text, ".") or String.ends_with?(text, ".")),
+       do: text
   end
 
   defp rust_dotted(path),
@@ -1485,13 +1795,29 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp ruby_dotted(name), do: name |> String.split("::") |> Enum.map_join(".", &String.trim/1)
 
-  # `Foo<T>` -> `Foo`: type arguments are not part of a symbol's identity.
-  defp rust_base_type_node(type_node) do
-    with "generic_type" <- TS.node_kind(type_node),
-         inner when not is_nil(inner) <- TS.node_child_by_field_name(type_node, "type") do
-      inner
-    else
-      _ -> type_node
+  # A Rust impl's type identity is its PATH type: references and pointers are
+  # unwrapped to the pointee, generics to their base type. A type with no path
+  # identity (tuple, array, slice, fn pointer, `dyn`, ...) yields nil.
+  defp rust_impl_type_name(type_node, source) do
+    case rust_path_type_node(type_node) do
+      nil -> nil
+      node -> source |> slice(node) |> rust_dotted()
+    end
+  end
+
+  defp rust_path_type_node(node) do
+    case TS.node_kind(node) do
+      kind when kind in ["generic_type", "reference_type", "pointer_type"] ->
+        case TS.node_child_by_field_name(node, "type") do
+          nil -> nil
+          inner -> rust_path_type_node(inner)
+        end
+
+      kind when kind in ["type_identifier", "scoped_type_identifier", "primitive_type"] ->
+        node
+
+      _ ->
+        nil
     end
   end
 
@@ -1505,24 +1831,38 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp at_cap?(acc), do: acc.count >= @max_items
 
-  # The item cap and the symbol-size limit are both enforced HERE, at the single
-  # choke point every emission goes through, so no traversal path can exceed
-  # them; the `at_cap?/1` checks in the walkers are only early exits. A skipped
-  # oversized definition still extends the scope for its children, whose
-  # qualified names then exceed the limit too and are skipped consistently.
+  # The item cap, the symbol-size limit and storability are enforced HERE, at
+  # the single choke point every emission goes through, so no traversal path can
+  # exceed them; the `at_cap?/1` checks in the walkers are only early exits. A
+  # definition whose name isn't emittable was already made anonymous in
+  # handle_definition_category/8, so it never becomes scope or `from`.
   defp add_entity(%{count: count} = acc, _entity) when count >= @max_items, do: acc
 
   defp add_entity(acc, %{qualified_name: qname}) when byte_size(qname) > @max_symbol_bytes,
     do: acc
 
-  defp add_entity(acc, entity),
-    do: %{acc | entities: [entity | acc.entities], count: acc.count + 1}
+  defp add_entity(acc, %{qualified_name: qname} = entity) do
+    if storable_name?(qname),
+      do: %{acc | entities: [entity | acc.entities], count: acc.count + 1},
+      else: acc
+  end
 
   defp add_reference(%{count: count} = acc, _reference) when count >= @max_items, do: acc
 
   defp add_reference(acc, %{name: name}) when byte_size(name) > @max_symbol_bytes,
     do: acc
 
-  defp add_reference(acc, reference),
-    do: %{acc | references: [reference | acc.references], count: acc.count + 1}
+  defp add_reference(acc, %{name: name} = reference) do
+    if storable_name?(name),
+      do: %{acc | references: [reference | acc.references], count: acc.count + 1},
+      else: acc
+  end
+
+  # Decoded names can carry control characters (`\x00`, `\0`); NUL can't be
+  # stored in a Postgres text column, and no real symbol contains any C0/C1
+  # control or DEL, so such a name is skipped for every language here.
+  defp storable_name?(name), do: not String.match?(name, ~r/[\x{0}-\x{1F}\x{7F}-\x{9F}]/u)
+
+  # What add_entity/2 would accept; definitions check it before entering scope.
+  defp emittable_name?(name), do: byte_size(name) <= @max_symbol_bytes and storable_name?(name)
 end

@@ -18,7 +18,73 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
   defp extract(source, language) do
     root = parse(source, language)
     {:ok, result} = GraphTS.extract({root, source}, language, [])
+    assert_invariants!(result)
     result
+  end
+
+  @max_items 10_000
+  @symbol_forbidden [
+    {"`::`", "::"},
+    {"a double quote", "\""},
+    {"a single quote", "'"},
+    {"a backtick", "`"},
+    {"`(`", "("},
+    {"`)`", ")"},
+    {"`..`", ".."}
+  ]
+  @import_forbidden [
+    {"a double quote", "\""},
+    {"a single quote", "'"},
+    {"a backtick", "`"},
+    {"`(`", "("},
+    {"`)`", ")"}
+  ]
+
+  # Invariants every extraction result must satisfy, whatever the source.
+  defp assert_invariants!(%{entities: entities, references: references}) do
+    total = length(entities) + length(references)
+    assert total <= @max_items, "cap: #{total} entities+references exceeds #{@max_items}"
+
+    for %{qualified_name: name} = entity <- entities do
+      assert_symbol!(name, "entity #{inspect(entity)} qualified_name", @symbol_forbidden, true)
+    end
+
+    qnames = MapSet.new(entities, & &1.qualified_name)
+
+    for %{name: name, kind: kind, from: from} = ref <- references do
+      if kind == :import do
+        assert_symbol!(name, "import #{inspect(ref)} name", @import_forbidden, false)
+      else
+        assert_symbol!(name, "reference #{inspect(ref)} name", @symbol_forbidden, true)
+      end
+
+      assert is_nil(from) or MapSet.member?(qnames, from),
+             "from validity: reference #{inspect(ref)} has `from` #{inspect(from)} " <>
+               "that is not the qualified_name of any entity in the result"
+    end
+
+    :ok
+  end
+
+  defp assert_symbol!(name, label, forbidden, dotted?) do
+    assert is_binary(name) and name != "",
+           "#{label}: must be a non-empty string, got #{inspect(name)}"
+
+    assert not String.match?(name, ~r/\s/),
+           "#{label}: must not contain whitespace, got #{inspect(name)}"
+
+    assert not String.match?(name, ~r/[\x{0}-\x{1F}\x{7F}-\x{9F}]/u),
+           "#{label}: must not contain control characters, got #{inspect(name)}"
+
+    for {desc, bad} <- forbidden do
+      assert not String.contains?(name, bad),
+             "#{label}: must not contain #{desc}, got #{inspect(name)}"
+    end
+
+    if dotted? do
+      assert not (String.starts_with?(name, ".") or String.ends_with?(name, ".")),
+             "#{label}: must not start or end with `.`, got #{inspect(name)}"
+    end
   end
 
   describe "python" do
@@ -957,6 +1023,47 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       refute Enum.any?(entities, &(byte_size(&1.qualified_name) > 256))
       refute Enum.any?(refs, &(byte_size(&1.name) > 256))
     end
+
+    test "python: a rejected nested class keeps the outer receiver only in its body" do
+      long = String.duplicate("X", 300)
+
+      src = """
+      class Factory:
+          def build(self):
+              class #{long}:
+                  value = self.helper()
+
+                  def run(self):
+                      return self.helper()
+      """
+
+      %{references: refs} = extract(src, "python")
+      calls = for %{kind: :call, name: n, from: f} <- refs, do: {n, f}
+      # The class body captures build's `self` (Factory); `run`'s own `self` is
+      # an instance of the nameless class, so it stays unresolved (bare).
+      assert {"Factory.helper", "Factory.build"} in calls
+      assert {"helper", "Factory.build.run"} in calls
+    end
+
+    test "ruby: a rejected nested class or module clears the enclosing receiver" do
+      long = "M" <> String.duplicate("x", 300)
+
+      for kw <- ["module", "class"] do
+        src = "class C\n  #{kw} #{long}\n    self.helper\n  end\n  def self.helper; end\nend\n"
+        %{references: refs} = extract(src, "ruby")
+        # `self` in the nested body is that module/class, which has no identity.
+        refute Enum.any?(refs, &(&1.name == "C.helper"))
+        assert Enum.any?(refs, &(&1.name == "helper" and &1.from == "C"))
+      end
+    end
+
+    test "an oversized definition is anonymous: calls inside get the outer from" do
+      long = String.duplicate("x", 300)
+      src = "class K:\n    def #{long}(self):\n        helper()\n"
+      %{references: refs} = extract(src, "python")
+      # The invariant check in extract/2 also asserts every `from` is emitted.
+      assert [%{name: "helper", from: "K"}] = refs
+    end
   end
 
   describe "review regressions, round 4" do
@@ -1160,7 +1267,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       src = "class Outer { make() { class Inner { [this.key()]() {} } } }"
 
       for lang <- ["javascript", "typescript"] do
-        assert calls(src, lang) == [{"Outer.key", "Outer.make"}]
+        assert calls(src, lang) == [
+                 {"Outer.key", "Outer.make"}
+               ]
       end
     end
 
@@ -1213,6 +1322,196 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
         assert Enum.any?(r, &(&1.name == "Outer.key" and &1.from == "Outer.make"))
         refute Enum.any?(r, &(&1.name == "key"))
       end
+    end
+  end
+
+  describe "member names and impl types without a static identity" do
+    test "js/ts: parser identifiers keep Unicode names and their receiver" do
+      for lang <- ["javascript", "typescript"] do
+        src = "class Café { método() { this.otro(); } otro() {} }"
+        %{entities: e, references: r} = extract(src, lang)
+        assert find(e, "Café") && find(e, "Café.método") && find(e, "Café.otro")
+        assert Enum.any?(r, &(&1.name == "Café.otro" and &1.from == "Café.método"))
+      end
+    end
+
+    test "js/ts: literal keys use the full ECMAScript identifier sets" do
+      for lang <- ["javascript", "typescript"] do
+        %{entities: e} = extract(~s|class C { "℘"() {} ["a·b"]() {} "x‍y"() {} }|, lang)
+        assert find(e, "C.℘") && find(e, "C.a·b") && find(e, "C.x‍y")
+      end
+    end
+
+    test "js/ts: literal keys are validated on their decoded value" do
+      for lang <- ["javascript", "typescript"] do
+        src = ~S|class C { ["helper"]() {} ["'quoted'"]() {} "\u{1F600}"() {} "\uD83D"() {} }|
+        %{entities: e} = extract(src, lang)
+        # Escapes decode to `helper`; a key whose value contains quotes, a
+        # non-identifier character or a lone surrogate names no entity.
+        assert find(e, "C.helper")
+        assert e |> Enum.map(& &1.qualified_name) |> Enum.sort() == ["C", "C.helper"]
+      end
+    end
+
+    test "js/ts: escaped identifiers canonicalize alike in definitions and callees" do
+      for lang <- ["javascript", "typescript"] do
+        src = ~S"""
+        class C {
+          "helper"() {}
+          run() { this.helper(); this.h\u{65}lper(); }
+        }
+        """
+
+        %{entities: e, references: r} = extract(src, lang)
+        assert find(e, "C.helper") && find(e, "C.run")
+        calls = for %{kind: :call} = ref <- r, do: {ref.name, ref.from}
+        assert calls == [{"C.helper", "C.run"}, {"C.helper", "C.run"}]
+      end
+    end
+
+    test "js/ts: imports canonicalize escapes like definitions and callees" do
+      for lang <- ["javascript", "typescript"] do
+        src = ~S"""
+        import d\u0065f, { h\u0065lper, "x" as y, "a b" as z } from "p\u006bg";
+        import "./rel/m\u006fd";
+        """
+
+        %{references: r} = extract(src, lang)
+        imports = for %{kind: :import, name: name} <- r, do: name
+        assert Enum.sort(imports) == Enum.sort(["pkg", "def", "helper", "x", "./rel/mod"])
+      end
+    end
+
+    test "js/ts: a line continuation between surrogate escapes still pairs them" do
+      for lang <- ["javascript", "typescript"] do
+        # `\uD835\` + newline + `\uDC9C` is the single identifier character U+1D49C.
+        src = "class C { \"\\uD835\\\n\\uDC9C\"() {} \"\\uD835x\\uDC9C\"() {} }"
+        %{entities: e} = extract(src, lang)
+        assert e |> Enum.map(& &1.qualified_name) |> Enum.sort() == ["C", "C.\u{1D49C}"]
+      end
+    end
+
+    test "js/ts: decoded NULs and out-of-range escapes never become names" do
+      for lang <- ["javascript", "typescript"] do
+        src = ~S"""
+        import "pkg\x00";
+        import "ok";
+        class C { "a\u{110000}\uDC00"() {} "\u{10000}"() {} }
+        """
+
+        %{entities: e, references: r} = extract(src, lang)
+        assert for(%{kind: :import, name: n} <- r, do: n) == ["ok"]
+        # The out-of-range escape is rejected, not turned into a valid U+10000.
+        refute find(e, "C.a\u{10000}")
+      end
+
+      src = ~S|declare module "m\0x" { import "ok"; export function f() { g(); } }|
+      %{entities: e, references: r} = extract(src, "typescript")
+      refute Enum.any?(e, &String.contains?(&1.qualified_name, <<0>>))
+      # The unstorable module is anonymous: nothing inside points `from` it.
+      assert find(e, "f")
+      assert Enum.any?(r, &(&1.name == "ok" and is_nil(&1.from)))
+      assert Enum.any?(r, &(&1.name == "g" and &1.from == "f"))
+    end
+
+    test "javascript: legacy octal escapes decode with ECMAScript digit limits" do
+      src = ~S"""
+      const o = { "f\157o"() {}, "\101b"() {}, "a\477b"() {}, "\8x"() {} };
+      """
+
+      # \157 -> o, \101 -> A, \477 -> ' + "7" (quote: no entity), \8 -> 8.
+      %{entities: e} = extract(src, "javascript")
+      assert e |> Enum.map(& &1.qualified_name) |> Enum.sort() == ["Ab", "foo"]
+    end
+
+    test "js/ts: comments inside a computed string key don't drop the member" do
+      for lang <- ["javascript", "typescript"] do
+        %{entities: e} = extract(~s|class C { ["helper" /* why */]() {} }|, lang)
+        assert find(e, "C.helper")
+      end
+    end
+
+    test "typescript: dotted namespaces and string modules keep their scope" do
+      src = """
+      namespace A.B { export function run() {} }
+      namespace C.D { export function run() {} }
+      declare module "pkg-a" { export function g(): void {} }
+      declare module "@scope/pkg" { export function g(): void {} }
+      """
+
+      %{entities: e} = extract(src, "typescript")
+
+      for name <- ~w(A.B.run C.D.run pkg-a pkg-a.g @scope/pkg @scope/pkg.g),
+          do: assert(find(e, name), "missing #{name}")
+    end
+
+    test "js/ts: #private methods are entities matching their this.#x callees" do
+      for lang <- ["javascript", "typescript"] do
+        %{entities: e, references: r} =
+          extract("class C { #helper() {} run() { this.#helper(); } }", lang)
+
+        assert %{kind: :method} = find(e, "C.#helper")
+        assert Enum.any?(r, &(&1.name == "C.#helper" and &1.from == "C.run"))
+      end
+    end
+
+    test "js/ts: only identifier-like member keys become entities" do
+      for lang <- ["javascript", "typescript"] do
+        src = """
+        class C {
+          plain() {}
+          ["helper"]() {}
+          [this.key()]() { this.plain(); }
+          ['a b']() {}
+          "q c"() {}
+          "ok"() {}
+          [Symbol.iterator]() {}
+        }
+        """
+
+        assert ents(src, lang) == [
+                 {"C", :class},
+                 {"C.plain", :method},
+                 {"C.helper", :method},
+                 {"C.ok", :method}
+               ]
+
+        # Anonymous members still walk their bodies with the class receiver and
+        # the enclosing named definition as `from`.
+        assert calls(src, lang) == [{"key", nil}, {"C.plain", "C"}]
+      end
+    end
+
+    test "js/ts: anonymous object-literal member rebinds this" do
+      src = "class C { m() { return { [k()]() { this.x(); } }; } }"
+
+      for lang <- ["javascript", "typescript"] do
+        assert calls(src, lang) == [{"k", "C.m"}, {"x", "C.m"}]
+      end
+    end
+
+    test "rust: impl type identity is its path type" do
+      cases = [
+        {"impl Foo for &Bar { fn a(&self) { self.b(); } }", ["Bar.Foo", "Bar.Foo.a"], "Bar.b"},
+        {"impl Foo for &mut Bar { fn a(&self) { self.b(); } }", ["Bar.Foo", "Bar.Foo.a"],
+         "Bar.b"},
+        {"impl<'a, T> Foo for &'a T { fn a(&self) { self.b(); } }", ["T.Foo", "T.Foo.a"], "T.b"},
+        {"impl Foo for (A, B) { fn a(&self) { self.b(); } }", ["Foo", "Foo.a"], "Foo.b"},
+        {"impl Foo for [u8] { fn a(&self) { self.b(); } }", ["Foo", "Foo.a"], "Foo.b"},
+        {"impl Foo for [u8; 4] { fn a(&self) { self.b(); } }", ["Foo", "Foo.a"], "Foo.b"},
+        {"impl Foo for fn(u8) -> u8 { fn a(&self) { self.b(); } }", ["Foo", "Foo.a"], "Foo.b"},
+        {"impl Foo for *const Bar { fn a(&self) { self.b(); } }", ["Bar.Foo", "Bar.Foo.a"],
+         "Bar.b"}
+      ]
+
+      for {src, names, callee} <- cases do
+        assert Enum.map(ents(src, "rust"), &elem(&1, 0)) == names, src
+        assert [{^callee, _}] = calls(src, "rust"), src
+      end
+    end
+
+    test "rust: an inherent impl on a non-path type has no impl scope segment" do
+      assert ents("impl (A, B) { fn a(&self) {} }", "rust") == [{"a", :method}]
     end
   end
 
