@@ -282,31 +282,103 @@ defmodule RetrievalNode.Ingest.FileIngest do
   # FIRST chunk of the file rather than being dropped — imports are file-level
   # signal and losing them would gut the imports leg of the graph. Chunks with
   # no graph items get `nil`.
-  defp attach_graphs(chunks, entities, references) do
-    entities_by_chunk = Enum.group_by(entities, &chunk_index_for(&1, chunks))
-    references_by_chunk = Enum.group_by(references, &chunk_index_for(&1, chunks))
+  @doc false
+  def attach_graphs(chunks, entities, references) do
+    index = build_chunk_index(chunks)
+    entities_by_chunk = Enum.group_by(entities, &chunk_index_for(&1, index))
+    references_by_chunk = Enum.group_by(references, &chunk_index_for(&1, index))
 
     chunks
     |> Enum.with_index()
-    |> Enum.map(fn {_chunk, index} ->
-      graph_attrs(Map.get(entities_by_chunk, index, []), Map.get(references_by_chunk, index, []))
+    |> Enum.map(fn {_chunk, i} ->
+      graph_attrs(Map.get(entities_by_chunk, i, []), Map.get(references_by_chunk, i, []))
     end)
   end
 
   defp graph_attrs([], []), do: nil
   defp graph_attrs(entities, references), do: %{entities: entities, references: references}
 
-  defp chunk_index_for(item, chunks) do
-    case Enum.find_index(chunks, &contains?(&1, item)) do
-      nil -> 0
-      index -> index
+  # Three position indexes, each built once per file (O(n log n)) so every
+  # lookup is O(log n): chunks that carry bytes (byte containment), chunks
+  # without bytes (line containment for byte-carrying items), and all chunks
+  # (line containment for items with no byte).
+  defp build_chunk_index(chunks) do
+    indexed = Enum.with_index(chunks)
+
+    {with_bytes, without_bytes} =
+      Enum.split_with(indexed, fn {c, _} -> is_map_key(c, :start_byte) end)
+
+    %{
+      bytes: range_index(with_bytes, & &1.start_byte, &(&1.end_byte - 1)),
+      lines_unbyted: range_index(without_bytes, & &1.start_line, & &1.end_line),
+      lines_all: range_index(indexed, & &1.start_line, & &1.end_line)
+    }
+  end
+
+  # Starts sorted ascending with a running max of the (inclusive) ends: the
+  # first entry whose running max reaches x is the first chunk, in start order,
+  # that contains x — correct even when ranges touch or overlap.
+  defp range_index(indexed, start_fun, end_fun) do
+    sorted = Enum.sort_by(indexed, fn {c, i} -> {start_fun.(c), i} end)
+
+    {ends, _} =
+      Enum.map_reduce(sorted, nil, fn {c, _}, max ->
+        e = end_fun.(c)
+        m = if max == nil or e > max, do: e, else: max
+        {m, m}
+      end)
+
+    %{
+      starts: sorted |> Enum.map(fn {c, _} -> start_fun.(c) end) |> List.to_tuple(),
+      maxends: List.to_tuple(ends),
+      orig: sorted |> Enum.map(&elem(&1, 1)) |> List.to_tuple()
+    }
+  end
+
+  defp lookup(%{starts: starts} = idx, x) when tuple_size(starts) > 0 and is_integer(x) do
+    last = last_at_or_before(starts, x, 0, tuple_size(starts) - 1, nil)
+
+    if last != nil and elem(idx.maxends, last) >= x do
+      elem(idx.orig, first_reaching(idx.maxends, x, 0, last))
     end
   end
 
-  defp contains?(%{start_byte: sb, end_byte: eb}, %{byte: byte}),
-    do: byte >= sb and byte < eb
+  defp lookup(_idx, _x), do: nil
 
-  defp contains?(chunk, %{line: line}), do: line >= chunk.start_line and line <= chunk.end_line
+  # Rightmost position whose start <= x.
+  defp last_at_or_before(_t, _x, lo, hi, best) when lo > hi, do: best
+
+  defp last_at_or_before(t, x, lo, hi, best) do
+    mid = div(lo + hi, 2)
+
+    if elem(t, mid) <= x,
+      do: last_at_or_before(t, x, mid + 1, hi, mid),
+      else: last_at_or_before(t, x, lo, mid - 1, best)
+  end
+
+  # Leftmost position <= hi whose running max end >= x (hi itself qualifies).
+  defp first_reaching(_t, _x, lo, hi) when lo == hi, do: lo
+
+  defp first_reaching(t, x, lo, hi) do
+    mid = div(lo + hi, 2)
+
+    if elem(t, mid) >= x,
+      do: first_reaching(t, x, lo, mid),
+      else: first_reaching(t, x, mid + 1, hi)
+  end
+
+  # Byte containment applies only when both sides carry bytes; everything else
+  # compares lines. An item matching nothing goes to chunk 0.
+  defp chunk_index_for(%{byte: byte} = item, index) do
+    hits = [lookup(index.bytes, byte), lookup(index.lines_unbyted, Map.get(item, :line))]
+
+    case Enum.reject(hits, &is_nil/1) do
+      [] -> 0
+      found -> Enum.min(found)
+    end
+  end
+
+  defp chunk_index_for(%{line: line}, index), do: lookup(index.lines_all, line) || 0
 
   # Called only from inside a terminal `Repo.transaction` (`write/7`,
   # `reconcile_and_reap/3`), so the append-only audit rows commit exactly when
