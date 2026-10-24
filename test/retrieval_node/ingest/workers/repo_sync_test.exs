@@ -506,7 +506,7 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
       assert {:ok, _stats} = SourceOwner.drain(ctx.source.id)
 
       chunks = Repo.all(from c in Chunk, where: c.source_id == ^ctx.source.id)
-      assert chunks != [] and Enum.all?(chunks, &(&1.parse_status == :ok))
+      assert chunks != []
 
       names =
         Repo.all(
@@ -516,6 +516,48 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
         )
 
       assert "Pay.run" in names
+    end
+
+    @tag :tree_sitter
+    test "text outside defs stays indexed while the graph still has the def", ctx do
+      prev = Application.get_env(:retrieval_node, :chunking_impl)
+      Application.put_env(:retrieval_node, :chunking_impl, RetrievalNode.Chunking.TreeSitterImpl)
+      on_exit(fn -> Application.put_env(:retrieval_node, :chunking_impl, prev) end)
+
+      src = """
+      defmodule PayTest do
+        @moduledoc "Covers the payment flow."
+        use ExUnit.Case
+
+        def helper(x), do: x
+
+        test "pays the order" do
+          assert helper(1) == 1
+        end
+      end
+      """
+
+      commit(ctx.src, [{"pay_test.exs", src}])
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+      on_exit(fn -> SourceOwner.stop(ctx.source.id) end)
+      assert {:ok, _stats} = SourceOwner.drain(ctx.source.id)
+
+      text =
+        Repo.all(from c in Chunk, where: c.source_id == ^ctx.source.id, select: c.content)
+        |> Enum.join("\n")
+
+      assert text =~ "Covers the payment flow."
+      assert text =~ ~s(test "pays the order")
+      assert text =~ "use ExUnit.Case"
+
+      names =
+        Repo.all(
+          from e in RetrievalNode.Graph.Entity,
+            where: e.source_id == ^ctx.source.id,
+            select: e.qualified_name
+        )
+
+      assert "PayTest.helper" in names
     end
   end
 end

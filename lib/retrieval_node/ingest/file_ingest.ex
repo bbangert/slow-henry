@@ -68,7 +68,12 @@ defmodule RetrievalNode.Ingest.FileIngest do
   # chunk count into the tens of thousands, so batch defensively too.
   @insert_batch_size 2_000
 
+  # Every column derived from the staged row is refreshed on conflict; only the
+  # conflict target (source_id, chunk_key) and inserted_at are preserved.
   @replace_on_conflict [
+    :lang,
+    :repo,
+    :source_type,
     :content,
     :content_hash,
     :embedding,

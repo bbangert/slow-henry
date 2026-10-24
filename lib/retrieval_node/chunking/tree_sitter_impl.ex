@@ -14,19 +14,21 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   costs regular-scheduler fairness, and no in-VM guard catches a C-level segfault
   — that's the peer-node escape hatch's job, deferred to v1.1.
 
-  v1 covers the mainstream code languages plus Elixir; HEEx/EEx fall through to
+  v1 AST-chunks the mainstream code languages; Elixir/HEEx/EEx fall through to
   the heuristic chunker until their native-AST path lands (fast-follow).
 
-  Elixir is the one language here whose grammar has no fixed boundary-kind
-  set: `defmodule`/`def`/`defp`/... all parse as a bare `call` node (target:
-  identifier), so `chunk_boundary?/4` special-cases it with a predicate
-  (target text in `@elixir_def_forms`) instead of a kind-set lookup. The form
-  set and name canonicalisation (`defdelegate`, `Elixir.Foo` -> `Foo`) match
-  `Graph.Extractor.TreeSitter`, so chunk breadcrumbs agree with entity names.
+  Graph-only languages (`@graph_only_languages`, currently `elixir`) are parsed
+  by `chunk_with_graph/2` purely to extract entities/references; their `chunks`
+  stay the heuristic chunker's, so text outside definitions (ExUnit `test`
+  blocks, Ecto `schema`, router scopes, `@moduledoc`, `use` lines) remains
+  indexed. `chunk/2` rejects them as `:unsupported_language`, exactly as for any
+  heuristic-only language. Elixir moves to AST chunking only together with
+  top-level (gap) chunking, which preserves that coverage.
   """
 
   @behaviour RetrievalNode.Chunking
 
+  alias RetrievalNode.Chunking.HeuristicImpl
   alias RetrievalNode.Graph.Extractor
   alias TreeSitterLanguagePack, as: TS
 
@@ -39,20 +41,15 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   # to the tree in Phase 8; until then only tests use it (via start_supervised!).
   @supervisor RetrievalNode.ChunkTaskSupervisor
 
-  @allowed_languages ~w(python javascript typescript go rust ruby java elixir)
+  @allowed_languages ~w(python javascript typescript go rust ruby java)
 
-  # Elixir def-family forms that mark a chunk boundary when they're a `call`
-  # node's target identifier. defmodule/defprotocol/defimpl are containers
-  # (their do_block holds nested defs); the rest are leaf-most function chunks.
-  @elixir_module_forms ~w(defmodule defprotocol defimpl)
-  @elixir_function_forms ~w(def defp defmacro defmacrop defguard defguardp defdelegate)
-  @elixir_def_forms @elixir_module_forms ++ @elixir_function_forms
+  # Parsed for the graph only; chunk text comes from the heuristic chunker.
+  @graph_only_languages ~w(elixir)
 
   # Node kinds that mark a chunk boundary, per language. A node is emitted as a
   # chunk only if it has no chunkable descendants (leaf-most def); a container
   # (e.g. a class) yields its members instead, with the container name in the
-  # breadcrumb — so methods are chunks scoped as "Class > method". Elixir has
-  # no entry here — see `chunk_boundary?/4`.
+  # breadcrumb — so methods are chunks scoped as "Class > method".
   @chunk_kinds %{
     "python" => ~w(function_definition class_definition),
     "javascript" =>
@@ -73,7 +70,7 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   def chunk(source, language) when is_binary(source) do
     # Cheapest check first: an O(1) allowlist lookup short-circuits before the
     # O(n) binary-content scan of an up-to-2MB blob.
-    with :ok <- check_language_allowlist(language),
+    with :ok <- check_language_allowlist(language, @allowed_languages),
          :ok <- check_size(source),
          :ok <- check_binary_content(source) do
       guarded(fn -> parse_to_chunks(source, language) end)
@@ -85,10 +82,11 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   parse, two consumers — see `RetrievalNode.Graph.Extractor.TreeSitter`'s
   moduledoc). Same pre-flight guards and `guarded/1` Task isolation as
   `chunk/2`; only plain maps (never NIF node refs) cross back out of the task.
+  Graph-only languages return heuristic chunks (see the moduledoc).
   """
   @impl true
   def chunk_with_graph(source, language) when is_binary(source) do
-    with :ok <- check_language_allowlist(language),
+    with :ok <- check_language_allowlist(language, @allowed_languages ++ @graph_only_languages),
          :ok <- check_size(source),
          :ok <- check_binary_content(source) do
       guarded(fn -> parse_to_chunks_and_graph(source, language) end)
@@ -145,8 +143,8 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   defp check_binary_content(bin),
     do: if(RetrievalNode.Chunking.binary_content?(bin), do: {:error, :binary_content}, else: :ok)
 
-  defp check_language_allowlist(lang),
-    do: if(lang in @allowed_languages, do: :ok, else: {:error, :unsupported_language})
+  defp check_language_allowlist(lang, allowed),
+    do: if(lang in allowed, do: :ok, else: {:error, :unsupported_language})
 
   defp parse_to_chunks(source, language) do
     with {:ok, root} <- parse_root(source, language) do
@@ -160,10 +158,17 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   defp parse_to_chunks_and_graph(source, language) do
     with {:ok, root} <- parse_root(source, language),
          {:ok, graph} <- Extractor.TreeSitter.extract({root, source}, language, []) do
-      chunks = extract(root, source, language, [])
+      chunks = graph_chunks(root, source, language)
       {:ok, %{chunks: chunks, entities: graph.entities, references: graph.references}}
     end
   end
+
+  defp graph_chunks(_root, source, language) when language in @graph_only_languages do
+    {:ok, chunks} = HeuristicImpl.chunk(source, language)
+    chunks
+  end
+
+  defp graph_chunks(root, source, language), do: extract(root, source, language, [])
 
   defp parse_root(source, language) do
     parser = TS.parser_new()
@@ -183,7 +188,7 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   end
 
   defp extract(node, source, language, scope) do
-    kinds = Map.get(@chunk_kinds, language, [])
+    kinds = Map.fetch!(@chunk_kinds, language)
 
     node
     |> named_children()
@@ -191,54 +196,26 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   end
 
   defp extract_child(child, source, language, scope, kinds) do
-    if chunk_boundary?(child, source, language, kinds) do
-      emit_or_recurse(child, source, language, scope, TS.node_kind(child))
+    kind = TS.node_kind(child)
+
+    if kind in kinds do
+      emit_or_recurse(child, source, language, scope, kind)
     else
       # Non-chunkable wrapper (block/body/decorator): descend, keep scope.
       extract(child, source, language, scope)
     end
   end
 
-  # Elixir has no fixed boundary-kind set (see moduledoc): every construct is
-  # a `call` node discriminated by its target identifier's text.
-  defp chunk_boundary?(child, source, "elixir", _kinds) do
-    TS.node_kind(child) == "call" and elixir_def_form?(child, source)
-  end
-
-  defp chunk_boundary?(child, _source, _language, kinds), do: TS.node_kind(child) in kinds
-
-  defp elixir_def_form?(call_node, source) do
-    case TS.node_child_by_field_name(call_node, "target") do
-      nil ->
-        false
-
-      target_node ->
-        TS.node_kind(target_node) == "identifier" and
-          slice(source, target_node) in @elixir_def_forms
-    end
-  end
-
   # A chunkable node with chunkable descendants (a container, e.g. a class) yields
   # its members; a leaf-most one is emitted as a chunk itself.
   defp emit_or_recurse(child, source, language, scope, kind) do
-    child_scope = enclosing_scope(child, source, language, scope) ++ [node_name(child, source)]
+    child_scope = scope ++ [node_name(child, source)]
 
     case extract(child, source, language, child_scope) do
       [] -> [to_chunk(child, source, kind, child_scope)]
       nested -> nested
     end
   end
-
-  # A rooted `defmodule Elixir.Foo` is absolute: it never nests under the
-  # enclosing module, matching `Graph.Extractor.TreeSitter`.
-  defp enclosing_scope(node, source, "elixir", scope) do
-    case elixir_module_alias(node, source) do
-      {_name, true} -> []
-      _ -> scope
-    end
-  end
-
-  defp enclosing_scope(_node, _source, _language, scope), do: scope
 
   # Collect direct named children in one O(n) cursor pass. The indexed
   # `node_named_child/2` accessor rescans from the first child each call (O(n²)
@@ -264,100 +241,10 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
     end
   end
 
-  # Elixir boundary nodes are always kind "call"; every other language's
-  # boundary kinds carry a "name" field directly.
   defp node_name(node, source) do
-    case TS.node_kind(node) do
-      "call" -> elixir_call_name(node, source) || "call"
-      _ -> generic_node_name(node, source)
-    end
-  end
-
-  defp generic_node_name(node, source) do
     case TS.node_child_by_field_name(node, "name") do
       nil -> TS.node_kind(node)
       name_node -> slice(source, name_node)
-    end
-  end
-
-  defp elixir_call_name(call_node, source) do
-    case TS.node_child_by_field_name(call_node, "target") do
-      nil ->
-        nil
-
-      target_node ->
-        case slice(source, target_node) do
-          t when t in @elixir_module_forms ->
-            call_node |> elixir_module_alias(source) |> alias_name()
-
-          t when t in @elixir_function_forms ->
-            elixir_def_name(call_node, source)
-
-          _ ->
-            nil
-        end
-    end
-  end
-
-  # defmodule/defprotocol/defimpl name from the first `alias` among their
-  # arguments — `defimpl Sized, for: MyStruct` has a second alias, but it is
-  # nested under the keyword list, not a direct child of `arguments`. The
-  # absolute `Elixir.Foo` form is canonicalised to `{"Foo", true}` (rooted), as
-  # in the extractor; non-rooted aliases are `{name, false}`.
-  defp elixir_module_alias(call_node, source) do
-    with args_node when not is_nil(args_node) <- elixir_arguments_node(call_node),
-         alias_node when not is_nil(alias_node) <-
-           args_node |> named_children() |> Enum.find(&(TS.node_kind(&1) == "alias")) do
-      case slice(source, alias_node) do
-        "Elixir." <> rest -> {rest, true}
-        name -> {name, false}
-      end
-    end
-  end
-
-  defp alias_name({name, _rooted?}), do: name
-  defp alias_name(nil), do: nil
-
-  # def-family name from the first argument, in one of three shapes: a bare
-  # identifier (zero-arity no-paren def), a nested `call` (the common
-  # `def name(...)` case), or a `binary_operator` (a `when`-guard clause)
-  # whose `left:` is the name-call.
-  defp elixir_def_name(call_node, source) do
-    with args_node when not is_nil(args_node) <- elixir_arguments_node(call_node),
-         [first | _] <- named_children(args_node) do
-      elixir_def_name_from(first, source)
-    else
-      _ -> nil
-    end
-  end
-
-  # `arguments` is a plain positional child in this grammar, NOT reachable via
-  # `node_child_by_field_name` — find it by kind among the call's named children.
-  defp elixir_arguments_node(call_node) do
-    call_node
-    |> named_children()
-    |> Enum.find(&(TS.node_kind(&1) == "arguments"))
-  end
-
-  defp elixir_def_name_from(node, source) do
-    case TS.node_kind(node) do
-      "call" ->
-        case TS.node_child_by_field_name(node, "target") do
-          nil -> nil
-          target_node -> slice(source, target_node)
-        end
-
-      "identifier" ->
-        slice(source, node)
-
-      "binary_operator" ->
-        case TS.node_child_by_field_name(node, "left") do
-          nil -> nil
-          left_node -> elixir_def_name_from(left_node, source)
-        end
-
-      _ ->
-        nil
     end
   end
 
