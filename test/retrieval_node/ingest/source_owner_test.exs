@@ -231,6 +231,13 @@ defmodule RetrievalNode.Ingest.SourceOwnerTest do
         SourceOwner.child_spec(source.id)
       )
 
+    # init/1 runs a first pass via handle_continue straight away. A sys call is
+    # only handled after it returns, so the owner is idle before it is killed:
+    # a :kill landing mid-query would take the shared sandbox connection down
+    # with it (DBConnection.Holder dies), failing the drain below. Flaky
+    # (CI's 8-core runner, ~1 in 25 local file runs) before this sync.
+    _ = :sys.get_state(pid1)
+
     seed_raw(source, "repo:x:e.py", "e.py", "hello\n")
     seed_raw(source, "repo:x:f.py", "f.py", "world\n")
 
