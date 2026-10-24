@@ -1,7 +1,8 @@
 defmodule RetrievalNode.Reranking.NxServingImplTest do
-  use ExUnit.Case, async: true
+  # async: false — the serving tests register the global Serving.name().
+  use ExUnit.Case, async: false
 
-  alias RetrievalNode.Reranking.NxServingImpl
+  alias RetrievalNode.Reranking.{NxServingImpl, Serving}
 
   describe "truncate_passage/1 (pure byte-cap truncation)" do
     test "leaves a short passage unchanged" do
@@ -67,25 +68,56 @@ defmodule RetrievalNode.Reranking.NxServingImplTest do
     end
   end
 
-  describe "rerank_scores/2's pairing bounds the query once for the whole pool" do
-    # rerank_scores/2 itself calls the real Nx.Serving (RetrievalNode.Reranking.Serving),
-    # which this unit test's supervision tree doesn't start — so this checks
-    # the pure pieces rerank_scores/2 composes its pairs from (truncate_query/1
-    # + truncate_passage/1) directly, at the same {query, passage} pairing
-    # shape rerank_scores/2 builds, rather than standing up the serving.
-    test "a multi-KB query still yields exactly one bounded pair per passage" do
-      big_query = String.duplicate("q", 5_000)
-      passages = ["short passage", String.duplicate("p", 3_000)]
+  describe "rerank_scores/2 through a model-free serving" do
+    # A fake Nx.Serving registered under Serving.name() records the pairs the
+    # adapter submits and scores each by its passage's byte size, so the test
+    # sees the real adapter's truncation, pairing and score extraction.
+    setup do
+      test = self()
 
-      truncated_query = NxServingImpl.truncate_query(big_query)
-      pairs = Enum.map(passages, &{truncated_query, NxServingImpl.truncate_passage(&1)})
+      serving =
+        Nx.Serving.new(fn opts -> Nx.Defn.jit(&Function.identity/1, opts) end)
+        |> Nx.Serving.client_preprocessing(fn pairs ->
+          send(test, {:pairs, pairs})
+          {Nx.Batch.stack(Enum.map(pairs, fn _ -> Nx.tensor(0) end)), pairs}
+        end)
+        |> Nx.Serving.client_postprocessing(fn _output, pairs ->
+          Enum.map(pairs, fn {_q, p} -> %{score: byte_size(p) * 1.0} end)
+        end)
 
-      assert length(pairs) == length(passages)
+      start_supervised!({Nx.Serving, serving: serving, name: Serving.name()})
+      :ok
+    end
 
-      Enum.each(pairs, fn {q, p} ->
-        assert byte_size(q) <= 512
-        assert byte_size(p) <= 2_000
-      end)
+    test "submits one bounded pair per passage and returns scores in passage order" do
+      passages = [String.duplicate("p", 3_000), "short passage"]
+
+      assert NxServingImpl.rerank_scores(String.duplicate("q", 5_000), passages) ==
+               [2_000.0, 13.0]
+
+      assert_receive {:pairs, [{q, p1}, {q, "short passage"}]}
+      assert byte_size(q) == 512 and byte_size(p1) == 2_000
+    end
+  end
+
+  # Loads the real cross-encoder; run with `mix test --include integration`.
+  describe "rerank_scores/2 through the loaded model" do
+    @describetag :integration
+
+    setup do
+      start_supervised!(Serving)
+      :ok
+    end
+
+    test "returns one float logit per passage, ranking the relevant passage first" do
+      [relevant, other] =
+        NxServingImpl.rerank_scores("how do I reset a password?", [
+          "To reset your password, open settings and choose reset password.",
+          "The weather in Lisbon is mild in spring."
+        ])
+
+      assert is_float(relevant) and is_float(other)
+      assert relevant > other
     end
   end
 end
