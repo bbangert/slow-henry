@@ -1024,6 +1024,27 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       refute Enum.any?(refs, &(byte_size(&1.name) > 256))
     end
 
+    test "python: a rejected nested class keeps the outer receiver only in its body" do
+      long = String.duplicate("X", 300)
+
+      src = """
+      class Factory:
+          def build(self):
+              class #{long}:
+                  value = self.helper()
+
+                  def run(self):
+                      return self.helper()
+      """
+
+      %{references: refs} = extract(src, "python")
+      calls = for %{kind: :call, name: n, from: f} <- refs, do: {n, f}
+      # The class body captures build's `self` (Factory); `run`'s own `self` is
+      # an instance of the nameless class, so it stays unresolved (bare).
+      assert {"Factory.helper", "Factory.build"} in calls
+      assert {"helper", "Factory.build.run"} in calls
+    end
+
     test "an oversized definition is anonymous: calls inside get the outer from" do
       long = String.duplicate("x", 300)
       src = "class K:\n    def #{long}(self):\n        helper()\n"

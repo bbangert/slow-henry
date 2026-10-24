@@ -44,7 +44,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter.WalkState do
       `class_definition` would bind, held back because a class body keeps the
       OUTER `receiver`. Set when entering a Python class; consumed by a
       function defined directly in that class body that takes `self`. Reset to
-      `nil` by every other definition.
+      `nil` by every other definition. `:unresolved` when the class's name was
+      rejected (not emittable): its `self`-binding methods then get no
+      receiver instead of falling back to the outer one.
     * `self_target` - ONE-SHOT. Names the qualified-name suffix that
       `receiver` should take instead of the entity's own name: the impl TYPE
       for a Rust `impl Trait for T` (entities are scoped `T.Trait`, `self`
@@ -65,7 +67,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter.WalkState do
           container_kind: category() | nil,
           enclosing_qname: String.t() | nil,
           receiver: String.t() | nil,
-          pending_receiver: String.t() | nil,
+          pending_receiver: String.t() | :unresolved | nil,
           self_target: String.t() | nil,
           keys_done: boolean()
         }

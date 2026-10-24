@@ -778,6 +778,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     {new_receiver, pending_receiver} =
       python_class_receiver(language, category, state, new_receiver, child, source)
 
+    pending_receiver = unresolved_if_anonymous_class(pending_receiver, language, category, name)
+
     if at_cap?(acc) do
       acc
     else
@@ -858,12 +860,22 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
          source
        ) do
     if python_binds_self?(node, source),
-      do: {state.pending_receiver || state.receiver, nil},
+      do: {self_receiver(state), nil},
       else: {state.receiver, nil}
   end
 
   defp python_class_receiver(_language, _category, _state, receiver, _node, _source),
     do: {receiver, nil}
+
+  # A python class whose name was rejected (not emittable) has no identity for
+  # `self` in its methods to resolve to: they stay unresolved, never falling
+  # back to an outer receiver. Its BODY still keeps the outer receiver.
+  defp unresolved_if_anonymous_class(_pending, "python", :class_like, nil), do: :unresolved
+  defp unresolved_if_anonymous_class(pending, _language, _category, _name), do: pending
+
+  defp self_receiver(%WalkState{pending_receiver: :unresolved}), do: nil
+  defp self_receiver(%WalkState{pending_receiver: nil, receiver: receiver}), do: receiver
+  defp self_receiver(%WalkState{pending_receiver: pending}), do: pending
 
   defp python_binds_self?(node, source) do
     case TS.node_child_by_field_name(node, "parameters") do
@@ -902,7 +914,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # identity to resolve a receiver to.
   defp receiver_boundary?(node, source, language, category, name, state) do
     this_rebinding?(language, TS.node_kind(node)) or object_literal_method?(node) or
-      (is_nil(name) and category == :class_like) or
+      (is_nil(name) and category == :class_like and language != "python") or
       python_rebinds_self?(node, source, language, state)
   end
 
