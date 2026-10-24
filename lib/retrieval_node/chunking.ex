@@ -16,21 +16,32 @@ defmodule RetrievalNode.Chunking do
   whatever that impl returns, including `{:error, reason}`. It does NOT itself
   fall back. The fallback *orchestration* — deciding which error reasons re-run
   through `HeuristicImpl` (`:chunk_timeout`/`:chunk_crashed`/`:unsupported_language`)
-  versus skip the file (`:too_large`/`:binary_content`) — lives in
-  `Ingest.FileIngest`, the ingest pipeline's functional core. `FileIngest` only
-  ever calls `chunk/2`, never the NIF directly, so promoting to the peer-node
-  isolation escape hatch later is a config change plus one module, not a
-  call-site rewrite.
+  versus skip the file (`:too_large`/`:binary_content`) — lives in the ingest
+  pipeline's functional core (`Ingest.FileIngest`). That module only ever calls
+  `chunk_with_graph/2`/`chunk/2`, never the NIF directly, so promoting to the
+  peer-node isolation escape hatch later is a config change plus one module,
+  not a call-site rewrite.
+
+  Graph extraction (`chunk_with_graph/2`) is tree-sitter-only: it is an
+  **optional** callback, implemented only by `TreeSitterImpl` (single parse,
+  two consumers — the same tree yields both chunks and graph rows). The
+  heuristic fallback path has no AST to walk, so it indexes chunks but
+  contributes no entities/references; the dispatcher below wraps its
+  `chunk/2` result accordingly rather than erroring.
   """
+
+  alias RetrievalNode.Graph.Extractor
 
   @type language :: String.t()
   @type chunk :: %{
-          text: String.t(),
-          breadcrumb: String.t(),
-          start_line: pos_integer(),
-          end_line: pos_integer(),
-          kind: String.t(),
-          parse_status: :ok | :heuristic_fallback | :crashed_fallback
+          required(:text) => String.t(),
+          required(:breadcrumb) => String.t(),
+          required(:start_line) => pos_integer(),
+          required(:end_line) => pos_integer(),
+          required(:kind) => String.t(),
+          required(:parse_status) => :ok | :heuristic_fallback | :crashed_fallback,
+          optional(:start_byte) => non_neg_integer(),
+          optional(:end_byte) => non_neg_integer()
         }
 
   @doc "Split `source` (in `language`) into chunks, or return a tagged error."
@@ -40,8 +51,47 @@ defmodule RetrievalNode.Chunking do
   @doc "The languages this implementation can chunk (tree-sitter allowlist)."
   @callback allowed_languages() :: [language]
 
+  @doc """
+  Like `chunk/2`, but also returns graph entities/references extracted from
+  the same parse. Optional — only `TreeSitterImpl` implements it.
+  """
+  @callback chunk_with_graph(source :: String.t(), language :: language) ::
+              {:ok,
+               %{
+                 chunks: [chunk],
+                 entities: [Extractor.entity()],
+                 references: [Extractor.ref()]
+               }}
+              | {:error, atom() | {atom(), term()}}
+
+  @optional_callbacks chunk_with_graph: 2
+
   @spec chunk(String.t(), language) :: {:ok, [chunk]} | {:error, atom() | {atom(), term()}}
   def chunk(source, language), do: impl().chunk(source, language)
+
+  @doc """
+  Dispatch to `impl().chunk_with_graph/2` when the configured impl exports it;
+  otherwise fall back to `chunk/2` and wrap the result with empty graph lists.
+  Errors pass through unchanged either way.
+  """
+  @spec chunk_with_graph(String.t(), language) ::
+          {:ok, %{chunks: [chunk], entities: [Extractor.entity()], references: [Extractor.ref()]}}
+          | {:error, atom() | {atom(), term()}}
+  def chunk_with_graph(source, language) do
+    impl = impl()
+
+    # Code.ensure_loaded?/1 is required: function_exported?/3 is false for a
+    # not-yet-loaded module, which would silently drop graph data until some
+    # other caller happened to load the impl.
+    if Code.ensure_loaded?(impl) and function_exported?(impl, :chunk_with_graph, 2) do
+      impl.chunk_with_graph(source, language)
+    else
+      case impl.chunk(source, language) do
+        {:ok, chunks} -> {:ok, %{chunks: chunks, entities: [], references: []}}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
 
   @doc """
   True if `content` is binary rather than text: contains a NUL byte, or isn't

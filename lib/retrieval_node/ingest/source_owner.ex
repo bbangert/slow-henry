@@ -2,7 +2,7 @@ defmodule RetrievalNode.Ingest.SourceOwner do
   @moduledoc """
   The ingest pipeline's Boundary layer (per *Designing Elixir Systems with
   OTP*'s Data/Functions/Boundary split): one `GenServer` per source, the ONLY
-  process that writes `chunks` rows for that source. Its mailbox is the
+  process that writes `chunks`/graph rows for that source. Its mailbox is the
   serialization point — not a DB lock, generation counter, or tombstone —
   because a single BEAM node is the deployment premise (see the plan). Two
   concurrent `notify/1` calls for the same source coalesce onto the same
@@ -22,7 +22,7 @@ defmodule RetrievalNode.Ingest.SourceOwner do
 
   ## Lifecycle
 
-  Started on demand (`notify/1`/`drain/1` both start-if-absent) under
+  Started on demand (`notify/1`/`drain/1`/`gc/1` all start-if-absent) under
   `Ingest.SourceSupervisor`, registered via `Ingest.SourceRegistry` so at most
   one owner ever exists per `source_id` at a time (`Registry, keys: :unique`
   is the actual uniqueness guarantee — nothing else enforces it). It stops
@@ -37,12 +37,27 @@ defmodule RetrievalNode.Ingest.SourceOwner do
   (`Ingest.FileIngest.apply/2` is idempotent per `chunk_key`, and only deletes
   its raw row on success — a crash mid-apply leaves the row for the restarted
   owner to pick up and re-apply from scratch).
+
+  ## Graph orphan reaping
+
+  `Graph.gc_orphaned_entities/2` deletes zero-mention entities and must never
+  interleave with a write that is about to attach mentions, so it only ever
+  runs inside this process. Two entry points, both serialized with passes by
+  the mailbox: `gc/1` (a synchronous call, for sweeps and ops) and an
+  automatic reap at the end of any pass that reconciled chunks away or applied
+  a deletion/unindexable entry — the paths that strand entities in bulk. A
+  pass that only added or updated chunks does not reap, to keep the per-pass
+  cost off the common path: an update can still orphan an entity (a chunk
+  that stops calling `helper` drops `helper`'s last mention while keeping its
+  `chunk_key`), and those are left for the periodic per-source sweep through
+  `gc/1`.
   """
 
   use GenServer
 
   require Logger
 
+  alias RetrievalNode.Graph
   alias RetrievalNode.Ingest.{FileIngest, PendingChunks}
 
   @max_file_attempts 5
@@ -182,6 +197,17 @@ defmodule RetrievalNode.Ingest.SourceOwner do
     GenServer.call(pid, :drain, :infinity)
   end
 
+  @doc """
+  Synchronous per-source GC: ensure `source_id`'s owner is started, then reap
+  that source's zero-mention entities inside the owner (see "Graph orphan
+  reaping" in the moduledoc). Returns the number of entities deleted.
+  """
+  @spec gc(source_id()) :: {:ok, non_neg_integer()}
+  def gc(source_id) do
+    pid = ensure_started(source_id)
+    GenServer.call(pid, :gc, :infinity)
+  end
+
   defp ensure_started(source_id) do
     case DynamicSupervisor.start_child(
            RetrievalNode.Ingest.SourceSupervisor,
@@ -237,6 +263,12 @@ defmodule RetrievalNode.Ingest.SourceOwner do
     {:reply, {:ok, state.stats}, state, @idle_ms}
   end
 
+  @impl GenServer
+  def handle_call(:gc, _from, state) do
+    deleted = Graph.gc_orphaned_entities(state.source_id)
+    {:reply, {:ok, deleted}, state, @idle_ms}
+  end
+
   # A pass that came back full (rows_per_pass rows drained) means more may be
   # waiting right behind it — send ourselves another :drain rather than
   # looping inline, so a :notify/:drain call arriving mid-drain still gets to
@@ -283,31 +315,34 @@ defmodule RetrievalNode.Ingest.SourceOwner do
     rows = PendingChunks.drainable(source_id, limit: @rows_per_pass)
     full_batch? = length(rows) == @rows_per_pass
 
-    stats =
-      Enum.reduce(rows, %{empty_stats() | superseded: superseded}, fn row, stats ->
-        apply_row(source_id, row, stats)
+    {stats, reap?} =
+      Enum.reduce(rows, {%{empty_stats() | superseded: superseded}, false}, fn row,
+                                                                               {stats, reap?} ->
+        apply_row(source_id, row, stats, reap?)
       end)
+
+    gcd = if reap?, do: Graph.gc_orphaned_entities(source_id), else: 0
 
     # A pass that touched no rows (a `notify/1` on a source with nothing new —
     # e.g. a routine sync tick that staged nothing) is logged at debug, not
     # info, so idle notifies don't flood production logs.
-    log_pass(source_id, stats, rows)
+    log_pass(source_id, stats, rows, gcd)
 
     {stats, full_batch?}
   end
 
-  defp log_pass(source_id, stats, drained) do
+  defp log_pass(source_id, stats, drained, gcd) do
     message =
       "Ingest.SourceOwner pass source_id=#{source_id} applied=#{stats.applied} " <>
         "skipped=#{stats.skipped} failed=#{stats.failed} superseded=#{stats.superseded} " <>
-        "embedded=#{stats.embedded} reused=#{stats.reused}"
+        "embedded=#{stats.embedded} reused=#{stats.reused} gcd=#{gcd}"
 
     if drained == [] and stats.superseded == 0,
       do: Logger.debug(message),
       else: Logger.info(message)
   end
 
-  defp apply_row(source_id, row, stats) do
+  defp apply_row(source_id, row, stats, reap?) do
     force? = row.force
     row = PendingChunks.mark_attempt(row)
     on_parse_crash = if row.attempts >= @max_file_attempts, do: :heuristic, else: :error
@@ -329,21 +364,30 @@ defmodule RetrievalNode.Ingest.SourceOwner do
       {:ok, summary} ->
         # `embedded`/`reused` only exist on an :indexed summary; deletions and
         # unindexable files embed nothing.
-        %{
+        stats = %{
           stats
           | applied: stats.applied + 1,
             embedded: stats.embedded + Map.get(summary, :embedded, 0),
             reused: stats.reused + Map.get(summary, :reused, 0)
         }
 
+        {stats, reap? or reap_for?(summary)}
+
       {:skipped, :unchanged} ->
-        %{stats | skipped: stats.skipped + 1}
+        {%{stats | skipped: stats.skipped + 1}, reap?}
 
       {:error, reason} ->
         handle_failure(source_id, row, reason)
-        %{stats | failed: stats.failed + 1}
+        {%{stats | failed: stats.failed + 1}, reap?}
     end
   end
+
+  # Chunk removal strands entities in bulk, so it triggers a reap. An in-place
+  # update can orphan one too (a dropped call target); the periodic sweep via
+  # gc/1 catches those, keeping the reap off the common path.
+  defp reap_for?(%{reconciled: n}) when n > 0, do: true
+  defp reap_for?(%{action: action}) when action in [:deleted, :unindexable], do: true
+  defp reap_for?(_summary), do: false
 
   defp handle_failure(source_id, row, reason) do
     minutes = min(Integer.pow(2, row.attempts), 30)
