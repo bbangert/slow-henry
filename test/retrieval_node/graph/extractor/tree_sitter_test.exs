@@ -1023,6 +1023,14 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       refute Enum.any?(entities, &(byte_size(&1.qualified_name) > 256))
       refute Enum.any?(refs, &(byte_size(&1.name) > 256))
     end
+
+    test "an oversized definition is anonymous: calls inside get the outer from" do
+      long = String.duplicate("x", 300)
+      src = "class K:\n    def #{long}(self):\n        helper()\n"
+      %{references: refs} = extract(src, "python")
+      # The invariant check in extract/2 also asserts every `from` is emitted.
+      assert [%{name: "helper", from: "K"}] = refs
+    end
   end
 
   describe "review regressions, round 4" do
@@ -1364,8 +1372,13 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
         refute find(e, "C.a\u{10000}")
       end
 
-      %{entities: e} = extract(~S|declare module "m\0x" { export function f() {} }|, "typescript")
+      src = ~S|declare module "m\0x" { import "ok"; export function f() { g(); } }|
+      %{entities: e, references: r} = extract(src, "typescript")
       refute Enum.any?(e, &String.contains?(&1.qualified_name, <<0>>))
+      # The unstorable module is anonymous: nothing inside points `from` it.
+      assert find(e, "f")
+      assert Enum.any?(r, &(&1.name == "ok" and is_nil(&1.from)))
+      assert Enum.any?(r, &(&1.name == "g" and &1.from == "f"))
     end
 
     test "javascript: legacy octal escapes decode with ECMAScript digit limits" do

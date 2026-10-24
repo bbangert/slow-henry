@@ -111,7 +111,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   The item cap, the symbol-size limit and storability (no control characters,
   e.g. a decoded NUL) are enforced only in `add_entity/2` and
   `add_reference/2`, the single emission choke point. The walkers' `at_cap?/1`
-  checks are early exits, never the enforcement.
+  checks are early exits, never the enforcement. A definition whose name would
+  be rejected there is treated as anonymous, so it never becomes scope, `from`
+  or receiver: every reference's `from` names an emitted entity.
 
   ### Change discipline
 
@@ -750,6 +752,11 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # Scope/qname/receiver threading, identical once `category` and `name`
   # are known regardless of how they were derived.
   defp handle_definition_category(child, category, name, source, language, lang_ctx, state, acc) do
+    # A name that can't be emitted (oversized, or carrying control characters)
+    # must never become scope, `from` or receiver either: the definition is
+    # treated as anonymous, so every `from` names an emitted entity.
+    name = if name && emittable_name?(Enum.join(state.scope ++ [name], ".")), do: name
+
     {new_scope, new_enclosing_qname, new_receiver, acc} =
       case name do
         nil ->
@@ -1796,11 +1803,11 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp at_cap?(acc), do: acc.count >= @max_items
 
-  # The item cap and the symbol-size limit are both enforced HERE, at the single
-  # choke point every emission goes through, so no traversal path can exceed
-  # them; the `at_cap?/1` checks in the walkers are only early exits. A skipped
-  # oversized definition still extends the scope for its children, whose
-  # qualified names then exceed the limit too and are skipped consistently.
+  # The item cap, the symbol-size limit and storability are enforced HERE, at
+  # the single choke point every emission goes through, so no traversal path can
+  # exceed them; the `at_cap?/1` checks in the walkers are only early exits. A
+  # definition whose name isn't emittable was already made anonymous in
+  # handle_definition_category/8, so it never becomes scope or `from`.
   defp add_entity(%{count: count} = acc, _entity) when count >= @max_items, do: acc
 
   defp add_entity(acc, %{qualified_name: qname}) when byte_size(qname) > @max_symbol_bytes,
@@ -1827,4 +1834,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # stored in a Postgres text column, and no real symbol contains any C0/C1
   # control or DEL, so such a name is skipped for every language here.
   defp storable_name?(name), do: not String.match?(name, ~r/[\x{0}-\x{1F}\x{7F}-\x{9F}]/u)
+
+  # What add_entity/2 would accept; definitions check it before entering scope.
+  defp emittable_name?(name), do: byte_size(name) <= @max_symbol_bytes and storable_name?(name)
 end
