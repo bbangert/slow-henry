@@ -1325,6 +1325,19 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       end
     end
 
+    test "js/ts: imports canonicalize escapes like definitions and callees" do
+      for lang <- ["javascript", "typescript"] do
+        src = ~S"""
+        import d\u0065f, { h\u0065lper, "x" as y, "a b" as z } from "p\u006bg";
+        import "./rel/m\u006fd";
+        """
+
+        %{references: r} = extract(src, lang)
+        imports = for %{kind: :import, name: name} <- r, do: name
+        assert Enum.sort(imports) == Enum.sort(["pkg", "def", "helper", "x", "./rel/mod"])
+      end
+    end
+
     test "javascript: legacy octal escapes decode with ECMAScript digit limits" do
       src = ~S"""
       const o = { "f\157o"() {}, "\101b"() {}, "a\477b"() {}, "\8x"() {} };

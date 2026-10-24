@@ -52,9 +52,12 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       its path string (`"pkg-a"`, `"@scope/pkg"`) when that satisfies the
       output naming rules.
     * JS/TS identifiers are canonical: `\\u` escapes inside an identifier are
-      decoded the same way for definitions and callees (`h\\u0065lper` is
-      `helper` on both sides). String values decode every escape, including
-      legacy octal (`\\157` is `o`) with ECMAScript's digit-length limits.
+      decoded the same way EVERYWHERE a name is emitted: definitions, callees,
+      and import specifiers/default imports (`h\\u0065lper` is `helper` in
+      all three). String values (literal keys, module names, import sources)
+      decode every escape, including legacy octal (`\\157` is `o`) with
+      ECMAScript's digit-length limits; an undecodable or non-hygienic import
+      source is omitted.
     * A Rust impl's type identity is its path type: references and pointers
       unwrap to the pointee, generics to their base. A type without one (tuple,
       array, slice, fn pointer, ...) makes the trait the container
@@ -1266,8 +1269,15 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
       src_node ->
         ln = line(node)
-        module_ref = {strip_quotes(slice(source, src_node)), ln}
-        [module_ref | js_import_symbol_refs(node, source, ln)]
+        # The source is a string literal: decoded like any js/ts string value,
+        # and omitted when it doesn't decode to a usable import path.
+        module_refs =
+          case js_import_path(js_string_value(src_node, source)) do
+            nil -> []
+            path -> [{path, ln}]
+          end
+
+        module_refs ++ js_import_symbol_refs(node, source, ln)
     end
   end
 
@@ -1336,6 +1346,14 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp import_refs(_node, _source, _language), do: []
+
+  # Import paths may be relative (`./x`) or scoped (`@s/p`) but, like every
+  # emitted name, contain no whitespace, quotes, backticks or parentheses.
+  defp js_import_path(path) when is_binary(path) do
+    if path != "" and not String.match?(path, ~r/[\s"'`()]/u), do: path
+  end
+
+  defp js_import_path(_path), do: nil
 
   defp rust_use_paths(node, prefix, source) do
     case TS.node_kind(node) do
@@ -1420,7 +1438,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp js_clause_child_refs(child, source, ln) do
     case TS.node_kind(child) do
       "identifier" ->
-        [{slice(source, child), ln}]
+        [{decode_js_identifier(slice(source, child)), ln}]
 
       "named_imports" ->
         child
@@ -1433,10 +1451,21 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
+  # Specifier names are canonical like every js/ts identifier; an ES2022 string
+  # specifier (`{ "a-b" as x }`) is its decoded value when that is an
+  # identifier, otherwise it names nothing.
   defp import_specifier_ref(spec, source, ln) do
     case TS.node_child_by_field_name(spec, "name") do
-      nil -> []
-      name_node -> [{slice(source, name_node), ln}]
+      nil ->
+        []
+
+      name_node ->
+        name =
+          if TS.node_kind(name_node) == "string",
+            do: name_node |> js_string_value(source) |> literal_identifier(),
+            else: decode_js_identifier(slice(source, name_node))
+
+        if name, do: [{name, ln}], else: []
     end
   end
 
