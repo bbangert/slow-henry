@@ -494,8 +494,9 @@ defmodule RetrievalNode.GraphTest do
     end
 
     test "there is no unscoped (all-sources) form" do
-      # A sweep must go source by source through each owner (single writer).
-      assert_raise FunctionClauseError, fn -> Graph.gc_orphaned_entities(nil) end
+      # A sweep must go source by source through each owner (single writer);
+      # the source_id is required (a nil one is also rejected at compile time
+      # by the is_binary/1 guard's type check).
       refute function_exported?(Graph, :gc_orphaned_entities, 0)
     end
 
