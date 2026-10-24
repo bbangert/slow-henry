@@ -25,6 +25,7 @@ defmodule RetrievalNode.Application do
         {Task.Supervisor, name: RetrievalNode.GitTaskSupervisor}
       ] ++
         embedding_children() ++
+        reranking_children() ++
         [
           # Owns the per-source ingest boundary (Ingest.SourceOwner processes) —
           # must be up before Oban so a *Sync job's post-commit
@@ -62,6 +63,16 @@ defmodule RetrievalNode.Application do
   end
 
   defp mcp_server_start?, do: Application.get_env(:retrieval_node, :mcp_server_start, true)
+
+  # The reranking serving sub-tree loads the ~91 MB cross-encoder model and
+  # JIT-compiles it — never in :test, where RetrievalNode.Reranking.StubImpl
+  # stands in.
+  defp reranking_children do
+    if reranking_serving_start?(), do: [RetrievalNode.Reranking.Supervisor], else: []
+  end
+
+  defp reranking_serving_start?,
+    do: Application.get_env(:retrieval_node, :reranking_serving_start, true)
 
   defp embedding_serving_start?,
     do: Application.get_env(:retrieval_node, :embedding_serving_start, true)

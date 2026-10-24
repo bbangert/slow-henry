@@ -186,6 +186,24 @@ defmodule RetrievalNode.MCP.ToolsTest do
       %{"results" => none} = ok(SemanticSearch, %{query: "flurbo", repo: "no-such-repo"})
       assert none == []
     end
+
+    test "rerank: true carries fused_score alongside score; omitted does not" do
+      source =
+        Repo.insert!(%Source{source_type: :git_repo, name: "acme/rr", identifier: "file:///rr"})
+
+      insert_chunk(source, :git_repo, "authentication and login handling",
+        repo: "acme/rr",
+        lang: "python",
+        breadcrumb: "acme/rr › auth.py › login"
+      )
+
+      %{"results" => [hit | _]} = ok(SemanticSearch, %{query: "authentication", rerank: true})
+      assert Map.has_key?(hit, "fused_score")
+      assert is_float(hit["fused_score"])
+
+      %{"results" => [hit | _]} = ok(SemanticSearch, %{query: "authentication"})
+      refute Map.has_key?(hit, "fused_score")
+    end
   end
 
   # --- helpers ---

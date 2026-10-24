@@ -199,5 +199,134 @@ defmodule RetrievalNode.Search.HybridQueryTest do
       # back-link projection must NOT leak full content
       refute Map.has_key?(chunk_map, :content)
     end
+
+    test "rerank: false (default) hits have no fused_score key" do
+      source = source_fixture("repo-a")
+
+      chunk_fixture(source,
+        repo: "repo-a",
+        content: "the quick brown fox",
+        embedding: axis(0)
+      )
+
+      [hit | _] = Search.hybrid_search("quick brown fox", embedding: axis(0), repo: "repo-a")
+
+      refute Map.has_key?(hit, :fused_score)
+    end
+  end
+
+  describe "Search.hybrid_search/2 rerank" do
+    alias RetrievalNode.Reranking.StubImpl
+
+    test "rerank: true orders hits by stub rerank score and carries fused_score" do
+      source = source_fixture("repo-a")
+      query = "quick brown fox"
+
+      chunks =
+        for i <- 1..4 do
+          chunk_fixture(source,
+            repo: "repo-a",
+            content: "quick brown fox variant #{i}",
+            embedding: axis(0)
+          )
+        end
+
+      hits =
+        Search.hybrid_search(query,
+          embedding: axis(0),
+          repo: "repo-a",
+          rerank: true,
+          top_k: 4
+        )
+
+      expected_order =
+        chunks
+        |> Enum.map(& &1.content)
+        |> then(&StubImpl.rerank_scores(query, &1))
+        |> Enum.zip(chunks)
+        |> Enum.sort_by(fn {score, _chunk} -> score end, :desc)
+        |> Enum.map(fn {_score, chunk} -> chunk.id end)
+
+      assert Enum.map(hits, & &1.chunk.id) == expected_order
+      assert length(hits) <= 4
+
+      Enum.each(hits, fn hit ->
+        assert %{chunk: _chunk, score: score, fused_score: fused_score} = hit
+        assert is_float(score)
+        assert is_float(fused_score)
+      end)
+    end
+
+    test "rerank funnel: top_k caps to the highest rerank-scored candidates regardless of fused rank" do
+      source = source_fixture("repo-a")
+      query = "quick brown fox"
+
+      chunks =
+        for i <- 1..5 do
+          chunk_fixture(source,
+            repo: "repo-a",
+            content: "quick brown fox funnel #{i}",
+            embedding: axis(0)
+          )
+        end
+
+      expected_top2 =
+        chunks
+        |> Enum.map(& &1.content)
+        |> then(&StubImpl.rerank_scores(query, &1))
+        |> Enum.zip(chunks)
+        |> Enum.sort_by(fn {score, _chunk} -> score end, :desc)
+        |> Enum.take(2)
+        |> Enum.map(fn {_score, chunk} -> chunk.id end)
+
+      hits =
+        Search.hybrid_search(query,
+          embedding: axis(0),
+          repo: "repo-a",
+          rerank: true,
+          top_k: 2
+        )
+
+      assert Enum.map(hits, & &1.chunk.id) == expected_top2
+    end
+
+    test "rerank normalizes an invalid top_k the same way the non-rerank path does (no raise, default 20)" do
+      source = source_fixture("repo-a")
+      query = "quick brown fox"
+
+      chunks =
+        for i <- 1..3 do
+          chunk_fixture(source,
+            repo: "repo-a",
+            content: "quick brown fox variant #{i}",
+            embedding: axis(0)
+          )
+        end
+
+      for bad_top_k <- [-1, "nope"] do
+        rerank_hits =
+          Search.hybrid_search(query,
+            embedding: axis(0),
+            repo: "repo-a",
+            rerank: true,
+            top_k: bad_top_k
+          )
+
+        non_rerank_hits =
+          Search.hybrid_search(query,
+            embedding: axis(0),
+            repo: "repo-a",
+            rerank: false,
+            top_k: bad_top_k
+          )
+
+        # top_k clamps to the default (20), which is >= all 3 seeded chunks —
+        # both paths return every chunk instead of raising or silently
+        # dropping results (the pre-fix Enum.take(-1) bug, or a raise on a
+        # non-integer top_k reaching Enum.take/2 or Postgres' $4 bind).
+        assert length(rerank_hits) == length(chunks)
+        assert length(non_rerank_hits) == length(chunks)
+      end
+    end
   end
 end

@@ -151,10 +151,16 @@ defmodule RetrievalNode.Search.HybridQuery do
   defp to_float(n) when is_float(n), do: n
   defp to_float(n) when is_integer(n), do: n * 1.0
 
-  # Clamp to [1, @max_top_k] so a caller (eventually the MCP tool layer) can't
-  # request an unbounded or nonsensical LIMIT.
-  defp clamp_top_k(k) when is_integer(k) and k >= 1, do: min(k, @max_top_k)
-  defp clamp_top_k(_), do: @default_top_k
+  @doc """
+  Clamp a caller-supplied `top_k` to `[1, #{@max_top_k}]`, defaulting to
+  #{@default_top_k} for anything that isn't a positive integer — the same
+  normalization `search/1` applies to its own `:top_k`. Exposed so `Search`'s
+  rerank funnel, which picks its candidate pool size before calling
+  `search/1`, shares it rather than duplicating the constants.
+  """
+  @spec clamp_top_k(term()) :: pos_integer()
+  def clamp_top_k(k) when is_integer(k) and k >= 1, do: min(k, @max_top_k)
+  def clamp_top_k(_), do: @default_top_k
 
   # Raw `Repo.query!` binds `$5::uuid` as Postgrex's 16-byte binary, not the
   # 36-char string form callers hold.
