@@ -263,12 +263,18 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
           state
 
         kind when kind in ["constant", "scope_resolution"] ->
-          segs = source |> slice(value) |> ruby_dotted() |> String.split(".")
+          {base, text} =
+            case slice(source, value) do
+              "::" <> rooted -> {[], rooted}
+              text -> {state.scope, text}
+            end
+
+          segs = text |> ruby_dotted() |> String.split(".")
 
           scope =
-            if List.starts_with?(Enum.reverse(state.scope), Enum.reverse(segs)),
-              do: state.scope,
-              else: state.scope ++ segs
+            if List.starts_with?(Enum.reverse(base), Enum.reverse(segs)),
+              do: base,
+              else: base ++ segs
 
           %{state | scope: scope, class_qname: Enum.join(scope, ".")}
 
@@ -716,16 +722,46 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
-  # A class heritage (`extends <expr>`) is evaluated in the ENCLOSING scope.
+  # A class heritage (`extends <expr>`) is evaluated in the ENCLOSING scope, and
+  # so are the computed keys of its members.
   defp walk_js_class(node, source, language, lang_ctx, outer_state, inner_state, acc) do
     Enum.reduce_while(named_children(node), acc, fn child, acc ->
-      state = if TS.node_kind(child) == "class_heritage", do: outer_state, else: inner_state
+      acc =
+        case TS.node_kind(child) do
+          "class_heritage" ->
+            process_child(child, source, language, lang_ctx, outer_state, acc)
 
-      if at_cap?(acc),
-        do: {:halt, acc},
-        else: {:cont, process_child(child, source, language, lang_ctx, state, acc)}
+          "class_body" ->
+            walk_js_class_body(child, source, language, lang_ctx, outer_state, inner_state, acc)
+
+          _ ->
+            process_child(child, source, language, lang_ctx, inner_state, acc)
+        end
+
+      if at_cap?(acc), do: {:halt, acc}, else: {:cont, acc}
     end)
   end
+
+  defp walk_js_class_body(body, source, language, lang_ctx, outer_state, inner_state, acc) do
+    Enum.reduce(named_children(body), acc, fn member, acc ->
+      {keys, rest} = Enum.split_with(named_children(member), &computed_key?/1)
+      acc = walk_nodes(keys, source, language, lang_ctx, outer_state, acc)
+
+      if Map.has_key?(lang_ctx.def_kinds, TS.node_kind(member)),
+        do:
+          process_child(
+            member,
+            source,
+            language,
+            lang_ctx,
+            Map.put(inner_state, :keys_done, true),
+            acc
+          ),
+        else: walk_nodes(rest, source, language, lang_ctx, inner_state, acc)
+    end)
+  end
+
+  defp computed_key?(node), do: TS.node_kind(node) == "computed_property_name"
 
   # Entering a python class does not bind `self`: its direct statements keep the
   # outer receiver and only functions defined directly in the body get the
@@ -815,6 +851,21 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
        when lang in ["javascript", "typescript"],
        do: walk_js_class(node, source, lang, lang_ctx, outer, inner, acc)
 
+  # A class member's computed key was already walked in the class's enclosing state.
+  defp walk_definition(node, _category, lang, source, lang_ctx, %{keys_done: true}, inner, acc)
+       when lang in ["javascript", "typescript"] do
+    children = node |> named_children() |> Enum.reject(&computed_key?/1)
+    walk_nodes(children, source, lang, lang_ctx, inner, acc)
+  end
+
+  # A ruby superclass expression is evaluated in the ENCLOSING scope.
+  defp walk_definition(node, :class_like, "ruby", source, lang_ctx, outer, inner, acc) do
+    Enum.reduce(named_children(node), acc, fn child, acc ->
+      state = if TS.node_kind(child) == "superclass", do: outer, else: inner
+      walk_nodes([child], source, "ruby", lang_ctx, state, acc)
+    end)
+  end
+
   # Walks the whole definition node: these grammars give the parameter list its
   # own dedicated node kind, so there's no ambiguity to worry about.
   defp walk_definition(node, _category, lang, source, lang_ctx, _outer, inner, acc),
@@ -893,8 +944,11 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         "field_expression" ->
           rust_field_expression_callee(fn_node, source)
 
-        kind when kind in ["identifier", "scoped_identifier"] ->
-          {fallback_last_segment(source, fn_node), false}
+        "scoped_identifier" ->
+          rust_scoped_callee(fn_node, source)
+
+        "identifier" ->
+          {slice(source, fn_node), false}
 
         _ ->
           nil
@@ -953,6 +1007,13 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       inner |> unwrap_parenthesized() |> rust_unwrap_generic_callee()
     else
       _ -> fn_node
+    end
+  end
+
+  defp rust_scoped_callee(fn_node, source) do
+    case TS.node_child_by_field_name(fn_node, "name") do
+      nil -> {fallback_last_segment(source, fn_node), false}
+      name_node -> {slice(source, name_node), false}
     end
   end
 

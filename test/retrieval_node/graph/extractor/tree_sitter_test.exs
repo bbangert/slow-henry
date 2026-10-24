@@ -1147,6 +1147,35 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
     end
   end
 
+  describe "review regressions, round 8" do
+    test "ruby: class << ::A is rooted; class << A::B still nests" do
+      src = "class C; class << ::A; def run; self.helper; end; end; end"
+      assert calls(src, "ruby") == [{"A.helper", "A.run"}]
+
+      src = "class C; class << A::B; def run; self.helper; end; end; end"
+      assert calls(src, "ruby") == [{"C.A.B.helper", "C.A.B.run"}]
+    end
+
+    test "js/ts: computed class member keys run in the enclosing instance" do
+      src = "class Outer { make() { class Inner { [this.key()]() {} } } }"
+
+      for lang <- ["javascript", "typescript"] do
+        assert calls(src, lang) == [{"Outer.key", "Outer.make"}]
+      end
+    end
+
+    test "ruby: the superclass expression runs in the enclosing scope" do
+      src = "class Outer; class Inner < self.base(); end; end"
+      assert calls(src, "ruby") == [{"Outer.base", "Outer"}]
+    end
+
+    test "rust: scoped callees resolve through the name field" do
+      for src <- ["util::helper()", "util :: helper()", "util:: /* c */ helper()"] do
+        assert calls("fn run() { #{src}; }", "rust") == [{"helper", "run"}]
+      end
+    end
+  end
+
   defp find(entities, qualified_name),
     do: Enum.find(entities, &(&1.qualified_name == qualified_name))
 end
