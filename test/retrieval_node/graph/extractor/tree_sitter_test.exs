@@ -883,6 +883,58 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
     end
   end
 
+  describe "review regressions, round 3" do
+    test "ruby: named receiver inside its own class matches def self.other" do
+      src = "class C; def C.run; self.other; end; def self.other; end; end"
+      %{entities: e, references: r} = extract(src, "ruby")
+      assert find(e, "C.run")
+      assert find(e, "C.other")
+      refute find(e, "C.C.run")
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "C.other"))
+    end
+
+    test "typescript: namespaces qualify their members" do
+      src =
+        "namespace A { export function run() { go(); } }\nnamespace B { export function run() {} }"
+
+      %{entities: e, references: r} = extract(src, "typescript")
+      assert find(e, "A.run")
+      assert find(e, "B.run")
+      refute find(e, "run")
+      assert Enum.any?(r, &(&1.name == "go" and &1.from == "A.run"))
+    end
+
+    test "python: lambda binding self shadows the receiver in its body only" do
+      src = """
+      class K:
+          def m(self):
+              a = lambda self: self.helper()
+              b = lambda: self.helper()
+              c = lambda x=self.dflt(): x
+      """
+
+      %{references: r} = extract(src, "python")
+      calls = for %{kind: :call, name: n} <- r, do: n
+      assert Enum.sort(calls) == ["K.dflt", "K.helper", "helper"]
+    end
+
+    test "ruby: singleton method on a local variable drops the class receiver" do
+      src = "class C; def attach(other); def other.run; self.helper(); end; end; end"
+      %{entities: e, references: r} = extract(src, "ruby")
+      assert find(e, "C.attach.run")
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "helper"))
+      refute Enum.any?(r, &(&1.name == "C.helper"))
+    end
+
+    test "ruby: receiver-qualified require is a call, bare/Kernel require an import" do
+      src = ~S|validator.require("token")| <> "\nrequire \"json\"\nKernel.require \"set\"\n"
+      %{references: r} = extract(src, "ruby")
+      imports = for %{kind: :import, name: n} <- r, do: n
+      assert Enum.sort(imports) == ["json", "set"]
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "require"))
+    end
+  end
+
   describe "oversized symbols" do
     # Mirrors @max_symbol_bytes in the extractor: identifiers past the cap are
     # minified/generated junk and would blow the entities unique btree index

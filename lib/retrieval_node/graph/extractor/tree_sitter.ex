@@ -109,7 +109,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       "class" => :class_like,
       "interface_declaration" => :class_like,
       "type_alias_declaration" => :class_like,
-      "enum_declaration" => :class_like
+      "enum_declaration" => :class_like,
+      "internal_module" => :module_like,
+      "module" => :module_like
     },
     "go" => %{
       "function_declaration" => :function_like,
@@ -219,8 +221,18 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         state = %{state | container_kind: :function_like, class_qname: class_qname}
         walk(child, source, language, lang_ctx, state, acc)
 
+      true ->
+        process_scope_child(child, kind, source, language, lang_ctx, state, acc)
+    end
+  end
+
+  defp process_scope_child(child, kind, source, language, lang_ctx, state, acc) do
+    cond do
       this_rebinding?(language, kind) ->
         walk(child, source, language, lang_ctx, %{state | class_qname: nil}, acc)
+
+      python_self_lambda?(child, kind, source, language) ->
+        walk_python_lambda(child, source, language, lang_ctx, state, acc)
 
       java_anonymous_class_body?(language, kind, child) ->
         state = %{state | container_kind: :class_like, class_qname: nil}
@@ -229,6 +241,24 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       true ->
         walk(child, source, language, lang_ctx, state, acc)
     end
+  end
+
+  # `lambda self: ...` shadows the receiver in its body; parameter defaults are
+  # evaluated in the enclosing scope.
+  defp python_self_lambda?(node, "lambda", source, "python") do
+    case TS.node_child_by_field_name(node, "parameters") do
+      nil -> false
+      params -> params |> named_children() |> Enum.any?(&self_param?(&1, source))
+    end
+  end
+
+  defp python_self_lambda?(_node, _kind, _source, _language), do: false
+
+  defp walk_python_lambda(node, source, language, lang_ctx, state, acc) do
+    params = TS.node_child_by_field_name(node, "parameters")
+    body = TS.node_child_by_field_name(node, "body")
+    acc = walk(params, source, language, lang_ctx, state, acc)
+    walk_nodes(List.wrap(body), source, language, lang_ctx, %{state | class_qname: nil}, acc)
   end
 
   # Ordinary js/ts functions bind their own `this`; arrow functions inherit
@@ -447,12 +477,21 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
     if name && object && TS.node_kind(object) in ["constant", "scope_resolution"] do
       receiver = source |> slice(object) |> ruby_dotted()
-      state = %{state | self_name: receiver}
+
+      # A receiver naming the enclosing class itself (`class C; def C.run`)
+      # is already in the lexical scope; don't prefix it twice.
+      {state, method_name} =
+        if List.starts_with?(
+             Enum.reverse(state.scope),
+             Enum.reverse(String.split(receiver, "."))
+           ),
+           do: {state, name},
+           else: {%{state | self_name: receiver}, receiver <> "." <> name}
 
       handle_definition_category(
         child,
         :method_like,
-        receiver <> "." <> name,
+        method_name,
         source,
         language,
         lang_ctx,
@@ -460,6 +499,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         acc
       )
     else
+      # `def other.run`: `self` inside is an unresolvable object.
+      state =
+        if object && TS.node_kind(object) != "self", do: %{state | class_qname: nil}, else: state
+
       handle_definition_category(
         child,
         :function_like,
@@ -835,13 +878,22 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # nodes. Classify one as an import of its first string argument.
   defp ruby_import(call_node, source, "ruby", name)
        when name in ["require", "require_relative"] do
-    case first_string_arg(call_node, source) do
-      nil -> :not_import
-      str -> {:import, str}
+    with true <- ruby_kernel_receiver?(call_node, source),
+         str when not is_nil(str) <- first_string_arg(call_node, source) do
+      {:import, str}
+    else
+      _ -> :not_import
     end
   end
 
   defp ruby_import(_call_node, _source, _language, _name), do: :not_import
+
+  defp ruby_kernel_receiver?(call_node, source) do
+    case TS.node_child_by_field_name(call_node, "receiver") do
+      nil -> true
+      recv -> TS.node_kind(recv) == "self" or slice(source, recv) in ["Kernel", "::Kernel"]
+    end
+  end
 
   defp first_string_arg(call_node, source) do
     with args_node when not is_nil(args_node) <-
