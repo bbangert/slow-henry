@@ -54,6 +54,66 @@ defmodule RetrievalNode.Bench.MetricsTest do
     end
   end
 
+  describe "mrr/2" do
+    test "first relevant id at rank 1 scores 1.0" do
+      ranked = ["a", "b", "c"]
+      relevant = MapSet.new(["a"])
+
+      assert Metrics.mrr(ranked, relevant) == 1.0
+    end
+
+    test "first relevant id at rank 3 scores ~0.333" do
+      ranked = ["a", "b", "c", "d"]
+      relevant = MapSet.new(["c", "d"])
+
+      assert_in_delta Metrics.mrr(ranked, relevant), 1.0 / 3, 0.0001
+    end
+
+    test "no relevant id present scores 0.0" do
+      ranked = ["a", "b", "c"]
+      relevant = MapSet.new(["x", "y"])
+
+      assert Metrics.mrr(ranked, relevant) == 0.0
+    end
+
+    test "empty relevant set scores 0.0 rather than raising" do
+      assert Metrics.mrr(["a", "b"], MapSet.new()) == 0.0
+    end
+
+    test "empty ranked list scores 0.0" do
+      assert Metrics.mrr([], MapSet.new(["a"])) == 0.0
+    end
+  end
+
+  describe "hit_at_k/3" do
+    test "relevant id exactly at rank k counts as a hit (boundary)" do
+      ranked = ["a", "b", "c"]
+      relevant = MapSet.new(["c"])
+
+      assert Metrics.hit_at_k(ranked, relevant, 3)
+      refute Metrics.hit_at_k(ranked, relevant, 2)
+    end
+
+    test "relevant id at rank 1 is a hit for any k >= 1" do
+      ranked = ["a", "b", "c"]
+      relevant = MapSet.new(["a"])
+
+      assert Metrics.hit_at_k(ranked, relevant, 1)
+      assert Metrics.hit_at_k(ranked, relevant, 5)
+    end
+
+    test "no relevant id within the leading k is not a hit" do
+      ranked = ["a", "b", "c", "d"]
+      relevant = MapSet.new(["d"])
+
+      refute Metrics.hit_at_k(ranked, relevant, 3)
+    end
+
+    test "empty relevant set is never a hit" do
+      refute Metrics.hit_at_k(["a", "b"], MapSet.new(), 5)
+    end
+  end
+
   describe "percentile/2" do
     test "nearest-rank method over 1..10" do
       values = Enum.to_list(1..10)

@@ -3,6 +3,11 @@ defmodule RetrievalNode.MCP.Tools.SemanticSearch do
   Hybrid semantic + keyword search across indexed code, Jira issues, and Drive
   docs. Returns ranked back-links — `{source_type, repo, breadcrumb, metadata,
   score}` — **not** full content; expand a hit with `get_file`.
+
+  Optional `rerank: true` reranks the top RRF candidates with a cross-encoder
+  (experimental; adds latency and is off by default). When active, each result
+  also carries `fused_score` — the original RRF score — alongside the rerank
+  `score`, for comparing the two ranking modes.
   """
   use Anubis.Server.Component, type: :tool
 
@@ -17,6 +22,11 @@ defmodule RetrievalNode.MCP.Tools.SemanticSearch do
     field(:source, :string, description: "Filter by source kind: git | jira | drive")
     field(:repo, :string, description: "Filter by repo slug (see list_repos)")
     field(:lang, :string, description: "Filter by language, e.g. python, elixir")
+
+    field(:rerank, :boolean,
+      description:
+        "Experimental: rerank top candidates with a cross-encoder (adds latency; default off)"
+    )
   end
 
   @impl true
@@ -24,7 +34,12 @@ defmodule RetrievalNode.MCP.Tools.SemanticSearch do
     case normalize_source(Map.get(params, :source)) do
       {:ok, source_type} ->
         opts =
-          [source_type: source_type, repo: Map.get(params, :repo), lang: Map.get(params, :lang)]
+          [
+            source_type: source_type,
+            repo: Map.get(params, :repo),
+            lang: Map.get(params, :lang),
+            rerank: Map.get(params, :rerank)
+          ]
           |> Enum.reject(fn {_k, v} -> is_nil(v) end)
 
         results = query |> Search.hybrid_search(opts) |> Enum.map(&result/1)
@@ -44,15 +59,21 @@ defmodule RetrievalNode.MCP.Tools.SemanticSearch do
   defp normalize_source(other),
     do: {:error, "unknown source #{inspect(other)} — use git | jira | drive"}
 
-  defp result(%{chunk: chunk, score: score}) do
+  defp result(hit) do
     %{
-      chunk_id: chunk.id,
-      source_type: chunk.source_type,
-      repo: chunk.repo,
-      lang: chunk.lang,
-      breadcrumb: chunk.context_breadcrumb,
-      metadata: chunk.metadata,
-      score: score
+      chunk_id: hit.chunk.id,
+      source_type: hit.chunk.source_type,
+      repo: hit.chunk.repo,
+      lang: hit.chunk.lang,
+      breadcrumb: hit.chunk.context_breadcrumb,
+      metadata: hit.chunk.metadata,
+      score: hit.score
     }
+    |> maybe_put_fused_score(hit)
   end
+
+  defp maybe_put_fused_score(result, %{fused_score: fused_score}),
+    do: Map.put(result, :fused_score, fused_score)
+
+  defp maybe_put_fused_score(result, _hit), do: result
 end
