@@ -207,6 +207,11 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       kind in lang_ctx.import_kinds ->
         handle_import(child, source, language, state, acc)
 
+      anonymous_function?(language, kind) ->
+        class_qname = if this_rebinding?(language, kind), do: nil, else: state.class_qname
+        state = %{state | container_kind: :function_like, class_qname: class_qname}
+        walk(child, source, language, lang_ctx, state, acc)
+
       this_rebinding?(language, kind) ->
         walk(child, source, language, lang_ctx, %{state | class_qname: nil}, acc)
 
@@ -222,6 +227,23 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       kind in ~w(function_declaration generator_function_declaration function_expression generator_function)
 
   defp this_rebinding?(_language, _kind), do: false
+
+  # Anonymous functions emit no entity but are function-like containers, so a
+  # nested named function is a :function, not a :method of the enclosing class.
+  defp anonymous_function?(language, kind) when language in ["javascript", "typescript"],
+    do: kind in ~w(arrow_function function_expression generator_function)
+
+  defp anonymous_function?(_language, _kind), do: false
+
+  # An object-literal method binds `this` to the object, not the class.
+  defp object_literal_method?(node) do
+    with "method_definition" <- TS.node_kind(node),
+         parent when not is_nil(parent) <- TS.node_parent(node) do
+      TS.node_kind(parent) == "object"
+    else
+      _ -> false
+    end
+  end
 
   defp maybe_walk(acc, child, source, language, lang_ctx, state) do
     if at_cap?(acc), do: acc, else: walk(child, source, language, lang_ctx, state, acc)
@@ -303,12 +325,12 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
     child
     |> named_children()
-    |> Enum.filter(&(TS.node_kind(&1) == "type_spec"))
+    |> Enum.filter(&(TS.node_kind(&1) in ["type_spec", "type_alias"]))
     |> Enum.reduce_while(acc, fn spec, acc ->
       if at_cap?(acc) do
         {:halt, acc}
       else
-        name = name_field(spec, language, "type_spec", source)
+        name = name_field(spec, language, TS.node_kind(spec), source)
 
         {:cont,
          handle_definition_category(spec, category, name, source, language, lang_ctx, state, acc)}
@@ -471,7 +493,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         container_kind: category,
         enclosing_qname: new_enclosing_qname,
         class_qname:
-          if(this_rebinding?(language, TS.node_kind(child)), do: nil, else: new_class_qname),
+          if(this_rebinding?(language, TS.node_kind(child)) or object_literal_method?(child),
+            do: nil,
+            else: new_class_qname
+          ),
         self_name: nil
       }
 
@@ -826,7 +851,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp rust_use_list_paths(node, prefix, source) do
-    node |> named_children() |> Enum.flat_map(&rust_use_paths(&1, prefix, source))
+    node
+    |> named_children()
+    |> Enum.reject(&(TS.node_kind(&1) in ["line_comment", "block_comment"]))
+    |> Enum.flat_map(&rust_use_paths(&1, prefix, source))
   end
 
   defp rust_scoped_use_list_paths(node, prefix, source) do
@@ -1014,7 +1042,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp name_field(node, "rust", "impl_item", source) do
     case TS.node_child_by_field_name(node, "type") do
       nil -> nil
-      type_node -> type_node |> rust_base_type_node() |> then(&slice(source, &1))
+      type_node -> source |> slice(rust_base_type_node(type_node)) |> String.replace("::", ".")
     end
   end
 

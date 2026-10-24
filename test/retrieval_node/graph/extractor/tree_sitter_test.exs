@@ -712,6 +712,44 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
     end
   end
 
+  describe "review regressions" do
+    test "rust: module-qualified impl type is dotted; use-list comments skipped" do
+      %{entities: e, references: r} =
+        extract(
+          "mod m { pub struct Foo; impl Foo { pub fn helper(&self) {} } }\nimpl m::Foo<T> { fn run(&self) { self.helper(); } }\nuse std::{fs, /* c */ io};\n",
+          "rust"
+        )
+
+      assert find(e, "m.Foo.run")
+      refute Enum.any?(e, &String.contains?(&1.qualified_name, "::"))
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "m.Foo.helper"))
+
+      imports = for %{kind: :import, name: n} <- r, do: n
+      assert Enum.sort(imports) == ["std::fs", "std::io"]
+    end
+
+    test "go: type aliases are class entities, standalone and grouped" do
+      %{entities: e} =
+        extract("package p\ntype A = int\ntype (\n B = string\n C struct{}\n)\n", "go")
+
+      assert %{kind: :class} = find(e, "A")
+      assert %{kind: :class} = find(e, "B")
+      assert %{kind: :class} = find(e, "C")
+    end
+
+    test "js: object-literal method drops the class receiver; nested fn in arrow is a function" do
+      %{references: r} =
+        extract("class C { m() { const o = { run() { this.helper(); } }; } }", "javascript")
+
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "helper"))
+
+      %{entities: e} =
+        extract("class C { cb = () => { function local() {} } }", "javascript")
+
+      assert %{kind: :function} = Enum.find(e, &String.ends_with?(&1.qualified_name, "local"))
+    end
+  end
+
   describe "oversized symbols" do
     # Mirrors @max_symbol_bytes in the extractor: identifiers past the cap are
     # minified/generated junk and would blow the entities unique btree index
