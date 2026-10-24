@@ -237,6 +237,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       python_self_lambda?(child, kind, source, language) ->
         walk_python_lambda(child, source, language, lang_ctx, state, acc)
 
+      language == "ruby" and kind == "singleton_class" ->
+        walk_ruby_singleton_class(child, source, language, lang_ctx, state, acc)
+
       java_anonymous_class_body?(language, kind, child) ->
         state = %{state | container_kind: :class_like, class_qname: nil}
         walk(child, source, language, lang_ctx, state, acc)
@@ -244,6 +247,36 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       true ->
         walk(child, source, language, lang_ctx, state, acc)
     end
+  end
+
+  # `class << expr`: `expr` is evaluated in the enclosing scope. `self` keeps the
+  # enclosing class; a constant qualifies the body like `def Foo.x`; anything
+  # else is an unresolvable object, so `self` inside has no class receiver.
+  defp walk_ruby_singleton_class(node, source, language, lang_ctx, state, acc) do
+    value = TS.node_child_by_field_name(node, "value")
+    body = TS.node_child_by_field_name(node, "body")
+    acc = walk_nodes(List.wrap(value), source, language, lang_ctx, state, acc)
+
+    inner =
+      case value && TS.node_kind(value) do
+        "self" ->
+          state
+
+        kind when kind in ["constant", "scope_resolution"] ->
+          segs = source |> slice(value) |> ruby_dotted() |> String.split(".")
+
+          scope =
+            if List.starts_with?(Enum.reverse(state.scope), Enum.reverse(segs)),
+              do: state.scope,
+              else: state.scope ++ segs
+
+          %{state | scope: scope, class_qname: Enum.join(scope, ".")}
+
+        _ ->
+          %{state | class_qname: nil}
+      end
+
+    walk_nodes(List.wrap(body), source, language, lang_ctx, inner, acc)
   end
 
   # `lambda self: ...` shadows the receiver in its body; parameter defaults are
@@ -528,10 +561,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
          source,
          "ruby" = language,
          lang_ctx,
-         %{container_kind: :function_like, class_qname: class_qname} = state,
+         %{container_kind: container, class_qname: class_qname} = state,
          acc
        )
-       when is_binary(class_qname) do
+       when container in [:function_like, :method_like] and is_binary(class_qname) do
     name = name_field(child, language, kind, source)
     state = %{state | scope: String.split(class_qname, ".")}
     handle_definition_category(child, :method_like, name, source, language, lang_ctx, state, acc)
@@ -660,7 +693,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       end
 
     {new_class_qname, pending_class} =
-      python_class_receiver(language, category, state, new_class_qname)
+      python_class_receiver(language, category, state, new_class_qname, child, source)
 
     if at_cap?(acc) do
       acc
@@ -697,14 +730,31 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # Entering a python class does not bind `self`: its direct statements keep the
   # outer receiver and only functions defined directly in the body get the
   # class (held in `pending_class` meanwhile) as theirs.
-  defp python_class_receiver("python", :class_like, state, class_qname),
+  defp python_class_receiver("python", :class_like, state, class_qname, _node, _source),
     do: {state.class_qname, class_qname}
 
-  defp python_class_receiver("python", :function_like, %{container_kind: :class_like} = state, _) do
-    {state.pending_class || state.class_qname, nil}
+  defp python_class_receiver(
+         "python",
+         :function_like,
+         %{container_kind: :class_like} = state,
+         _,
+         node,
+         source
+       ) do
+    if python_binds_self?(node, source),
+      do: {state.pending_class || state.class_qname, nil},
+      else: {state.class_qname, nil}
   end
 
-  defp python_class_receiver(_language, _category, _state, class_qname), do: {class_qname, nil}
+  defp python_class_receiver(_language, _category, _state, class_qname, _node, _source),
+    do: {class_qname, nil}
+
+  defp python_binds_self?(node, source) do
+    case TS.node_child_by_field_name(node, "parameters") do
+      nil -> false
+      params -> params |> named_children() |> Enum.any?(&self_param?(&1, source))
+    end
+  end
 
   # Python evaluates a definition's header (parameter defaults, annotations,
   # class bases) in the ENCLOSING scope (outer receiver and `from`); only the
@@ -744,10 +794,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # own `self` parameter shadows the outer receiver.
   defp python_rebinds_self?(node, source, "python", %{container_kind: container})
        when container != :class_like do
-    case TS.node_child_by_field_name(node, "parameters") do
-      nil -> false
-      params -> params |> named_children() |> Enum.any?(&self_param?(&1, source))
-    end
+    python_binds_self?(node, source)
   end
 
   defp python_rebinds_self?(_node, _source, _language, _state), do: false
@@ -842,10 +889,15 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp callee_name(call_node, source, "rust") do
     with fn_node when not is_nil(fn_node) <- callee_node(call_node),
          fn_node <- rust_unwrap_generic_callee(fn_node) do
-      if TS.node_kind(fn_node) == "field_expression" do
-        rust_field_expression_callee(fn_node, source)
-      else
-        {fallback_last_segment(source, fn_node), false}
+      case TS.node_kind(fn_node) do
+        "field_expression" ->
+          rust_field_expression_callee(fn_node, source)
+
+        kind when kind in ["identifier", "scoped_identifier"] ->
+          {fallback_last_segment(source, fn_node), false}
+
+        _ ->
+          nil
       end
     end
   end
@@ -944,7 +996,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         field_node -> {slice(source, field_node), self?}
       end
     else
-      {slice(source, fn_node), false}
+      if TS.node_kind(fn_node) == "identifier", do: {slice(source, fn_node), false}
     end
   end
 

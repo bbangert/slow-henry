@@ -1076,6 +1076,77 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
     end
   end
 
+  describe "review regressions, round 7" do
+    defp calls(src, lang) do
+      %{references: r} = extract(src, lang)
+      for %{kind: :call} = c <- r, do: {c.name, c.from}
+    end
+
+    defp ents(src, lang) do
+      %{entities: e} = extract(src, lang)
+      for x <- e, do: {x.qualified_name, x.kind}
+    end
+
+    test "python: a nested method without a self parameter keeps the captured receiver" do
+      src = """
+      class Factory:
+          def build(self):
+              class Product:
+                  @staticmethod
+                  def run():
+                      return self.helper()
+
+                  @classmethod
+                  def make(cls):
+                      return self.other()
+
+                  def own(self):
+                      return self.mine()
+      """
+
+      assert calls(src, "python") == [
+               {"Factory.helper", "Factory.build.Product.run"},
+               {"Factory.other", "Factory.build.Product.make"},
+               {"Factory.build.Product.mine", "Factory.build.Product.own"}
+             ]
+
+      assert [{"K.x", "K.m"}] = calls("class K:\n    def m(self):\n        self.x()\n", "python")
+    end
+
+    test "ruby: class << other clears the receiver; class << self keeps it" do
+      src =
+        "class C; def attach(other); class << other; def run; self.helper(); end; end; end; end"
+
+      assert calls(src, "ruby") == [{"helper", "C.attach.run"}]
+
+      src = "class C; class << self; def run; self.helper(); end; end; end"
+      assert calls(src, "ruby") == [{"C.helper", "C.run"}]
+
+      src = "class C; class << Foo; def run; self.helper(); end; end; end"
+      assert calls(src, "ruby") == [{"C.Foo.helper", "C.Foo.run"}]
+    end
+
+    test "ruby: a def nested in an explicit-receiver method defines a method on the class" do
+      src = "class C; def C.install; def helper; end; end; end"
+      assert {"C.helper", :method} in ents(src, "ruby")
+    end
+
+    test "rust: non-path callee expressions are not named" do
+      src = "fn factory() -> impl Fn() { || {} } fn run() { factory()(); }"
+      assert calls(src, "rust") == [{"factory", "run"}]
+    end
+
+    test "python/js: non-identifier callee expressions are not named" do
+      assert calls("def run():\n    factory()()\n", "python") == [{"factory", "run"}]
+
+      src = "function run() { (function() { go(); })(); }"
+
+      for lang <- ["javascript", "typescript"] do
+        assert calls(src, lang) == [{"go", "run"}]
+      end
+    end
+  end
+
   defp find(entities, qualified_name),
     do: Enum.find(entities, &(&1.qualified_name == qualified_name))
 end
