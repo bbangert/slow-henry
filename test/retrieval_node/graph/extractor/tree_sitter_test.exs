@@ -778,6 +778,357 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
     end
   end
 
+  describe "elixir" do
+    @src """
+    defmodule Payment.Processor do
+      @moduledoc "docs"
+
+      alias Foo.Bar, as: B
+      import Ecto.Query
+      use GenServer
+      require Logger
+
+      def process(order) do
+        B.run(order)
+        helper(order)
+      end
+
+      defp helper(o), do: o
+
+      def init, do: :ok
+
+      def guarded(x) when x > 1 do
+        x
+      end
+
+      @x String.trim("y")
+    end
+    """
+
+    test "entities: module, def/defp-inside-module as :function with qualified names" do
+      %{entities: entities} = extract(@src, "elixir")
+
+      assert %{qualified_name: "Payment.Processor", kind: :module} =
+               find(entities, "Payment.Processor")
+
+      assert %{qualified_name: "Payment.Processor.process", kind: :function} =
+               find(entities, "Payment.Processor.process")
+
+      assert %{qualified_name: "Payment.Processor.helper", kind: :function} =
+               find(entities, "Payment.Processor.helper")
+    end
+
+    test "zero-arity no-paren def is named correctly" do
+      %{entities: entities} = extract(@src, "elixir")
+
+      assert %{qualified_name: "Payment.Processor.init", kind: :function} =
+               find(entities, "Payment.Processor.init")
+    end
+
+    test "a when-guard def is named correctly (not \"guarded(x) when x > 1\")" do
+      %{entities: entities} = extract(@src, "elixir")
+
+      assert %{qualified_name: "Payment.Processor.guarded", kind: :function} =
+               find(entities, "Payment.Processor.guarded")
+    end
+
+    test "bare and dot-qualified calls scoped to the enclosing def" do
+      %{references: refs} = extract(@src, "elixir")
+
+      assert %{name: "helper", kind: :call, from: "Payment.Processor.process"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+
+      assert %{name: "run", kind: :call, from: "Payment.Processor.process"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "run"))
+    end
+
+    test "a def's own head is not walked as a call: no spurious self-call from process to process" do
+      %{references: refs} = extract(@src, "elixir")
+
+      refute Enum.any?(
+               refs,
+               &(&1.kind == :call and &1.name == "process" and
+                   &1.from == "Payment.Processor.process")
+             )
+    end
+
+    test "a when-guard def's head and guard are not walked as calls, but its body still is" do
+      %{references: refs} =
+        extract(
+          """
+          defmodule Payment.Processor do
+            def guarded(x) when is_binary(x) do
+              helper(x)
+            end
+          end
+          """,
+          "elixir"
+        )
+
+      refute Enum.any?(refs, &(&1.kind == :call and &1.name == "guarded"))
+      refute Enum.any?(refs, &(&1.kind == :call and &1.name == "is_binary"))
+
+      assert %{name: "helper", kind: :call, from: "Payment.Processor.guarded"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+    end
+
+    test "keyword `do:` form still walks its body: defp x(a), do: helper(a) finds the call" do
+      %{references: refs} =
+        extract(
+          """
+          defmodule Payment.Processor do
+            defp x(a), do: helper(a)
+          end
+          """,
+          "elixir"
+        )
+
+      assert %{name: "helper", kind: :call, from: "Payment.Processor.x"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+    end
+
+    test "alias/import/use/require all become :import refs named by the full module text" do
+      %{references: refs} = extract(@src, "elixir")
+      imports = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert "Foo.Bar" in imports
+      assert "Ecto.Query" in imports
+      assert "GenServer" in imports
+      assert "Logger" in imports
+    end
+
+    test "@moduledoc does not produce a call ref, but a call nested in an attribute value is found" do
+      %{references: refs} = extract(@src, "elixir")
+
+      refute Enum.any?(refs, &(&1.kind == :call and &1.name == "moduledoc"))
+      refute Enum.any?(refs, &(&1.kind == :call and &1.name == "x"))
+
+      assert %{name: "trim", kind: :call, from: "Payment.Processor"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "trim"))
+    end
+
+    test "typespec attributes (@spec/@callback/@type) are never walked as calls, unlike other attributes" do
+      %{references: refs} =
+        extract(
+          """
+          defmodule M do
+            @spec f(binary()) :: :ok
+            def f(x), do: g(x)
+
+            @callback cb(term()) :: :ok
+
+            @type t :: map()
+
+            @custom String.trim("a")
+          end
+          """,
+          "elixir"
+        )
+
+      call_names = refs |> Enum.filter(&(&1.kind == :call)) |> Enum.map(& &1.name)
+
+      assert %{name: "g", kind: :call, from: "M.f"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "g"))
+
+      assert %{name: "trim", kind: :call, from: "M"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "trim"))
+
+      refute "f" in call_names
+      refute "binary" in call_names
+      refute "cb" in call_names
+      refute "term" in call_names
+      refute "map" in call_names
+    end
+
+    test "alias braces form best-effort: alias Foo.{Bar, Baz} records a single \"Foo\" import ref" do
+      %{references: refs} = extract("alias Foo.{Bar, Baz}\n", "elixir")
+
+      assert Enum.any?(refs, &(&1.kind == :import and &1.name == "Foo"))
+    end
+
+    test "defimpl is scoped by its for: type: impls don't collapse onto the protocol or each other" do
+      %{entities: entities, references: refs} =
+        extract(
+          """
+          defprotocol Sized do
+            def size(t)
+          end
+
+          defimpl Sized, for: BitString do
+            def size(s), do: byte_size(s)
+          end
+
+          defimpl Sized, for: Map do
+            def size(m), do: map_size(m)
+          end
+          """,
+          "elixir"
+        )
+
+      assert %{qualified_name: "Sized", kind: :module} = find(entities, "Sized")
+
+      assert %{qualified_name: "Sized.BitString", kind: :module} =
+               find(entities, "Sized.BitString")
+
+      assert %{qualified_name: "Sized.Map", kind: :module} = find(entities, "Sized.Map")
+
+      assert %{qualified_name: "Sized.BitString.size", kind: :function} =
+               find(entities, "Sized.BitString.size")
+
+      assert %{qualified_name: "Sized.Map.size", kind: :function} =
+               find(entities, "Sized.Map.size")
+
+      assert %{name: "byte_size", kind: :call, from: "Sized.BitString.size"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "byte_size"))
+    end
+
+    test "defimpl nested directly inside a defmodule (no for:) is scoped to the enclosing module" do
+      %{entities: entities} =
+        extract(
+          """
+          defprotocol Sized do
+            def size(t)
+          end
+
+          defmodule Outer do
+            defimpl Sized do
+              def size(_), do: 1
+            end
+          end
+          """,
+          "elixir"
+        )
+
+      assert %{qualified_name: "Sized.Outer", kind: :module} = find(entities, "Sized.Outer")
+
+      assert %{qualified_name: "Sized.Outer.size", kind: :function} =
+               find(entities, "Sized.Outer.size")
+
+      refute Enum.any?(entities, &(&1.qualified_name == "Outer.Sized"))
+    end
+
+    test "defimpl Sized, for: [BitString, Map] fans out to one implementation per listed type" do
+      %{entities: entities, references: refs} =
+        extract(
+          """
+          defprotocol Sized do
+            def size(t)
+          end
+
+          defimpl Sized, for: [BitString, Map] do
+            def size(x), do: helper(x)
+          end
+          """,
+          "elixir"
+        )
+
+      assert %{qualified_name: "Sized.BitString", kind: :module} =
+               find(entities, "Sized.BitString")
+
+      assert %{qualified_name: "Sized.Map", kind: :module} = find(entities, "Sized.Map")
+
+      assert %{qualified_name: "Sized.BitString.size", kind: :function} =
+               find(entities, "Sized.BitString.size")
+
+      assert %{qualified_name: "Sized.Map.size", kind: :function} =
+               find(entities, "Sized.Map.size")
+
+      # The shared defimpl body is walked once per listed type, so the
+      # `helper` call is attributed to BOTH generated implementations, not
+      # just the first (the round-12 bug this fixes silently kept only
+      # Sized.BitString and dropped Sized.Map entirely).
+      assert Enum.any?(
+               refs,
+               &(&1.kind == :call and &1.name == "helper" and &1.from == "Sized.BitString.size")
+             )
+
+      assert Enum.any?(
+               refs,
+               &(&1.kind == :call and &1.name == "helper" and &1.from == "Sized.Map.size")
+             )
+    end
+
+    test "macro-spliced and operator definition names are anonymous; bodies are still walked" do
+      %{entities: e, references: r} =
+        extract(
+          """
+          defmodule M do
+            defmacro gen(name) do
+              quote do
+                def unquote(name)(x), do: helper(x)
+                def unquote(:"a b#{1}")(), do: other()
+                def unquote(name), do: third()
+                def a <> b, do: fourth(a)
+              end
+            end
+          end
+          """,
+          "elixir"
+        )
+
+      assert Enum.sort(Enum.map(e, & &1.qualified_name)) == ["M", "M.gen"]
+
+      for name <- ["helper", "other", "third", "fourth"] do
+        assert Enum.any?(r, &(&1.kind == :call and &1.name == name and &1.from == "M.gen"))
+      end
+    end
+
+    test "a dot callee with a non-identifier member names nothing" do
+      %{references: r} = extract("defmodule M do\n  def f, do: Mod.unquote(x)()\nend\n", "elixir")
+      names = for %{kind: :call, name: n} <- r, do: n
+      assert names == ["unquote"]
+    end
+
+    test "attributes named like definition or import forms are not definitions or imports" do
+      %{entities: e, references: r} =
+        extract("defmodule M do\n  @use true\n  @def helper()\n  @alias 1\nend\n", "elixir")
+
+      assert Enum.map(e, & &1.qualified_name) == ["M"]
+      assert [%{name: "helper", kind: :call, from: "M"}] = r
+    end
+
+    test "defimpl: for: __MODULE__ and a duplicate type resolve once; an unresolvable target is anonymous" do
+      %{entities: e, references: r} =
+        extract(
+          """
+          defmodule Outer do
+            defimpl P, for: __MODULE__ do
+              def f(x), do: a(x)
+            end
+
+            defimpl Q, for: [A, A] do
+              def g(x), do: b(x)
+            end
+
+            defimpl R, for: unquote(t) do
+              def h(x), do: c(x)
+            end
+          end
+
+          defimpl S do
+            def i(x), do: d(x)
+          end
+          """,
+          "elixir"
+        )
+
+      assert Enum.sort(Enum.map(e, & &1.qualified_name)) ==
+               ["Outer", "P.Outer", "P.Outer.f", "Q.A", "Q.A.g", "Outer.h", "i"]
+               |> Enum.sort()
+
+      assert Enum.any?(r, &(&1.name == "a" and &1.from == "P.Outer.f"))
+      assert Enum.any?(r, &(&1.name == "c" and &1.from == "Outer.h"))
+      assert Enum.any?(r, &(&1.name == "d" and &1.from == "i"))
+    end
+
+    test "qualified calls name the rightmost member, never the enclosing module" do
+      %{references: r} =
+        extract("defmodule M do\n  def f, do: __MODULE__.g(Other.h())\nend\n", "elixir")
+
+      assert Enum.sort(for %{kind: :call, name: n} <- r, do: n) == ["g", "h"]
+    end
+  end
+
   describe "review regressions" do
     test "rust: module-qualified impl type is dotted; use-list comments skipped" do
       %{entities: e, references: r} =
@@ -1064,6 +1415,25 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       # The invariant check in extract/2 also asserts every `from` is emitted.
       assert [%{name: "helper", from: "K"}] = refs
     end
+
+    test "ruby: an oversized singleton-method name keeps its explicit receiver binding" do
+      long = String.duplicate("x", 300)
+
+      src =
+        "class C; class A; end; def A.#{long}; self.helper(); end; def C.#{long}; self.other(); end; end"
+
+      %{entities: e, references: refs} = extract(src, "ruby")
+      assert Enum.sort(Enum.map(e, & &1.qualified_name)) == ["C", "C.A"]
+      assert Enum.any?(refs, &(&1.name == "C.A.helper" and &1.from == "C"))
+      assert Enum.any?(refs, &(&1.name == "C.other" and &1.from == "C"))
+    end
+
+    test "ruby: an oversized singleton receiver is unresolvable, so self is too" do
+      long = String.duplicate("X", 300)
+      src = "class C; def #{long}.run; self.helper(); end; end"
+      %{references: refs} = extract(src, "ruby")
+      assert [%{name: "helper", from: "C"}] = refs
+    end
   end
 
   describe "review regressions, round 4" do
@@ -1298,7 +1668,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       "go" => {"package p\ntype T struct{}\n", "func (t T) M@@() {}\n", ""},
       "rust" => {"struct S;\nimpl S {\n", "  fn m@@(&self) {}\n", "}\n"},
       "ruby" => {"class C\n", "  def m@@; end\n", "end\n"},
-      "java" => {"class C {\n", "  void m@@() {}\n", "}\n"}
+      "java" => {"class C {\n", "  void m@@() {}\n", "}\n"},
+      "elixir" => {"defmodule M do\n", "  def f@@, do: :ok\n", "end\n"}
     }
 
     for {language, {head, member, tail}} <- @generators do
