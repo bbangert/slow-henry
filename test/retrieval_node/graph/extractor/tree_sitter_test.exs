@@ -1,10 +1,10 @@
 defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
   use ExUnit.Case, async: true
 
-  # Real tree-sitter parsing loads the NIF; excluded by default (mirrors
-  # RetrievalNode.Chunking.TreeSitterImplTest's "real AST chunking" describe).
-  # Run with `mix test --include integration`.
-  @moduletag :integration
+  # Real tree-sitter parsing loads the NIF and needs cached grammars; excluded by
+  # default (see test_helper.exs). CI prefetches and runs it; locally run
+  # `mix test --include tree_sitter`.
+  @moduletag :tree_sitter
 
   alias RetrievalNode.Graph.Extractor.TreeSitter, as: GraphTS
   alias TreeSitterLanguagePack, as: TS

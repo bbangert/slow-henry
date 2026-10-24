@@ -92,6 +92,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       MIX_ENV: test
+      # The tree-sitter NIF caches downloaded grammars under XDG_CACHE_HOME;
+      # point it inside the workspace so the cache step below can persist them.
+      XDG_CACHE_HOME: ${{ github.workspace }}/.cache
     services:
       # PostgreSQL 18 with pgvector preinstalled — matches the app's store and
       # satisfies the migration's `vector >= 0.5.0` guard.
@@ -122,9 +125,19 @@ jobs:
           key: ${{ runner.os }}-test-${{ hashFiles('mix.lock') }}
           restore-keys: ${{ runner.os }}-test-
       - run: mix deps.get
+      # Grammars are keyed on mix.lock: the cache path embeds the
+      # tree_sitter_language_pack version, so a bump fetches a fresh set.
+      - uses: actions/cache@v6
+        with:
+          path: .cache/tree-sitter-language-pack
+          key: ${{ runner.os }}-grammars-${{ hashFiles('mix.lock') }}
+      # Fails the job if any required grammar is still missing afterwards.
+      - run: mix rn.grammars.prefetch
       # The `test` alias runs ecto.create + ecto.migrate before the suite; the
       # migrate step exercises the extension/HNSW setup against real pgvector.
-      - run: mix test --warnings-as-errors
+      # :tree_sitter tests (real parsing: chunker + graph extractor) run here
+      # now that the grammars are cached; :integration (model) tests do not.
+      - run: mix test --warnings-as-errors --include tree_sitter
 
   dialyzer:
     name: Dialyzer
