@@ -76,12 +76,14 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
       states: [:available, :scheduled, :executing, :retryable, :suspended]
     ]
 
+  import Ecto.Query, only: [from: 2, subquery: 1, union: 2]
+
   require Logger
 
   alias RetrievalNode.Chunking
   alias RetrievalNode.Ingest.{GitMirror, PendingChunks, SourceOwner}
   alias RetrievalNode.Repo
-  alias RetrievalNode.Retrieval.{Source, SyncState}
+  alias RetrievalNode.Retrieval.{Chunk, PendingChunk, Source, SyncState}
 
   @lang_by_ext %{
     "py" => "python",
@@ -92,7 +94,9 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
     "go" => "go",
     "rs" => "rust",
     "rb" => "ruby",
-    "java" => "java"
+    "java" => "java",
+    "ex" => "elixir",
+    "exs" => "elixir"
   }
 
   @impl Oban.Worker
@@ -136,19 +140,33 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   end
 
   defp sync_changes(source, slug, last_sha, new_sha, sync_state, full?) do
-    with {:ok, entries} <- GitMirror.changed_entries(slug, last_sha, new_sha) do
-      # Deletions come from the diff status, NOT from probing `show` — a file that
-      # still exists but is unreadable ({:error, :file_too_large}) must be skipped,
-      # never mistaken for a deletion and pruned.
-      {deleted, present} = Enum.split_with(entries, fn {status, _} -> status == :deleted end)
+    with {:ok, entries} <- GitMirror.changed_entries(slug, last_sha, new_sha),
+         {:ok, rows} <- diff_rows(source, slug, entries, new_sha, full?) do
+      stage_and_advance(
+        source,
+        sync_state,
+        new_sha,
+        rows,
+        reconciler(full?, source, slug, entries)
+      )
+    end
+  end
 
-      deletion_rows =
-        Enum.map(deleted, fn {_status, path} -> deletion_row(source, slug, path) end)
+  defp reconciler(true, source, slug, entries),
+    do: fn -> stale_deletion_rows(source, slug, entries) end
 
-      with {:ok, content_rows} <-
-             build_rows(source, slug, Enum.map(present, &elem(&1, 1)), new_sha, full?) do
-        stage_and_advance(source, sync_state, new_sha, deletion_rows ++ content_rows)
-      end
+  defp reconciler(false, _source, _slug, _entries), do: nil
+
+  # Deletions come from the diff status, NOT from probing `show` — a file that
+  # still exists but is unreadable ({:error, :file_too_large}) must be skipped,
+  # never mistaken for a deletion and pruned.
+  defp diff_rows(source, slug, entries, new_sha, full?) do
+    {deleted, present} = Enum.split_with(entries, fn {status, _} -> status == :deleted end)
+    deletion_rows = Enum.map(deleted, fn {_status, path} -> deletion_row(source, slug, path) end)
+
+    with {:ok, content_rows} <-
+           build_rows(source, slug, Enum.map(present, &elem(&1, 1)), new_sha, full?) do
+      {:ok, deletion_rows ++ content_rows}
     end
   end
 
@@ -173,10 +191,14 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   # didn't stage. So the whole thing is atomic: either every row this sync
   # discovered is durable AND the cursor reflects it, or (on any error)
   # neither happened and the next cron tick re-discovers the same diff.
-  defp stage_and_advance(source, sync_state, new_sha, rows) do
+  #
+  # `reconcile`, when given, is called inside the transaction and returns extra
+  # deletion rows (full mode: see stale_deletion_rows/3).
+  defp stage_and_advance(source, sync_state, new_sha, rows, reconcile) do
     {:ok, :ok} =
       Repo.transaction(
         fn ->
+          rows = if reconcile, do: reconcile.() ++ rows, else: rows
           if rows != [], do: {:ok, _ids} = PendingChunks.insert_raw_all(rows)
           advance_watermark!(sync_state, new_sha)
           :ok
@@ -186,6 +208,35 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
 
     SourceOwner.notify(source.id)
     :ok
+  end
+
+  # A full sync diffs HEAD against nothing, so it never sees a file removed
+  # since the stored cursor — and advancing the cursor would hide it from every
+  # later incremental diff. Instead, stage a deletion entry for every path the
+  # source has indexed (applied `chunks`) or staged-but-unapplied (live raw
+  # mailbox rows, which a deletion entry supersedes per natural_key) that is
+  # absent from HEAD. Both sets come from ONE statement (one snapshot) so the
+  # owner moving a row from mailbox to chunks mid-read can't hide a path.
+  # Paths present at HEAD are never touched here: skip rules (binary,
+  # lockfile, oversized) already stage their own deletion in raw_row/5, so the
+  # index follows the current rules; unreadable-but-present files stay as-is.
+  defp stale_deletion_rows(source, slug, head_entries) do
+    at_head = MapSet.new(head_entries, &elem(&1, 1))
+
+    chunk_paths =
+      from c in Chunk,
+        where: c.source_id == ^source.id,
+        select: %{path: fragment("?->>'path'", c.metadata)}
+
+    pending_paths =
+      from p in PendingChunk,
+        where: p.source_id == ^source.id and p.status == "raw",
+        select: %{path: fragment("?->>'path'", p.metadata)}
+
+    from(u in subquery(union(chunk_paths, ^pending_paths)), select: u.path)
+    |> Repo.all()
+    |> Enum.reject(&(is_nil(&1) or MapSet.member?(at_head, &1)))
+    |> Enum.map(&deletion_row(source, slug, &1))
   end
 
   defp mark_synced!(sync_state) do

@@ -221,13 +221,24 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   # A chunkable node with chunkable descendants (a container, e.g. a class) yields
   # its members; a leaf-most one is emitted as a chunk itself.
   defp emit_or_recurse(child, source, language, scope, kind) do
-    child_scope = scope ++ [node_name(child, source)]
+    child_scope = enclosing_scope(child, source, language, scope) ++ [node_name(child, source)]
 
     case extract(child, source, language, child_scope) do
       [] -> [to_chunk(child, source, kind, child_scope)]
       nested -> nested
     end
   end
+
+  # A rooted `defmodule Elixir.Foo` is absolute: it never nests under the
+  # enclosing module, matching `Graph.Extractor.TreeSitter`.
+  defp enclosing_scope(node, source, "elixir", scope) do
+    case elixir_module_alias(node, source) do
+      {_name, true} -> []
+      _ -> scope
+    end
+  end
+
+  defp enclosing_scope(_node, _source, _language, scope), do: scope
 
   # Collect direct named children in one O(n) cursor pass. The indexed
   # `node_named_child/2` accessor rescans from the first child each call (O(n²)
@@ -276,9 +287,14 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
 
       target_node ->
         case slice(source, target_node) do
-          t when t in @elixir_module_forms -> elixir_module_name(call_node, source)
-          t when t in @elixir_function_forms -> elixir_def_name(call_node, source)
-          _ -> nil
+          t when t in @elixir_module_forms ->
+            call_node |> elixir_module_alias(source) |> alias_name()
+
+          t when t in @elixir_function_forms ->
+            elixir_def_name(call_node, source)
+
+          _ ->
+            nil
         end
     end
   end
@@ -286,17 +302,21 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   # defmodule/defprotocol/defimpl name from the first `alias` among their
   # arguments — `defimpl Sized, for: MyStruct` has a second alias, but it is
   # nested under the keyword list, not a direct child of `arguments`. The
-  # absolute `Elixir.Foo` form is canonicalised to `Foo`, as in the extractor.
-  defp elixir_module_name(call_node, source) do
+  # absolute `Elixir.Foo` form is canonicalised to `{"Foo", true}` (rooted), as
+  # in the extractor; non-rooted aliases are `{name, false}`.
+  defp elixir_module_alias(call_node, source) do
     with args_node when not is_nil(args_node) <- elixir_arguments_node(call_node),
          alias_node when not is_nil(alias_node) <-
            args_node |> named_children() |> Enum.find(&(TS.node_kind(&1) == "alias")) do
       case slice(source, alias_node) do
-        "Elixir." <> rest -> rest
-        name -> name
+        "Elixir." <> rest -> {rest, true}
+        name -> {name, false}
       end
     end
   end
+
+  defp alias_name({name, _rooted?}), do: name
+  defp alias_name(nil), do: nil
 
   # def-family name from the first argument, in one of three shapes: a bare
   # identifier (zero-arity no-paren def), a nested `call` (the common

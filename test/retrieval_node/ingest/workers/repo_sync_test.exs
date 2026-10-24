@@ -388,6 +388,69 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
       assert Repo.get_by!(SyncState, source_id: ctx.source.id).cursor["last_sha"] == head
     end
 
+    defp sync_and_drain(ctx, args \\ %{}) do
+      assert :ok = perform_job(RepoSync, Map.merge(%{"source_id" => ctx.source.id}, args))
+      on_exit(fn -> SourceOwner.stop(ctx.source.id) end)
+      assert {:ok, _stats} = SourceOwner.drain(ctx.source.id)
+    end
+
+    defp indexed_paths(ctx) do
+      Repo.all(
+        from c in Chunk,
+          where: c.source_id == ^ctx.source.id,
+          distinct: true,
+          select: fragment("?->>'path'", c.metadata)
+      )
+      |> Enum.sort()
+    end
+
+    defp rm_commit(ctx, path) do
+      File.rm!(Path.join(ctx.src, path))
+      git!(ctx.src, ["add", "-A"])
+      git!(ctx.src, ["commit", "-qm", "rm"])
+    end
+
+    test "a file deleted since the cursor is reconciled away by a full sync", ctx do
+      commit(ctx.src, [{"keep.py", "def k(): pass\n"}, {"gone.py", "def g(): pass\n"}])
+      sync_and_drain(ctx)
+      assert indexed_paths(ctx) == ["gone.py", "keep.py"]
+
+      rm_commit(ctx, "gone.py")
+      sync_and_drain(ctx, %{"full" => true})
+
+      assert indexed_paths(ctx) == ["keep.py"]
+    end
+
+    test "a rename removes the old path and indexes the new one on a full sync", ctx do
+      commit(ctx.src, [{"old.py", "def moved(): pass\n"}])
+      sync_and_drain(ctx)
+
+      git!(ctx.src, ["mv", "old.py", "new.py"])
+      git!(ctx.src, ["commit", "-qm", "mv"])
+      sync_and_drain(ctx, %{"full" => true})
+
+      assert indexed_paths(ctx) == ["new.py"]
+    end
+
+    test "a deletion whose raw row was staged but never applied is superseded", ctx do
+      commit(ctx.src, [{"a.py", "def a(): pass\n"}, {"gone.py", "def g(): pass\n"}])
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+      rm_commit(ctx, "gone.py")
+
+      sync_and_drain(ctx, %{"full" => true})
+
+      assert indexed_paths(ctx) == ["a.py"]
+    end
+
+    test "a full sync with nothing deleted stages no deletion entries", ctx do
+      commit(ctx.src, [{"a.py", "def a(): pass\n"}, {"b.py", "def b(): pass\n"}])
+      sync_and_drain(ctx)
+
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id, "full" => true})
+
+      assert Repo.all(from p in PendingChunk, where: p.status == "deleted") == []
+    end
+
     test "still applies the generated-file skip rule", ctx do
       commit(ctx.src, [{"a.py", "def a(): pass\n"}, {"mix.lock", "%{}\n"}])
 
@@ -415,6 +478,44 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
         assert Repo.aggregate(PendingChunk, :count, :id) == 0
         assert Repo.get_by(SyncState, source_id: ctx.source.id) == nil
       end
+    end
+  end
+
+  describe "elixir files" do
+    test "are staged with lang elixir", ctx do
+      commit(ctx.src, [{"a.ex", "defmodule A do\nend\n"}, {"t.exs", "IO.puts(1)\n"}])
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+      langs = Map.new(Repo.all(PendingChunk), &{&1.natural_key, &1.lang})
+
+      assert langs == %{
+               "repo:#{ctx.source.id}:a.ex" => "elixir",
+               "repo:#{ctx.source.id}:t.exs" => "elixir"
+             }
+    end
+
+    @tag :tree_sitter
+    test "ingest with tree-sitter yields ok chunks and graph entities", ctx do
+      prev = Application.get_env(:retrieval_node, :chunking_impl)
+      Application.put_env(:retrieval_node, :chunking_impl, RetrievalNode.Chunking.TreeSitterImpl)
+      on_exit(fn -> Application.put_env(:retrieval_node, :chunking_impl, prev) end)
+
+      commit(ctx.src, [{"pay.ex", "defmodule Pay do\n  def run(x), do: x\nend\n"}])
+      assert :ok = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+      on_exit(fn -> SourceOwner.stop(ctx.source.id) end)
+      assert {:ok, _stats} = SourceOwner.drain(ctx.source.id)
+
+      chunks = Repo.all(from c in Chunk, where: c.source_id == ^ctx.source.id)
+      assert chunks != [] and Enum.all?(chunks, &(&1.parse_status == :ok))
+
+      names =
+        Repo.all(
+          from e in RetrievalNode.Graph.Entity,
+            where: e.source_id == ^ctx.source.id,
+            select: e.qualified_name
+        )
+
+      assert "Pay.run" in names
     end
   end
 end

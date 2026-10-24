@@ -164,6 +164,27 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
       assert "Sized > size" in crumbs
     end
 
+    test "a rooted Elixir. module nested in another resets the breadcrumb scope, as the extractor does" do
+      src = """
+      defmodule Outer do
+        defmodule Elixir.Shared do
+          def s, do: 1
+        end
+
+        def o, do: 2
+      end
+      """
+
+      assert {:ok, %{chunks: chunks, entities: entities}} =
+               TSI.chunk_with_graph(src, "elixir")
+
+      crumbs = Enum.map(chunks, & &1.breadcrumb)
+      assert "Shared > s" in crumbs
+      assert "Outer > o" in crumbs
+      refute "Outer > Shared > s" in crumbs
+      assert Enum.any?(entities, &(&1.qualified_name == "Shared.s"))
+    end
+
     test "a module-less top-level def (script) still chunks" do
       {:ok, chunks} = TSI.chunk("def top(x) do\n  x + 1\nend\n", "elixir")
 
