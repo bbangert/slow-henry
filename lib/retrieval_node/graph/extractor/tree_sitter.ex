@@ -743,21 +743,24 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp walk_js_class_body(body, source, language, lang_ctx, outer_state, inner_state, acc) do
-    Enum.reduce(named_children(body), acc, fn member, acc ->
+    Enum.reduce_while(named_children(body), acc, fn member, acc ->
       {keys, rest} = Enum.split_with(named_children(member), &computed_key?/1)
       acc = walk_nodes(keys, source, language, lang_ctx, outer_state, acc)
 
-      if Map.has_key?(lang_ctx.def_kinds, TS.node_kind(member)),
-        do:
-          process_child(
-            member,
-            source,
-            language,
-            lang_ctx,
-            Map.put(inner_state, :keys_done, true),
+      acc =
+        cond do
+          at_cap?(acc) ->
             acc
-          ),
-        else: walk_nodes(rest, source, language, lang_ctx, inner_state, acc)
+
+          Map.has_key?(lang_ctx.def_kinds, TS.node_kind(member)) ->
+            keys_state = Map.put(inner_state, :keys_done, true)
+            process_child(member, source, language, lang_ctx, keys_state, acc)
+
+          true ->
+            walk_nodes(rest, source, language, lang_ctx, inner_state, acc)
+        end
+
+      if at_cap?(acc), do: {:halt, acc}, else: {:cont, acc}
     end)
   end
 
@@ -856,6 +859,15 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
        when lang in ["javascript", "typescript"] do
     children = node |> named_children() |> Enum.reject(&computed_key?/1)
     walk_nodes(children, source, lang, lang_ctx, inner, acc)
+  end
+
+  # Any other js/ts definition (e.g. an object-literal method): a computed key is
+  # evaluated in the scope enclosing the definition, its body in the new scope.
+  defp walk_definition(node, _category, lang, source, lang_ctx, outer, inner, acc)
+       when lang in ["javascript", "typescript"] do
+    {keys, rest} = node |> named_children() |> Enum.split_with(&computed_key?/1)
+    acc = walk_nodes(keys, source, lang, lang_ctx, outer, acc)
+    walk_nodes(rest, source, lang, lang_ctx, inner, acc)
   end
 
   # A ruby superclass expression is evaluated in the ENCLOSING scope.
@@ -1493,15 +1505,20 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp at_cap?(acc), do: acc.count >= @max_items
 
-  # Oversized symbols are skipped at the single choke point both emission
-  # paths go through (see @max_symbol_bytes). A skipped definition still
-  # extends the scope for its children, whose qualified names then exceed the
-  # cap too and are skipped consistently.
+  # The item cap and the symbol-size limit are both enforced HERE, at the single
+  # choke point every emission goes through, so no traversal path can exceed
+  # them; the `at_cap?/1` checks in the walkers are only early exits. A skipped
+  # oversized definition still extends the scope for its children, whose
+  # qualified names then exceed the limit too and are skipped consistently.
+  defp add_entity(%{count: count} = acc, _entity) when count >= @max_items, do: acc
+
   defp add_entity(acc, %{qualified_name: qname}) when byte_size(qname) > @max_symbol_bytes,
     do: acc
 
   defp add_entity(acc, entity),
     do: %{acc | entities: [entity | acc.entities], count: acc.count + 1}
+
+  defp add_reference(%{count: count} = acc, _reference) when count >= @max_items, do: acc
 
   defp add_reference(acc, %{name: name}) when byte_size(name) > @max_symbol_bytes,
     do: acc

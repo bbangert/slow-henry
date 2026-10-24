@@ -1176,6 +1176,46 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
     end
   end
 
+  describe "invariants" do
+    # Each generator ({head, member template with `@@` = index, tail}) emits
+    # ~10_050 definitions in that language's most common nesting (methods in a
+    # class/impl). Whatever path a language's walk takes, output must stop
+    # exactly at the 10_000-item cap.
+    @over_cap 10_050
+    @generators %{
+      "python" => {"class K:\n", "    def m@@(self): pass\n", ""},
+      "javascript" => {"class C {\n", "  m@@() {}\n", "}\n"},
+      "typescript" => {"class C {\n", "  m@@(): void {}\n", "}\n"},
+      "go" => {"package p\ntype T struct{}\n", "func (t T) M@@() {}\n", ""},
+      "rust" => {"struct S;\nimpl S {\n", "  fn m@@(&self) {}\n", "}\n"},
+      "ruby" => {"class C\n", "  def m@@; end\n", "end\n"},
+      "java" => {"class C {\n", "  void m@@() {}\n", "}\n"}
+    }
+
+    for {language, {head, member, tail}} <- @generators do
+      @language language
+      @head head
+      @member member
+      @tail tail
+      test "#{language}: output never exceeds the 10_000-item cap" do
+        body = Enum.map_join(1..@over_cap, &String.replace(@member, "@@", to_string(&1)))
+        src = @head <> body <> @tail
+        %{entities: e, references: r} = extract(src, @language)
+        assert length(e) + length(r) == 10_000
+      end
+    end
+
+    test "js/ts: an object-literal method's computed key runs in the enclosing scope" do
+      src = "class Outer { make() { return { [this.key()]() { go(); } }; } }"
+
+      for lang <- ["javascript", "typescript"] do
+        %{references: r} = extract(src, lang)
+        assert Enum.any?(r, &(&1.name == "Outer.key" and &1.from == "Outer.make"))
+        refute Enum.any?(r, &(&1.name == "key"))
+      end
+    end
+  end
+
   defp find(entities, qualified_name),
     do: Enum.find(entities, &(&1.qualified_name == qualified_name))
 end
