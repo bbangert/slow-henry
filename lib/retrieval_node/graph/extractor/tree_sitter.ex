@@ -81,6 +81,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   The receiver is what `self`/`this` calls qualify to (`WalkState.receiver`).
   An unresolved receiver leaves the callee bare; never guess.
+  A class or module with no emitted name (unnamed, or its name rejected as
+  oversized/unstorable) has no identity for `self` to resolve to, so it is a
+  receiver boundary in every language, except a Python class BODY, which
+  never binds `self` (its `self`-taking methods stay unresolved instead).
 
     * Python: a method binds its class only if it takes `self`. A class body
       keeps the outer receiver. A nested def or lambda that takes `self`
@@ -914,9 +918,21 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # identity to resolve a receiver to.
   defp receiver_boundary?(node, source, language, category, name, state) do
     this_rebinding?(language, TS.node_kind(node)) or object_literal_method?(node) or
-      (is_nil(name) and category == :class_like and language != "python") or
+      anonymous_container?(name, category, language) or
       python_rebinds_self?(node, source, language, state)
   end
+
+  # An unnamed (or rejected-name) class or module has no identity for `self` to
+  # resolve to, in every language; except a Python class body, which never binds
+  # `self` at all and keeps the outer receiver (its methods are handled via
+  # `:unresolved` pending_receiver).
+  defp anonymous_container?(nil, :class_like, "python"), do: false
+
+  defp anonymous_container?(nil, category, _language)
+       when category in [:class_like, :module_like],
+       do: true
+
+  defp anonymous_container?(_name, _category, _language), do: false
 
   # A python function nested in a function (not a direct method) that takes its
   # own `self` parameter shadows the outer receiver.

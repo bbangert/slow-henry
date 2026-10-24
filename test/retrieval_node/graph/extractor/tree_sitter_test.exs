@@ -1045,6 +1045,18 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       assert {"helper", "Factory.build.run"} in calls
     end
 
+    test "ruby: a rejected nested class or module clears the enclosing receiver" do
+      long = "M" <> String.duplicate("x", 300)
+
+      for kw <- ["module", "class"] do
+        src = "class C\n  #{kw} #{long}\n    self.helper\n  end\n  def self.helper; end\nend\n"
+        %{references: refs} = extract(src, "ruby")
+        # `self` in the nested body is that module/class, which has no identity.
+        refute Enum.any?(refs, &(&1.name == "C.helper"))
+        assert Enum.any?(refs, &(&1.name == "helper" and &1.from == "C"))
+      end
+    end
+
     test "an oversized definition is anonymous: calls inside get the outer from" do
       long = String.duplicate("x", 300)
       src = "class K:\n    def #{long}(self):\n        helper()\n"
