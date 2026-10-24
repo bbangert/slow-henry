@@ -1157,6 +1157,23 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       assert Enum.sort(calls) == Enum.sort([{"helper", "M.f"}, {"fun", "M.f"}, {"other", "M.f"}])
     end
 
+    test "multiline pipeline calls report their own lines" do
+      src = """
+      defmodule M do
+        def f(x) do
+          x
+          |> helper
+          |> other
+        end
+      end
+      """
+
+      %{references: r} = extract(src, "elixir")
+
+      assert Enum.sort(for %{kind: :call, name: n, line: l} <- r, do: {n, l}) ==
+               [{"helper", 4}, {"other", 5}]
+    end
+
     test "calls inside import forms are still collected" do
       src = ~S"""
       defmodule M do

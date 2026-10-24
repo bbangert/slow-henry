@@ -333,6 +333,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       bare_pipe_callee(child, source) ->
         # `x |> helper` calls helper/1: the right operand of `|>` is always a
         # call, but without parens the grammar makes it a bare identifier.
+        # The reference's line is the callee's (the operator node starts at the
+        # pipeline's input, possibly lines earlier).
         callee = bare_pipe_callee(child, source)
         left = List.wrap(TS.node_child_by_field_name(child, "left"))
         acc = walk_nodes(left, source, language, lang_ctx, state, acc)
@@ -341,7 +343,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
           name: callee,
           kind: :call,
           from: state.enclosing_qname,
-          line: line(child)
+          line: line(TS.node_child_by_field_name(child, "right"))
         })
 
       true ->
