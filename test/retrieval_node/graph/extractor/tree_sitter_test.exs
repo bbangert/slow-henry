@@ -1,0 +1,668 @@
+defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
+  use ExUnit.Case, async: true
+
+  # Real tree-sitter parsing loads the NIF; excluded by default (mirrors
+  # RetrievalNode.Chunking.TreeSitterImplTest's "real AST chunking" describe).
+  # Run with `mix test --include integration`.
+  @moduletag :integration
+
+  alias RetrievalNode.Graph.Extractor.TreeSitter, as: GraphTS
+  alias TreeSitterLanguagePack, as: TS
+
+  defp parse(source, language) do
+    parser = TS.parser_new()
+    {:ok, {}} = TS.parser_set_language(parser, language)
+    parser |> TS.parser_parse(source) |> TS.tree_root_node()
+  end
+
+  defp extract(source, language) do
+    root = parse(source, language)
+    {:ok, result} = GraphTS.extract({root, source}, language, [])
+    result
+  end
+
+  describe "python" do
+    @src """
+    class Payment:
+        def process(self):
+            return self.helper()
+
+
+    def helper():
+        return 1
+
+
+    import os
+    import os.path as osp
+    from collections import OrderedDict
+    """
+
+    test "entities: class, method-inside-class, and top-level function" do
+      %{entities: entities} = extract(@src, "python")
+
+      assert %{qualified_name: "Payment", kind: :class} = find(entities, "Payment")
+
+      assert %{qualified_name: "Payment.process", kind: :method} =
+               find(entities, "Payment.process")
+
+      assert %{qualified_name: "helper", kind: :function} = find(entities, "helper")
+    end
+
+    test "self.helper() -> \"Payment.helper\": self-receiver scoped to the enclosing class" do
+      %{references: refs} = extract(@src, "python")
+
+      assert %{name: "Payment.helper", kind: :call, from: "Payment.process"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "Payment.helper"))
+    end
+
+    test "other.helper() -> \"helper\": non-self receiver stays unscoped best-effort" do
+      %{references: refs} =
+        extract(
+          """
+          class Payment:
+              def process(self, other):
+                  return other.helper()
+          """,
+          "python"
+        )
+
+      assert %{name: "helper", kind: :call, from: "Payment.process"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+    end
+
+    test "imports: plain, aliased (real module name, not the alias), and from-import" do
+      %{references: refs} = extract(@src, "python")
+      imports = Enum.filter(refs, &(&1.kind == :import))
+
+      assert Enum.any?(imports, &(&1.name == "os" and &1.from == nil))
+      assert Enum.any?(imports, &(&1.name == "os.path" and &1.from == nil))
+      assert Enum.any?(imports, &(&1.name == "collections" and &1.from == nil))
+    end
+
+    test "from-import records both the module and each imported symbol (aliased -> original name)" do
+      %{references: refs} =
+        extract("from a.b import Klass, func as f\n", "python")
+
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert "a.b" in names
+      assert "Klass" in names
+      assert "func" in names
+      refute "f" in names
+    end
+
+    test "wildcard from-import records only the module, no symbol" do
+      %{references: refs} = extract("from x import *\n", "python")
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert names == ["x"]
+    end
+  end
+
+  describe "javascript" do
+    @src """
+    class Foo {
+      bar() {
+        return baz();
+      }
+    }
+
+    function baz() {
+      return 1;
+    }
+
+    const anon = () => {
+      return helper();
+    };
+
+    import { thing } from "./thing";
+    """
+
+    test "entities: class, method-inside-class, top-level function; no entity for the anonymous arrow" do
+      %{entities: entities} = extract(@src, "javascript")
+
+      assert %{qualified_name: "Foo", kind: :class} = find(entities, "Foo")
+      assert %{qualified_name: "Foo.bar", kind: :method} = find(entities, "Foo.bar")
+      assert %{qualified_name: "baz", kind: :function} = find(entities, "baz")
+
+      # The arrow function has no "name" field, so it is not a definition node
+      # at all: no entity is emitted for it under any name.
+      refute Enum.any?(entities, &(&1.qualified_name in ["anon", "arrow_function"]))
+    end
+
+    test "calls scoped correctly: inside a method vs. inside the anonymous arrow (from = nil)" do
+      %{references: refs} = extract(@src, "javascript")
+
+      assert %{name: "baz", kind: :call, from: "Foo.bar"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "baz"))
+
+      # helper() is called inside the anonymous arrow, which is not itself an
+      # entity, so `from` falls through to the nearest NAMED enclosing
+      # definition — none here, so nil.
+      assert %{name: "helper", kind: :call, from: nil} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+    end
+
+    test "import: source string with quotes stripped" do
+      %{references: refs} = extract(@src, "javascript")
+
+      assert Enum.any?(refs, &(&1.kind == :import and &1.name == "./thing" and &1.from == nil))
+    end
+
+    test "named import: records the module plus default and named symbols (alias -> original name)" do
+      %{references: refs} =
+        extract("import Default, { named, orig as alias } from \"./mod\";\n", "javascript")
+
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert "./mod" in names
+      assert "Default" in names
+      assert "named" in names
+      assert "orig" in names
+      refute "alias" in names
+    end
+
+    test "namespace import records only the module, no symbol" do
+      %{references: refs} = extract("import * as ns from \"y\";\n", "javascript")
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert names == ["y"]
+    end
+  end
+
+  describe "go" do
+    @src """
+    package main
+
+    import "fmt"
+
+    type Point struct {
+    \tX int
+    }
+
+    func (p Point) Distance() int {
+    \treturn fmt.Println("hi")
+    }
+
+    func main() {
+    \tfmt.Println("hello")
+    }
+    """
+
+    test "entities: struct (class-like via nested type_spec name), receiver-qualified method, top-level function" do
+      %{entities: entities} = extract(@src, "go")
+
+      assert %{qualified_name: "Point", kind: :class} = find(entities, "Point")
+      assert %{qualified_name: "main", kind: :function} = find(entities, "main")
+
+      # Distance is qualified by its receiver type ("Point.Distance", not
+      # bare "Distance") and comes out :method -- resolved from the
+      # receiver's `type:` field, not from AST nesting (a go method is never
+      # nested inside its receiver type's own node the way a method sits
+      # inside a class body in every other class-like language here).
+      assert %{qualified_name: "Point.Distance", kind: :method} = find(entities, "Point.Distance")
+      refute Enum.any?(entities, &(&1.qualified_name == "Distance"))
+    end
+
+    test "qualified-callee resolution: fmt.Println() -> \"Println\", scoped per call site" do
+      %{references: refs} = extract(@src, "go")
+      calls = Enum.filter(refs, &(&1.kind == :call and &1.name == "Println"))
+
+      assert length(calls) == 2
+      assert Enum.any?(calls, &(&1.from == "Point.Distance"))
+      assert Enum.any?(calls, &(&1.from == "main"))
+    end
+
+    test "import: quoted path stripped" do
+      %{references: refs} = extract(@src, "go")
+
+      assert Enum.any?(refs, &(&1.kind == :import and &1.name == "fmt" and &1.from == nil))
+    end
+
+    test "same-named methods on different receiver types no longer collapse into one entity" do
+      %{entities: entities, references: refs} =
+        extract(
+          """
+          package main
+
+          type A struct{}
+          type B struct{}
+
+          func (a A) Run() {
+          \ta.helper()
+          }
+
+          func (a A) helper() {
+          }
+
+          func (b B) Run() {
+          }
+          """,
+          "go"
+        )
+
+      assert %{qualified_name: "A.Run", kind: :method} = find(entities, "A.Run")
+      assert %{qualified_name: "B.Run", kind: :method} = find(entities, "B.Run")
+
+      assert %{name: "helper", kind: :call, from: "A.Run"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+    end
+
+    test "pointer receiver is unwrapped to its underlying type: func (p *P) Run() -> \"P.Run\"" do
+      %{entities: entities} =
+        extract(
+          """
+          package main
+
+          type P struct{}
+
+          func (p *P) Run() {
+          }
+          """,
+          "go"
+        )
+
+      assert %{qualified_name: "P.Run", kind: :method} = find(entities, "P.Run")
+    end
+
+    test "grouped type declaration: each type_spec is its own entity, not just the first" do
+      %{entities: entities} =
+        extract(
+          """
+          package main
+
+          type (
+          \tA struct{}
+          \tB struct{}
+          )
+
+          func (b B) Run() {
+          }
+          """,
+          "go"
+        )
+
+      assert %{qualified_name: "A", kind: :class} = find(entities, "A")
+      assert %{qualified_name: "B", kind: :class} = find(entities, "B")
+      assert %{qualified_name: "B.Run", kind: :method} = find(entities, "B.Run")
+    end
+  end
+
+  describe "ruby" do
+    @src """
+    require "json"
+
+    class Greeter
+      def hello
+        puts(helper())
+      end
+
+      def self.static_hello
+        1
+      end
+    end
+
+    def helper
+      42
+    end
+    """
+
+    test "entities: class, method and singleton_method-inside-class, top-level method" do
+      %{entities: entities} = extract(@src, "ruby")
+
+      assert %{qualified_name: "Greeter", kind: :class} = find(entities, "Greeter")
+      assert %{qualified_name: "Greeter.hello", kind: :method} = find(entities, "Greeter.hello")
+
+      assert %{qualified_name: "Greeter.static_hello", kind: :method} =
+               find(entities, "Greeter.static_hello")
+
+      assert %{qualified_name: "helper", kind: :function} = find(entities, "helper")
+    end
+
+    test "calls scoped to the enclosing method" do
+      %{references: refs} = extract(@src, "ruby")
+
+      assert %{name: "puts", kind: :call, from: "Greeter.hello"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "puts"))
+
+      assert %{name: "helper", kind: :call, from: "Greeter.hello"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+    end
+
+    test "self.helper() -> \"Greeter.helper\": self-receiver scoped to the enclosing class" do
+      %{references: refs} =
+        extract(
+          """
+          class Greeter
+            def hello
+              self.helper()
+            end
+
+            def helper
+              1
+            end
+          end
+          """,
+          "ruby"
+        )
+
+      assert %{name: "Greeter.helper", kind: :call, from: "Greeter.hello"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "Greeter.helper"))
+    end
+
+    test "require is classified :import (not :call), content of its string argument" do
+      %{references: refs} = extract(@src, "ruby")
+
+      assert %{name: "json", kind: :import, from: nil} =
+               Enum.find(refs, &(&1.name == "json"))
+
+      refute Enum.any?(refs, &(&1.name == "require"))
+    end
+  end
+
+  describe "java" do
+    @src """
+    import java.util.List;
+
+    class Calculator {
+        int add(int a, int b) {
+            return this.helper(a, b);
+        }
+
+        int helper(int a, int b) {
+            return a + b;
+        }
+    }
+    """
+
+    test "entities: class and methods-inside-class" do
+      %{entities: entities} = extract(@src, "java")
+
+      assert %{qualified_name: "Calculator", kind: :class} = find(entities, "Calculator")
+      assert %{qualified_name: "Calculator.add", kind: :method} = find(entities, "Calculator.add")
+
+      assert %{qualified_name: "Calculator.helper", kind: :method} =
+               find(entities, "Calculator.helper")
+    end
+
+    test "this.helper(a, b) -> \"Calculator.helper\": self-receiver scoped to the enclosing class" do
+      %{references: refs} = extract(@src, "java")
+
+      assert %{name: "Calculator.helper", kind: :call, from: "Calculator.add"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "Calculator.helper"))
+    end
+
+    test "bare helper(a, b) (implicit this, no explicit receiver) stays unscoped" do
+      %{references: refs} =
+        extract(
+          """
+          class Calculator {
+              int add(int a, int b) {
+                  return helper(a, b);
+              }
+
+              int helper(int a, int b) {
+                  return a + b;
+              }
+          }
+          """,
+          "java"
+        )
+
+      assert %{name: "helper", kind: :call, from: "Calculator.add"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+    end
+
+    test "import: scoped identifier text" do
+      %{references: refs} = extract(@src, "java")
+
+      assert Enum.any?(
+               refs,
+               &(&1.kind == :import and &1.name == "java.util.List" and &1.from == nil)
+             )
+    end
+  end
+
+  describe "typescript" do
+    @src """
+    interface Shape {
+      area(): number;
+    }
+
+    class Circle {
+      area(): number {
+        return this.helper();
+      }
+
+      helper(): number {
+        return 1;
+      }
+    }
+
+    function standalone(): number {
+      return helper2();
+    }
+
+    function helper2(): number {
+      return 2;
+    }
+
+    import { thing } from "./thing";
+    """
+
+    test "entities: interface (class-like) and class, method-inside-class, top-level functions" do
+      %{entities: entities} = extract(@src, "typescript")
+
+      assert %{qualified_name: "Shape", kind: :class} = find(entities, "Shape")
+
+      # An interface member (`method_signature`) is a definition node too --
+      # nested directly inside the class-like interface, it comes out
+      # :method via the same rule a concrete class method does.
+      assert %{qualified_name: "Shape.area", kind: :method} = find(entities, "Shape.area")
+
+      assert %{qualified_name: "Circle", kind: :class} = find(entities, "Circle")
+      assert %{qualified_name: "Circle.area", kind: :method} = find(entities, "Circle.area")
+      assert %{qualified_name: "Circle.helper", kind: :method} = find(entities, "Circle.helper")
+      assert %{qualified_name: "standalone", kind: :function} = find(entities, "standalone")
+      assert %{qualified_name: "helper2", kind: :function} = find(entities, "helper2")
+    end
+
+    test "this.helper() -> \"Circle.helper\": self-receiver scoped to the enclosing class; a bare call scoped to its top-level function" do
+      %{references: refs} = extract(@src, "typescript")
+
+      assert %{name: "Circle.helper", kind: :call, from: "Circle.area"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "Circle.helper"))
+
+      assert %{name: "helper2", kind: :call, from: "standalone"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper2"))
+    end
+
+    test "foo.helper() at module level (no enclosing class) stays unscoped best-effort" do
+      %{references: refs} =
+        extract(
+          """
+          function standalone(): number {
+            return foo.helper();
+          }
+          """,
+          "typescript"
+        )
+
+      assert %{name: "helper", kind: :call, from: "standalone"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper"))
+    end
+
+    test "import: source string with quotes stripped" do
+      %{references: refs} = extract(@src, "typescript")
+
+      assert Enum.any?(refs, &(&1.kind == :import and &1.name == "./thing" and &1.from == nil))
+    end
+
+    test "named import: records the module plus default and named symbols (alias -> original name)" do
+      %{references: refs} =
+        extract("import Default, { named, orig as alias } from \"./mod\";\n", "typescript")
+
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert "./mod" in names
+      assert "Default" in names
+      assert "named" in names
+      assert "orig" in names
+      refute "alias" in names
+    end
+  end
+
+  describe "rust" do
+    @src """
+    struct Point {
+        x: i32,
+    }
+
+    impl Point {
+        fn distance(&self) -> i32 {
+            self.helper()
+        }
+
+        fn helper(&self) -> i32 {
+            1
+        }
+    }
+
+    fn main() {
+        helper_fn();
+    }
+
+    fn helper_fn() -> i32 {
+        2
+    }
+
+    use std::collections::HashMap;
+    """
+
+    test "entities: struct, impl block (named via its \"type\" field), and methods-inside-impl, top-level function" do
+      %{entities: entities} = extract(@src, "rust")
+
+      assert %{qualified_name: "Point", kind: :class} = find(entities, "Point")
+      assert %{qualified_name: "Point.distance", kind: :method} = find(entities, "Point.distance")
+      assert %{qualified_name: "Point.helper", kind: :method} = find(entities, "Point.helper")
+      assert %{qualified_name: "main", kind: :function} = find(entities, "main")
+      assert %{qualified_name: "helper_fn", kind: :function} = find(entities, "helper_fn")
+    end
+
+    test "self.helper() -> \"Point.helper\": self-receiver scoped to the enclosing impl block; a bare call scoped to main" do
+      %{references: refs} = extract(@src, "rust")
+
+      assert %{name: "Point.helper", kind: :call, from: "Point.distance"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "Point.helper"))
+
+      assert %{name: "helper_fn", kind: :call, from: "main"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "helper_fn"))
+    end
+
+    test "import: use_declaration argument text (plain path)" do
+      %{references: refs} = extract(@src, "rust")
+
+      assert Enum.any?(
+               refs,
+               &(&1.kind == :import and &1.name == "std::collections::HashMap" and
+                   &1.from == nil)
+             )
+    end
+
+    test "import: use-list emits one ref per concrete path, including deeply nested groups" do
+      %{references: refs} = extract("use std::{fs::File, io::{self, Read}};\n", "rust")
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert "std::fs::File" in names
+      # bare `self` inside a nested list resolves to the prefix itself, not
+      # a literal "self" segment
+      assert "std::io" in names
+      assert "std::io::Read" in names
+      assert length(names) == 3
+    end
+
+    test "import: use-as-clause records the ORIGINAL path, not the alias" do
+      %{references: refs} = extract("use std::io::Result as IoResult;\n", "rust")
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert names == ["std::io::Result"]
+      refute "IoResult" in names
+    end
+
+    test "import: use-wildcard records the prefix path, not the glob" do
+      %{references: refs} = extract("use std::io::*;\n", "rust")
+      names = refs |> Enum.filter(&(&1.kind == :import)) |> Enum.map(& &1.name)
+
+      assert names == ["std::io"]
+    end
+
+    test "trait impls are scoped <Type>.<Trait>: same-named methods on different traits no longer collapse" do
+      %{entities: entities, references: refs} =
+        extract(
+          """
+          struct Foo;
+
+          impl std::fmt::Display for Foo {
+              fn fmt(&self) {
+                  self.helper()
+              }
+          }
+
+          impl Debug for Foo {
+              fn fmt(&self) {}
+          }
+
+          impl Foo {
+              fn helper(&self) {}
+          }
+          """,
+          "rust"
+        )
+
+      # path trait (`std::fmt::Display`) resolves to its rightmost segment
+      assert %{qualified_name: "Foo.Display", kind: :class} = find(entities, "Foo.Display")
+
+      assert %{qualified_name: "Foo.Display.fmt", kind: :method} =
+               find(entities, "Foo.Display.fmt")
+
+      assert %{qualified_name: "Foo.Debug", kind: :class} = find(entities, "Foo.Debug")
+      assert %{qualified_name: "Foo.Debug.fmt", kind: :method} = find(entities, "Foo.Debug.fmt")
+
+      refute Enum.any?(entities, &(&1.qualified_name == "Foo.fmt"))
+
+      # the inherent impl (no trait: field) keeps the bare <Type> scope
+      assert %{qualified_name: "Foo", kind: :class} = find(entities, "Foo")
+      assert %{qualified_name: "Foo.helper", kind: :method} = find(entities, "Foo.helper")
+
+      assert %{name: "Foo.Display.helper", kind: :call, from: "Foo.Display.fmt"} =
+               Enum.find(refs, &(&1.kind == :call and &1.name == "Foo.Display.helper"))
+    end
+  end
+
+  describe "oversized symbols" do
+    # Mirrors @max_symbol_bytes in the extractor: identifiers past the cap are
+    # minified/generated junk and would blow the entities unique btree index
+    # row limit downstream — they must never be emitted.
+    test "definitions and callees longer than the cap are skipped; normal ones survive" do
+      long = String.duplicate("x", 300)
+
+      src = """
+      def #{long}():
+          return 1
+
+
+      def ok():
+          return #{long}()
+      """
+
+      %{entities: entities, references: refs} = extract(src, "python")
+
+      assert Enum.any?(entities, &(&1.qualified_name == "ok"))
+      refute Enum.any?(entities, &(byte_size(&1.qualified_name) > 256))
+      refute Enum.any?(refs, &(byte_size(&1.name) > 256))
+    end
+  end
+
+  defp find(entities, qualified_name),
+    do: Enum.find(entities, &(&1.qualified_name == qualified_name))
+end
