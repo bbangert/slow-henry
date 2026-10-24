@@ -238,7 +238,9 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
       start_line: start_pos.row + 1,
       end_line: end_pos.row + 1,
       kind: kind,
-      parse_status: :ok
+      parse_status: :ok,
+      start_byte: TS.node_start_byte(node),
+      end_byte: TS.node_end_byte(node)
     }
   end
 

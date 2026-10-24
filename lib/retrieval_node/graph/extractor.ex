@@ -18,7 +18,8 @@ defmodule RetrievalNode.Graph.Extractor do
   @type entity :: %{
           qualified_name: String.t(),
           kind: :function | :method | :class | :module,
-          line: pos_integer()
+          line: pos_integer(),
+          byte: non_neg_integer()
         }
 
   @typedoc """
@@ -33,7 +34,8 @@ defmodule RetrievalNode.Graph.Extractor do
           name: String.t(),
           kind: :call | :import,
           from: String.t() | nil,
-          line: pos_integer()
+          line: pos_integer(),
+          byte: non_neg_integer()
         }
 
   @doc """

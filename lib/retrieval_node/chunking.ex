@@ -34,12 +34,14 @@ defmodule RetrievalNode.Chunking do
 
   @type language :: String.t()
   @type chunk :: %{
-          text: String.t(),
-          breadcrumb: String.t(),
-          start_line: pos_integer(),
-          end_line: pos_integer(),
-          kind: String.t(),
-          parse_status: :ok | :heuristic_fallback | :crashed_fallback
+          required(:text) => String.t(),
+          required(:breadcrumb) => String.t(),
+          required(:start_line) => pos_integer(),
+          required(:end_line) => pos_integer(),
+          required(:kind) => String.t(),
+          required(:parse_status) => :ok | :heuristic_fallback | :crashed_fallback,
+          optional(:start_byte) => non_neg_integer(),
+          optional(:end_byte) => non_neg_integer()
         }
 
   @doc "Split `source` (in `language`) into chunks, or return a tagged error."

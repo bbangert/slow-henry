@@ -28,7 +28,7 @@ defmodule RetrievalNode.Ingest.GraphIngestTest do
 
   defp use_impl(impl), do: Application.put_env(:retrieval_node, :chunking_impl, impl)
 
-  defp seed_raw(source, content, path) do
+  defp seed_raw(source, content, path, lang \\ "python") do
     {:ok, _} =
       PendingChunks.insert_raw_all([
         %{
@@ -36,7 +36,7 @@ defmodule RetrievalNode.Ingest.GraphIngestTest do
           source_id: source.id,
           source_type: "git_repo",
           repo: source.identifier,
-          lang: "python",
+          lang: lang,
           natural_key: "repo:#{source.identifier}:#{path}",
           content_hash: "rawhash-#{System.unique_integer([:positive])}",
           raw_content: content,
@@ -190,7 +190,7 @@ defmodule RetrievalNode.Ingest.GraphIngestTest do
     end
   end
 
-  describe "real tree-sitter python through FileIngest" do
+  describe "real tree-sitter (python, javascript) through FileIngest" do
     @describetag :tree_sitter
 
     setup do
@@ -238,6 +238,41 @@ defmodule RetrievalNode.Ingest.GraphIngestTest do
       assert mentioned == ["helper", "other"]
     end
 
+    test "a file with no definition boundaries still indexes (heuristic chunks) and keeps its import",
+         %{source: source} do
+      raw = seed_raw(source, "import os\nX = 1\n", "consts.py")
+
+      assert {:ok, %{action: :indexed}} = FileIngest.apply(raw, [])
+
+      [chunk] = chunks_for(source, "consts.py")
+      assert chunk.parse_status == :heuristic_fallback
+      assert mention_pairs(chunk) == MapSet.new([{"os", :import}])
+    end
+
+    test "a whitespace-only file still yields no chunks", %{source: source} do
+      raw = seed_raw(source, "  \n\n", "blank.py")
+
+      FileIngest.apply(raw, [])
+
+      assert chunks_for(source, "blank.py") == []
+      assert source_mention_count(source) == 0
+    end
+
+    test "two definitions on one line attach to their own chunks by byte position", %{
+      source: source
+    } do
+      raw =
+        seed_raw(source, "function a() {} function b() { target(); }\n", "ab.js", "javascript")
+
+      assert {:ok, %{action: :indexed}} = FileIngest.apply(raw, [])
+
+      [chunk_a, chunk_b] =
+        source |> chunks_for("ab.js") |> Enum.sort_by(& &1.context_breadcrumb)
+
+      assert mention_pairs(chunk_a) == MapSet.new([{"a", :definition}])
+      assert mention_pairs(chunk_b) == MapSet.new([{"b", :definition}, {"target", :call}])
+    end
+
     test "deleting the file removes its mentions via chunk cascade", %{source: source} do
       {:ok, _} = FileIngest.apply(seed_raw(source, @v1, "app.py"), [])
       assert source_mention_count(source) > 0
@@ -249,18 +284,16 @@ defmodule RetrievalNode.Ingest.GraphIngestTest do
   end
 
   describe "SourceOwner graph GC (NIF-free line impl)" do
-    setup do
+    setup %{source: source} do
       use_impl(LineGraphImpl)
-      on_exit(fn -> SourceOwner.stop(Process.get(:owner_source_id)) end)
+      # on_exit runs in a separate process: capture the id, don't read the pdict.
+      on_exit(fn -> SourceOwner.stop(source.id) end)
       :ok
     end
-
-    defp track(source), do: Process.put(:owner_source_id, source.id)
 
     test "gc/1 reaps orphans for that source only", %{source: source} do
       other = source_fixture("acme/other")
       for s <- [source, other], do: Repo.insert!(entity(s, "orphan"))
-      track(source)
       on_exit(fn -> SourceOwner.stop(other.id) end)
 
       assert {:ok, 1} = SourceOwner.gc(source.id)
@@ -269,7 +302,6 @@ defmodule RetrievalNode.Ingest.GraphIngestTest do
     end
 
     test "a pass that deletes a file reaps the entities it stranded", %{source: source} do
-      track(source)
       seed_raw(source, "def gone():\n  1\n", "gone.py")
       assert {:ok, _} = SourceOwner.drain(source.id)
       assert source_entity_names(source) == ["gone"]
@@ -282,7 +314,6 @@ defmodule RetrievalNode.Ingest.GraphIngestTest do
     test "concurrent gc/1 calls never reap entities that ingest is attaching mentions to", %{
       source: source
     } do
-      track(source)
       files = for n <- 1..12, do: "f#{n}.py"
 
       gc_tasks =

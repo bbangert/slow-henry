@@ -348,7 +348,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
           name: callee,
           kind: :call,
           from: state.enclosing_qname,
-          line: line(TS.node_child_by_field_name(child, "right"))
+          line: line(TS.node_child_by_field_name(child, "right")),
+          byte: TS.node_start_byte(TS.node_child_by_field_name(child, "right"))
         })
 
       true ->
@@ -847,7 +848,13 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         _ ->
           qname = Enum.join(state.scope ++ [name], ".")
           entity_kind = entity_kind_for(category, state.container_kind)
-          entity = %{qualified_name: qname, kind: entity_kind, line: line(child)}
+
+          entity = %{
+            qualified_name: qname,
+            kind: entity_kind,
+            line: line(child),
+            byte: TS.node_start_byte(child)
+          }
 
           receiver =
             if receiver_owner?(category, state.self_target),
@@ -1451,7 +1458,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
           name: name,
           kind: :call,
           from: state.enclosing_qname,
-          line: line(call_node)
+          line: line(call_node),
+          byte: TS.node_start_byte(call_node)
         }),
       else: acc
   end
@@ -1471,7 +1479,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
           name: name,
           kind: :import,
           from: state.enclosing_qname,
-          line: line(call_node)
+          line: line(call_node),
+          byte: TS.node_start_byte(call_node)
         }),
       else: acc
   end
@@ -1504,7 +1513,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
               name: import_name,
               kind: :import,
               from: state.enclosing_qname,
-              line: line(child)
+              line: line(child),
+              byte: TS.node_start_byte(child)
             })
 
           :not_import ->
@@ -1512,7 +1522,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
               name: scoped_callee_name(name, self_receiver?, state.receiver),
               kind: :call,
               from: state.enclosing_qname,
-              line: line(child)
+              line: line(child),
+              byte: TS.node_start_byte(child)
             })
         end
     end
@@ -1737,12 +1748,18 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp handle_import(child, source, language, state, acc) do
     child
     |> import_refs(source, language)
-    |> Enum.reduce_while(acc, fn {name, ln}, acc ->
+    |> Enum.reduce_while(acc, fn {name, {ln, byte}}, acc ->
       if at_cap?(acc) do
         {:halt, acc}
       else
         {:cont,
-         add_reference(acc, %{name: name, kind: :import, from: state.enclosing_qname, line: ln})}
+         add_reference(acc, %{
+           name: name,
+           kind: :import,
+           from: state.enclosing_qname,
+           line: ln,
+           byte: byte
+         })}
       end
     end)
   end
@@ -1761,7 +1778,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
             []
 
           mod_node ->
-            ln = line(mod_node)
+            ln = pos(mod_node)
             module_ref = {slice(source, mod_node), ln}
 
             # `import_from_statement` repeats the "name:" field once per
@@ -1791,7 +1808,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         []
 
       src_node ->
-        ln = line(node)
+        ln = pos(node)
         # The source is a string literal: decoded like any js/ts string value,
         # and omitted when it doesn't decode to a usable import path.
         module_refs =
@@ -1813,7 +1830,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     |> Enum.map(fn spec ->
       case TS.node_child_by_field_name(spec, "path") do
         nil -> nil
-        path_node -> {strip_quotes(slice(source, path_node)), line(spec)}
+        path_node -> {strip_quotes(slice(source, path_node)), pos(spec)}
       end
     end)
     |> Enum.reject(&is_nil/1)
@@ -1851,7 +1868,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         []
 
       arg_node ->
-        ln = line(node)
+        ln = pos(node)
         arg_node |> rust_use_paths(nil, source) |> Enum.map(&{&1, ln})
     end
   end
@@ -1863,8 +1880,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       |> Enum.find(&(TS.node_kind(&1) in ["scoped_identifier", "identifier"]))
 
     case name_node do
-      nil -> [{slice(source, node), line(node)}]
-      n -> [{slice(source, n), line(n)}]
+      nil -> [{slice(source, node), pos(node)}]
+      n -> [{slice(source, n), pos(n)}]
     end
   end
 
@@ -1992,7 +2009,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
-  defp python_import_name(n, source), do: {python_import_symbol(n, source), line(n)}
+  defp python_import_name(n, source), do: {python_import_symbol(n, source), pos(n)}
 
   # Aliased imports resolve to the ORIGINAL name (the `name:` field of
   # `aliased_import`), never the alias — consistent for both plain
@@ -2309,6 +2326,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp line(node), do: TS.node_start_position(node).row + 1
+
+  # {line, start_byte} of a node: import refs travel as `{name, pos}` tuples.
+  defp pos(node), do: {line(node), TS.node_start_byte(node)}
 
   defp slice(source, node) do
     start_byte = TS.node_start_byte(node)

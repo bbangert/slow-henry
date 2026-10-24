@@ -163,6 +163,9 @@ defmodule RetrievalNode.Ingest.FileIngest do
 
   defp chunk_and_index(row, content, opts, on_parse_crash) do
     case Chunking.chunk_with_graph(content, row.lang || "") do
+      {:ok, %{chunks: [], entities: entities, references: references}} ->
+        chunk_boundaryless(row, content, opts, entities, references)
+
       {:ok, %{chunks: chunks, entities: entities, references: references}} ->
         finalize(row, chunks, "ok", opts, entities, references)
 
@@ -178,6 +181,20 @@ defmodule RetrievalNode.Ingest.FileIngest do
         else
           {:error, err}
         end
+    end
+  end
+
+  # A parse with no definition boundaries (e.g. an import-only python file)
+  # yields zero chunks. Non-blank content is still indexed via the heuristic
+  # chunker — so its text is searchable and its graph has chunks to attach to —
+  # and is marked "heuristic_fallback" because those chunks are not AST-derived.
+  # Whitespace-only content keeps producing no chunks.
+  defp chunk_boundaryless(row, content, opts, entities, references) do
+    if String.trim(content) == "" do
+      finalize(row, [], "ok", opts, entities, references)
+    else
+      {:ok, chunks} = HeuristicImpl.chunk(content, row.lang || "")
+      finalize(row, chunks, "heuristic_fallback", opts, entities, references)
     end
   end
 
@@ -258,14 +275,16 @@ defmodule RetrievalNode.Ingest.FileIngest do
 
   defp file_prefix(row), do: Map.get(row.metadata || %{}, "path") || row.natural_key
 
-  # Assigns each entity/reference to the chunk whose start_line..end_line
-  # contains its line; items matching no chunk (typically a top-level import
-  # sitting between two defs) attach to the FIRST chunk of the file rather
-  # than being dropped — imports are file-level signal and losing them would
-  # gut the imports leg of the graph. Chunks with no graph items get `nil`.
+  # Assigns each entity/reference to the chunk containing it: by byte range when
+  # both the item and the chunk carry byte positions (disambiguates several
+  # definitions on one line), else by start_line..end_line; items matching no
+  # chunk (typically a top-level import sitting between two defs) attach to the
+  # FIRST chunk of the file rather than being dropped — imports are file-level
+  # signal and losing them would gut the imports leg of the graph. Chunks with
+  # no graph items get `nil`.
   defp attach_graphs(chunks, entities, references) do
-    entities_by_chunk = Enum.group_by(entities, &chunk_index_for(&1.line, chunks))
-    references_by_chunk = Enum.group_by(references, &chunk_index_for(&1.line, chunks))
+    entities_by_chunk = Enum.group_by(entities, &chunk_index_for(&1, chunks))
+    references_by_chunk = Enum.group_by(references, &chunk_index_for(&1, chunks))
 
     chunks
     |> Enum.with_index()
@@ -277,12 +296,17 @@ defmodule RetrievalNode.Ingest.FileIngest do
   defp graph_attrs([], []), do: nil
   defp graph_attrs(entities, references), do: %{entities: entities, references: references}
 
-  defp chunk_index_for(line, chunks) do
-    case Enum.find_index(chunks, &(line >= &1.start_line and line <= &1.end_line)) do
+  defp chunk_index_for(item, chunks) do
+    case Enum.find_index(chunks, &contains?(&1, item)) do
       nil -> 0
       index -> index
     end
   end
+
+  defp contains?(%{start_byte: sb, end_byte: eb}, %{byte: byte}),
+    do: byte >= sb and byte < eb
+
+  defp contains?(chunk, %{line: line}), do: line >= chunk.start_line and line <= chunk.end_line
 
   # Called only from inside a terminal `Repo.transaction` (`write/7`,
   # `reconcile_and_reap/3`), so the append-only audit rows commit exactly when
