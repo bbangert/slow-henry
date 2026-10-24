@@ -66,7 +66,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     * Elixir: module aliases are one dotted token (`Foo.Bar`), nested modules
       join their enclosing scope like any definition. Aliases are canonical
       wherever they name something (modules, protocols, `defimpl` targets,
-      imports): `Elixir.Foo` is the absolute `Foo`, rooted like Ruby `::A`. A function is named by
+      imports): `Elixir.Foo` is the absolute `Foo`, rooted like Ruby `::A`.
+      `defdelegate` defines a function like `def`. Keyword options are read
+      the same bare (`k: v`) or as a literal list (`[k: v]`), for bodies
+      (`do:`) and `defimpl`'s `for:` alike. A function is named by
       its head's identifier (also under a `when` guard). A module or function
       name that is not static (`def unquote(name)()`, `defmodule unquote(m)`,
       operator heads, quoted atoms) makes the definition anonymous. `defimpl P,
@@ -91,6 +94,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       `when` guards) parses as calls but is not a call site, so only the body
       (`do` block or `do:` value) and default values (the right side of
       `arg \\\\ default`, evaluated when the function is called) are walked.
+      A module-like definition walks only its body (`do` block or `do:`),
+      never its header, so a `defimpl` with N targets costs N bodies.
 
   ### Receiver binding
 
@@ -281,7 +286,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # defmodule/defprotocol/defimpl are :module_like; the def-family is
   # :function_like (a function directly inside a module is a :function).
   @elixir_module_forms ~w(defmodule defprotocol defimpl)
-  @elixir_function_forms ~w(def defp defmacro defmacrop defguard defguardp)
+  @elixir_function_forms ~w(def defp defmacro defmacrop defguard defguardp defdelegate)
   @elixir_def_forms @elixir_module_forms ++ @elixir_function_forms
   @elixir_import_forms ~w(alias import use require)
 
@@ -1085,15 +1090,15 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     # function is called without that argument, so they belong to it.
     acc = walk_nodes(elixir_default_values(node, source), source, "elixir", lang_ctx, inner, acc)
 
-    node
-    |> named_children()
-    |> Enum.filter(&(TS.node_kind(&1) in ["do_block", "arguments"]))
-    |> Enum.reduce_while(acc, fn child, acc ->
-      if at_cap?(acc),
-        do: {:halt, acc},
-        else: {:cont, walk_elixir_def_body_node(child, source, lang_ctx, inner, acc)}
-    end)
+    walk_nodes(elixir_body_nodes(node, :all, source), source, "elixir", lang_ctx, inner, acc)
   end
+
+  # An elixir module's header (`defmodule A`, `defimpl P, for: [T1, T2]`) holds
+  # no dependencies, and a defimpl walks once per target: only the body is
+  # walked, so N targets cost N bodies, never N headers.
+  defp walk_definition(node, :module_like, "elixir", source, lang_ctx, _outer, inner, acc),
+    do:
+      walk_nodes(elixir_body_nodes(node, ["do"], source), source, "elixir", lang_ctx, inner, acc)
 
   # Walks the whole definition node: these grammars give the parameter list its
   # own dedicated node kind, so there's no ambiguity to worry about.
@@ -1121,18 +1126,42 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
-  defp walk_elixir_def_body_node(node, source, lang_ctx, state, acc) do
-    case TS.node_kind(node) do
-      "do_block" ->
-        walk(node, source, "elixir", lang_ctx, state, acc)
+  # A definition's body: its `do_block`, plus the values of its keyword-form
+  # body pairs (`do: expr`, also `rescue:`, ... for functions) -- all of them
+  # for `:all`, else only the listed keys.
+  defp elixir_body_nodes(call_node, keys, source) do
+    blocks = call_node |> named_children() |> Enum.filter(&(TS.node_kind(&1) == "do_block"))
 
-      "arguments" ->
-        node
-        |> named_children()
-        |> Enum.filter(&(TS.node_kind(&1) == "keywords"))
-        |> Enum.flat_map(&named_children/1)
-        |> Enum.flat_map(&List.wrap(TS.node_child_by_field_name(&1, "value")))
-        |> walk_nodes(source, "elixir", lang_ctx, state, acc)
+    values =
+      for pair <- elixir_keyword_pairs(call_node),
+          keys == :all or elixir_pair_key(pair, source) in keys,
+          value = TS.node_child_by_field_name(pair, "value"),
+          not is_nil(value),
+          do: value
+
+    blocks ++ values
+  end
+
+  # Keyword options of a call: bare (`f x, k: v`) or a literal list
+  # (`f x, [k: v]`), which Elixir treats identically.
+  defp elixir_keyword_pairs(call_node) do
+    call_node
+    |> elixir_arguments()
+    |> Enum.flat_map(fn arg ->
+      case TS.node_kind(arg) do
+        "keywords" -> [arg]
+        "list" -> arg |> named_children() |> Enum.filter(&(TS.node_kind(&1) == "keywords"))
+        _ -> []
+      end
+    end)
+    |> Enum.flat_map(&named_children/1)
+    |> Enum.filter(&(TS.node_kind(&1) == "pair"))
+  end
+
+  defp elixir_pair_key(pair, source) do
+    case TS.node_child_by_field_name(pair, "key") do
+      nil -> nil
+      key -> key |> then(&slice(source, &1)) |> String.trim() |> String.trim_trailing(":")
     end
   end
 
@@ -1325,11 +1354,11 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp elixir_defimpl_names(call_node, state, source) do
-    with [_ | _] = args <- elixir_arguments(call_node),
+    with [_ | _] <- elixir_arguments(call_node),
          protocol when not is_nil(protocol) <-
            elixir_definition_name(call_node, :module_like, source) do
       types =
-        case elixir_defimpl_for_value(args, source) do
+        case elixir_defimpl_for_value(call_node, source) do
           nil -> List.wrap(state.receiver)
           value -> elixir_defimpl_types(value, state, source)
         end
@@ -1340,17 +1369,11 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
-  defp elixir_defimpl_for_value(args, source) do
-    args
-    |> Enum.filter(&(TS.node_kind(&1) == "keywords"))
-    |> Enum.flat_map(&named_children/1)
+  defp elixir_defimpl_for_value(call_node, source) do
+    call_node
+    |> elixir_keyword_pairs()
     |> Enum.find_value(fn pair ->
-      with key when not is_nil(key) <- TS.node_child_by_field_name(pair, "key"),
-           true <- String.starts_with?(slice(source, key), "for:") do
-        TS.node_child_by_field_name(pair, "value")
-      else
-        _ -> nil
-      end
+      if elixir_pair_key(pair, source) == "for", do: TS.node_child_by_field_name(pair, "value")
     end)
   end
 

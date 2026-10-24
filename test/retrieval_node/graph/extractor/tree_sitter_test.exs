@@ -1174,6 +1174,44 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
                [{"helper", 4}, {"other", 5}]
     end
 
+    test "defdelegate defines a function, not calls" do
+      src = "defmodule M do\n  defdelegate run(x), to: Impl\nend\n"
+      %{entities: e, references: r} = extract(src, "elixir")
+      assert %{kind: :function} = find(e, "M.run")
+      assert for(%{kind: :call} = ref <- r, do: ref.name) == []
+    end
+
+    test "bracketed keyword options are read like bare ones" do
+      src = ~S"""
+      defmodule Outer do
+        def f(x), [do: helper(x)]
+        defimpl P, [for: T] do
+          def p(_), do: 1
+        end
+      end
+
+      defimpl Q, [for: U] do
+      end
+      """
+
+      %{entities: e, references: r} = extract(src, "elixir")
+      assert {"helper", "Outer.f"} in for(%{kind: :call, name: n, from: f} <- r, do: {n, f})
+      assert find(e, "P.T") && find(e, "P.T.p") && find(e, "Q.U")
+      refute find(e, "P.Outer")
+    end
+
+    test "a defimpl walks its body once per target, never its header" do
+      n = 2_000
+      targets = Enum.map_join(1..n, ", ", &"T#{&1}")
+      src = "defimpl P, for: [#{targets}] do\nend\n"
+
+      {micros, %{entities: e}} = :timer.tc(fn -> extract(src, "elixir") end)
+      assert length(e) == n
+      # Linear in targets; re-walking the header per target was quadratic
+      # (~4M node visits here, many seconds).
+      assert micros < 3_000_000, "took #{div(micros, 1000)}ms"
+    end
+
     test "calls inside import forms are still collected" do
       src = ~S"""
       defmodule M do
