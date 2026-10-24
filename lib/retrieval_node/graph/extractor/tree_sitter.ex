@@ -280,12 +280,13 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp anonymous_function?(_language, _kind), do: false
 
-  # `new T() { ... }`: the body has no graph identity, so `this` inside it must
-  # not resolve to the enclosing class.
+  # `new T() { ... }` and enum constant bodies (`PLUS { ... }`): the body has
+  # no graph identity, so `this` inside it must not resolve to the enclosing
+  # class.
   defp java_anonymous_class_body?("java", "class_body", node) do
     case TS.node_parent(node) do
       nil -> false
-      parent -> TS.node_kind(parent) == "object_creation_expression"
+      parent -> TS.node_kind(parent) in ["object_creation_expression", "enum_constant"]
     end
   end
 
@@ -518,6 +519,23 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
+  # A `def` nested in another method defines a method on the containing class,
+  # not on the enclosing method.
+  defp handle_definition(
+         child,
+         "method" = kind,
+         source,
+         "ruby" = language,
+         lang_ctx,
+         %{container_kind: :function_like, class_qname: class_qname} = state,
+         acc
+       )
+       when is_binary(class_qname) do
+    name = name_field(child, language, kind, source)
+    state = %{state | scope: String.split(class_qname, ".")}
+    handle_definition_category(child, :method_like, name, source, language, lang_ctx, state, acc)
+  end
+
   defp handle_definition(child, kind, source, language, lang_ctx, state, acc) do
     category = Map.fetch!(lang_ctx.def_kinds, kind)
     name = name_field(child, language, kind, source)
@@ -656,17 +674,22 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         self_name: nil
       }
 
-      if python_rebinds_self?(child, source, language, state),
-        do: walk_python_self_def(child, source, language, lang_ctx, state, new_state, acc),
+      if language == "python",
+        do: walk_python_def(child, source, language, lang_ctx, state, new_state, acc),
         else: walk_definition_body(child, category, language, source, lang_ctx, new_state, acc)
     end
   end
 
-  # Like `walk_python_lambda/6`: a nested def binding its own `self` shadows the
-  # receiver in its body only; parameter defaults and the return annotation are
-  # evaluated in the enclosing scope (outer receiver and `from`).
-  defp walk_python_self_def(node, source, language, lang_ctx, outer_state, inner_state, acc) do
-    outer = Enum.map(~w(parameters return_type), &TS.node_child_by_field_name(node, &1))
+  # Python evaluates a definition's header (parameter defaults, annotations,
+  # class bases) in the ENCLOSING scope (outer receiver and `from`); only the
+  # body sees the new scope (and a rebound `self`, per the inner state).
+  defp walk_python_def(node, source, language, lang_ctx, outer_state, inner_state, acc) do
+    header_fields =
+      if TS.node_kind(node) == "class_definition",
+        do: ["superclasses"],
+        else: ["parameters", "return_type"]
+
+    outer = Enum.map(header_fields, &TS.node_child_by_field_name(node, &1))
     acc = walk_nodes(Enum.reject(outer, &is_nil/1), source, language, lang_ctx, outer_state, acc)
     body = TS.node_child_by_field_name(node, "body")
     walk_nodes(List.wrap(body), source, language, lang_ctx, inner_state, acc)
@@ -763,13 +786,13 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp scoped_callee_name(name, _self_receiver?, _class_qname), do: name
 
   defp callee_name(call_node, source, "python") do
-    with fn_node when not is_nil(fn_node) <- TS.node_child_by_field_name(call_node, "function") do
+    with fn_node when not is_nil(fn_node) <- callee_node(call_node) do
       qualified_or_bare(fn_node, source, "attribute", "object", "attribute", &python_self?/2)
     end
   end
 
   defp callee_name(call_node, source, lang) when lang in ["javascript", "typescript"] do
-    with fn_node when not is_nil(fn_node) <- TS.node_child_by_field_name(call_node, "function") do
+    with fn_node when not is_nil(fn_node) <- callee_node(call_node) do
       qualified_or_bare(fn_node, source, "member_expression", "object", "property", &this_node?/2)
     end
   end
@@ -785,7 +808,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp callee_name(call_node, source, "rust") do
-    with fn_node when not is_nil(fn_node) <- TS.node_child_by_field_name(call_node, "function"),
+    with fn_node when not is_nil(fn_node) <- callee_node(call_node),
          fn_node <- rust_unwrap_generic_callee(fn_node) do
       if TS.node_kind(fn_node) == "field_expression" do
         rust_field_expression_callee(fn_node, source)
@@ -821,12 +844,29 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp callee_name(_call_node, _source, _language), do: nil
 
+  # `(helper)()` / `(this.helper)()`: grouping parentheses don't change the callee.
+  defp callee_node(call_node) do
+    case TS.node_child_by_field_name(call_node, "function") do
+      nil -> nil
+      fn_node -> unwrap_parenthesized(fn_node)
+    end
+  end
+
+  defp unwrap_parenthesized(node) do
+    with "parenthesized_expression" <- TS.node_kind(node),
+         [inner | _] <- Enum.reject(named_children(node), &(TS.node_kind(&1) =~ "comment")) do
+      unwrap_parenthesized(inner)
+    else
+      _ -> node
+    end
+  end
+
   # `parse::<u32>()` / `self.helper::<u32>()`: the callee is a
   # `generic_function` wrapping the real callee in its "function" field.
   defp rust_unwrap_generic_callee(fn_node) do
     with "generic_function" <- TS.node_kind(fn_node),
          inner when not is_nil(inner) <- TS.node_child_by_field_name(fn_node, "function") do
-      rust_unwrap_generic_callee(inner)
+      inner |> unwrap_parenthesized() |> rust_unwrap_generic_callee()
     else
       _ -> fn_node
     end

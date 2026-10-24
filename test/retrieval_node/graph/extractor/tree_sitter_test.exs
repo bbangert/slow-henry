@@ -979,6 +979,63 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
     end
   end
 
+  describe "review regressions, round 5" do
+    defp call_names(src, lang) do
+      %{references: r} = extract(src, lang)
+      for %{kind: :call} = c <- r, do: {c.name, c.from}
+    end
+
+    test "java: enum constant body is an anonymous receiver boundary" do
+      src =
+        "enum Op { PLUS { int apply() { return this.helper(); } int helper() { return 1; } }; int helper() { return 0; } }"
+
+      assert {"helper", _} = List.keyfind(call_names(src, "java"), "helper", 0)
+    end
+
+    test "ruby: nested def defines a method on the containing class" do
+      src = "class C; def install; def helper; end; end; def run; self.helper(); end; end"
+      %{entities: e} = extract(src, "ruby")
+      assert %{kind: :method} = find(e, "C.helper")
+      refute find(e, "C.install.helper")
+      assert {"C.helper", "C.run"} in call_names(src, "ruby")
+    end
+
+    test "python: class bases and defaults evaluate in the enclosing scope" do
+      src = """
+      class Factory:
+          def build(self):
+              class Product(self.base()):
+                  pass
+
+              def inner(value=self.base()):
+                  pass
+      """
+
+      assert call_names(src, "python") == [
+               {"Factory.base", "Factory.build"},
+               {"Factory.base", "Factory.build"}
+             ]
+    end
+
+    test "rust: parenthesized callees are unwrapped" do
+      assert call_names("fn main() { (helper)(); }", "rust") == [{"helper", "main"}]
+      assert [{"helper", "main"}] = call_names("fn main() { (module::helper)(); }", "rust")
+    end
+
+    test "python/js/ts: parenthesized callees are unwrapped" do
+      assert [{"helper", "f"}] = call_names("def f():\n    (helper)()\n", "python")
+
+      py = "class K:\n    def m(self):\n        (self.helper)()\n"
+      assert call_names(py, "python") == [{"K.helper", "K.m"}]
+
+      for lang <- ["javascript", "typescript"] do
+        assert [{"helper", "f"}] = call_names("function f() { (helper)(); }", lang)
+        src = "class C { m() { (this.helper)(); } }"
+        assert call_names(src, lang) == [{"C.helper", "C.m"}]
+      end
+    end
+  end
+
   defp find(entities, qualified_name),
     do: Enum.find(entities, &(&1.qualified_name == qualified_name))
 end
