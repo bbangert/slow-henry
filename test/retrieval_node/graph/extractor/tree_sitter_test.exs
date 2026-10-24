@@ -1338,6 +1338,15 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       end
     end
 
+    test "js/ts: a line continuation between surrogate escapes still pairs them" do
+      for lang <- ["javascript", "typescript"] do
+        # `\uD835\` + newline + `\uDC9C` is the single identifier character U+1D49C.
+        src = "class C { \"\\uD835\\\n\\uDC9C\"() {} \"\\uD835x\\uDC9C\"() {} }"
+        %{entities: e} = extract(src, lang)
+        assert e |> Enum.map(& &1.qualified_name) |> Enum.sort() == ["C", "C.\u{1D49C}"]
+      end
+    end
+
     test "javascript: legacy octal escapes decode with ECMAScript digit limits" do
       src = ~S"""
       const o = { "f\157o"() {}, "\101b"() {}, "a\477b"() {}, "\8x"() {} };

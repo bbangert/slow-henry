@@ -1662,7 +1662,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end)
     |> case do
       :error -> nil
-      parts -> parts |> Enum.reverse() |> join_js_parts([])
+      # Line continuations decode to ""; drop them so a surrogate pair split
+      # by one (`\\uD835\\<newline>\\uDC9C`) still pairs.
+      parts -> parts |> Enum.reverse() |> Enum.reject(&(&1 == "")) |> join_js_parts([])
     end
   end
 
