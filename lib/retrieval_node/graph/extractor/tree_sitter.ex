@@ -80,7 +80,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       "function_declaration" => :function_like,
       "generator_function_declaration" => :function_like,
       "method_definition" => :function_like,
-      "class_declaration" => :class_like
+      "function_expression" => :function_like,
+      "generator_function" => :function_like,
+      "class_declaration" => :class_like,
+      "class" => :class_like
     },
     "typescript" => %{
       "function_declaration" => :function_like,
@@ -100,7 +103,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       # until that container is tracked too; deliberately out of scope here.
       "method_signature" => :function_like,
       "abstract_method_signature" => :function_like,
+      "function_expression" => :function_like,
+      "generator_function" => :function_like,
       "class_declaration" => :class_like,
+      "class" => :class_like,
       "interface_declaration" => :class_like,
       "type_alias_declaration" => :class_like,
       "enum_declaration" => :class_like
@@ -215,6 +221,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       this_rebinding?(language, kind) ->
         walk(child, source, language, lang_ctx, %{state | class_qname: nil}, acc)
 
+      java_anonymous_class_body?(language, kind, child) ->
+        state = %{state | container_kind: :class_like, class_qname: nil}
+        walk(child, source, language, lang_ctx, state, acc)
+
       true ->
         walk(child, source, language, lang_ctx, state, acc)
     end
@@ -228,12 +238,25 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp this_rebinding?(_language, _kind), do: false
 
-  # Anonymous functions emit no entity but are function-like containers, so a
-  # nested named function is a :function, not a :method of the enclosing class.
+  # Arrow functions have no name field and emit no entity but are function-like
+  # containers, so a nested named function is a :function, not a :method of the
+  # enclosing class. (Function expressions are definitions: named ones emit an
+  # entity, anonymous ones fall through the nil-name path.)
   defp anonymous_function?(language, kind) when language in ["javascript", "typescript"],
-    do: kind in ~w(arrow_function function_expression generator_function)
+    do: kind == "arrow_function"
 
   defp anonymous_function?(_language, _kind), do: false
+
+  # `new T() { ... }`: the body has no graph identity, so `this` inside it must
+  # not resolve to the enclosing class.
+  defp java_anonymous_class_body?("java", "class_body", node) do
+    case TS.node_parent(node) do
+      nil -> false
+      parent -> TS.node_kind(parent) == "object_creation_expression"
+    end
+  end
+
+  defp java_anonymous_class_body?(_language, _kind, _node), do: false
 
   # An object-literal method binds `this` to the object, not the class.
   defp object_literal_method?(node) do
@@ -362,7 +385,14 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
          acc
        ) do
     category = Map.fetch!(lang_ctx.def_kinds, kind)
-    type_name = name_field(child, language, kind, source)
+
+    {scope, type_name} =
+      case name_field(child, language, kind, source) do
+        nil -> {state.scope, nil}
+        raw -> rust_resolve_path(raw, state.scope)
+      end
+
+    state = %{state | scope: scope}
 
     name =
       case type_name && TS.node_child_by_field_name(child, "trait") do
@@ -382,11 +412,48 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
   end
 
+  # `class A::B` / `module A::B` name a `scope_resolution`; normalize to the
+  # dotted form nested declarations use. A leading `::` is rooted: it ignores
+  # the lexical scope.
+  defp handle_definition(child, kind, source, "ruby" = language, lang_ctx, state, acc)
+       when kind in ["class", "module"] do
+    category = Map.fetch!(lang_ctx.def_kinds, kind)
+    raw = name_field(child, language, kind, source)
+
+    {state, name} =
+      case raw do
+        "::" <> rooted -> {%{state | scope: []}, ruby_dotted(rooted)}
+        nil -> {state, nil}
+        _ -> {state, ruby_dotted(raw)}
+      end
+
+    handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
+  end
+
   defp handle_definition(child, kind, source, language, lang_ctx, state, acc) do
     category = Map.fetch!(lang_ctx.def_kinds, kind)
     name = name_field(child, language, kind, source)
     handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
   end
+
+  # Resolves a rooted impl path against the enclosing module scope. Assumes
+  # `scope` holds module names only at the point an impl is declared:
+  # `crate::` restarts at the crate root, `self::` stays in the current module,
+  # each `super::` pops one module. Any other path is relative to the scope.
+  defp rust_resolve_path(dotted, scope) do
+    {scope, segs} =
+      case String.split(dotted, ".") do
+        ["crate" | rest] -> {[], rest}
+        ["self" | rest] -> {scope, rest}
+        ["super" | _] = segs -> rust_pop_supers(segs, scope)
+        segs -> {scope, segs}
+      end
+
+    {scope, Enum.join(segs, ".")}
+  end
+
+  defp rust_pop_supers(["super" | rest], scope), do: rust_pop_supers(rest, Enum.drop(scope, -1))
+  defp rust_pop_supers(segs, scope), do: {scope, segs}
 
   # Resolves a rust `impl_item`'s "trait:" field to the trait's own bare
   # name -- the rightmost type identifier, regardless of how the trait path
@@ -493,7 +560,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         container_kind: category,
         enclosing_qname: new_enclosing_qname,
         class_qname:
-          if(this_rebinding?(language, TS.node_kind(child)) or object_literal_method?(child),
+          if(receiver_boundary?(child, language, category, name),
             do: nil,
             else: new_class_qname
           ),
@@ -502,6 +569,13 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
       walk_definition_body(child, category, language, source, lang_ctx, new_state, acc)
     end
+  end
+
+  # Definitions that bind their own `this`, or (unnamed classes) have no graph
+  # identity to resolve a receiver to.
+  defp receiver_boundary?(node, language, category, name) do
+    this_rebinding?(language, TS.node_kind(node)) or object_literal_method?(node) or
+      (is_nil(name) and category == :class_like)
   end
 
   # Walks the whole definition node: these grammars give the parameter list its
@@ -1049,9 +1123,18 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp name_field(node, _language, _kind, source) do
     case TS.node_child_by_field_name(node, "name") do
       nil -> nil
-      name_node -> slice(source, name_node)
+      name_node -> definition_name_text(name_node, source)
     end
   end
+
+  # js/ts allow string-literal method names (`"helper"() {}`).
+  defp definition_name_text(name_node, source) do
+    if TS.node_kind(name_node) == "string",
+      do: string_content(name_node, source),
+      else: slice(source, name_node)
+  end
+
+  defp ruby_dotted(name), do: name |> String.split("::") |> Enum.map_join(".", &String.trim/1)
 
   # `Foo<T>` -> `Foo`: type arguments are not part of a symbol's identity.
   defp rust_base_type_node(type_node) do

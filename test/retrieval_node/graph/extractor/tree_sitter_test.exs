@@ -748,6 +748,83 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
 
       assert %{kind: :function} = Enum.find(e, &String.ends_with?(&1.qualified_name, "local"))
     end
+
+    test "js: named function expression is an entity; its calls are attributed to it" do
+      %{entities: e, references: r} =
+        extract("const cb = function recur() { recur(); };", "javascript")
+
+      assert %{kind: :function} = find(e, "recur")
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "recur" and &1.from == "recur"))
+    end
+
+    test "js: class expressions are class-like; unnamed ones drop the outer receiver" do
+      src =
+        "class Outer { run() { const I = class Named { helper() {} call() { this.helper(); } }; } }"
+
+      %{entities: e, references: r} = extract(src, "javascript")
+      assert %{kind: :class} = find(e, "Outer.run.Named")
+      assert find(e, "Outer.run.Named.helper")
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "Outer.run.Named.helper"))
+
+      %{references: r} =
+        extract(
+          "class Outer { run() { const I = class { call() { this.x(); } }; } }",
+          "javascript"
+        )
+
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "x"))
+    end
+
+    test "java: anonymous class body is a receiver boundary" do
+      src =
+        "class Outer { void make() { new Object() { void run() { this.helper(); } void helper() {} }; } void helper() {} }"
+
+      %{entities: e, references: r} = extract(src, "java")
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "helper"))
+      refute Enum.any?(r, &(&1.name == "Outer.helper"))
+      assert find(e, "Outer.helper")
+    end
+
+    test "rust: rooted impl paths resolve crate/self/super against the module scope" do
+      src = """
+      mod a { pub struct Foo; }
+      mod b {
+        impl crate::a::Foo { fn run(&self) { self.go(); } }
+        impl self::Bar { fn x(&self) {} }
+        mod c { impl super::Baz { fn y(&self) {} } }
+      }
+      impl m::Foo { fn z(&self) {} }
+      """
+
+      %{entities: e, references: r} = extract(src, "rust")
+      assert find(e, "a.Foo.run")
+      assert find(e, "b.Bar.x")
+      assert find(e, "b.Baz.y")
+      assert find(e, "m.Foo.z")
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "a.Foo.go"))
+    end
+
+    test "js: quoted method names are normalized" do
+      src = ~s|class C { "helper"() {} run() { this.helper(); } }|
+      %{entities: e, references: r} = extract(src, "javascript")
+      assert find(e, "C.helper")
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "C.helper"))
+    end
+
+    test "ruby: scope_resolution names are dotted and share identity with nesting" do
+      src = """
+      module A; class B; def helper; end; end; end
+      class A::B; def run; self.helper; end; end
+      module X; class ::A::B; def other; end; end; end
+      """
+
+      %{entities: e, references: r} = extract(src, "ruby")
+      assert find(e, "A.B.helper")
+      assert find(e, "A.B.run")
+      assert find(e, "A.B.other")
+      refute Enum.any?(e, &String.contains?(&1.qualified_name, "::"))
+      assert Enum.any?(r, &(&1.kind == :call and &1.name == "A.B.helper"))
+    end
   end
 
   describe "oversized symbols" do
