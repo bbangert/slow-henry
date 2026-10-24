@@ -10,43 +10,105 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   Unlike chunking's boundary-only walk (which only descends until it finds a
   chunk-boundary kind, then treats that subtree as opaque chunk text), this is
   a full-tree walk: every named node is visited, including deep inside
-  function bodies, because calls and imports live there. Two pieces of state
-  thread down the walk:
-
-    * `scope` — the list of enclosing NAMED definitions, joined with "." to
-      build `qualified_name`.
-    * `container_kind` — the category (`:function_like` / `:class_like` /
-      `:module_like`) of the nearest enclosing definition, used to decide
-      `:function` vs `:method` (a function-ish node directly inside a
-      class-like container is a method).
-    * `enclosing_qname` — the qualified_name of the nearest NAMED enclosing
-      definition, used as `from` on references. An anonymous definition (no
-      `name` field — e.g. a JS arrow function) does not become an entity and
-      does not update `enclosing_qname`, but it DOES update `container_kind`
-      so a method nested directly inside it is still classified correctly.
-      Because `extract/3` walks exactly one already-parsed file's root node
-      per call, `enclosing_qname` — and therefore every reference's `from` —
-      can only ever name a definition from THIS file, never another file of
-      the same source.
-    * `class_qname` — the qualified_name of the nearest NAMED enclosing
-      class-like/module-like definition (set on entering one, carried
-      unchanged through nested function-likes so a method's inner helper
-      still knows its class). Used to resolve `self.x()`/`this.x()` calls: in
-      python/rust/ruby (`self`) and javascript/typescript/java (`this`), the
-      receiver is statically the enclosing class -- no type inference needed
-      -- so the callee name is scoped to `<class_qname>.<member>` instead of
-      the bare rightmost member. Every other receiver shape keeps the
-      rightmost-member best-effort below; full receiver resolution would
-      require type inference, deliberately out of scope.
+  function bodies, because calls and imports live there. The per-node context
+  threaded down the walk (scope, enclosing definition, receiver, ...) is
+  `RetrievalNode.Graph.Extractor.TreeSitter.WalkState`; its moduledoc defines
+  every field. Because `extract/3` walks exactly one already-parsed file's root
+  node per call, every reference's `from` can only ever name a definition from
+  THIS file.
 
   Defensive cap: at most `@max_items` combined entities+references are
   collected per file; a generated/minified file could otherwise produce
   millions of rows downstream. Collection (and further descent into the
   subtree that would exceed it) stops once the cap is hit.
+
+  ## Extraction rules
+
+  Every change to this module must follow these rules.
+
+  ### Naming
+
+    * A `qualified_name` is the enclosing scope's segments plus the definition's
+      own name, joined with ".". Segments come from AST name fields, not from
+      splitting arbitrary source text.
+    * Language path separators (`::`, Ruby `A::B`, Rust `a::B`) are normalized
+      to ".".
+    * Type arguments are not part of identity: `Foo<T>` is `Foo` (Rust impl
+      types and trait names, Go generic receivers).
+    * Quoted member names are unquoted (`"helper"() {}` is `helper`).
+    * Output names never contain `::`, whitespace, quotes, backticks,
+      parentheses or `..`, and never start or end with ".". Import references
+      are module/path strings and are exempt from the `::`/`..`/dot rules. The
+      test helper asserts all of this on every result.
+    * A JS/TS member is an entity only when its key is statically
+      identifier-like: a plain identifier, a `#private` name (kept with its `#`,
+      matching the `this.#x` callee), or a string literal (also inside `[...]`)
+      whose content matches `[A-Za-z_$][A-Za-z0-9_$]*`. Any other key (`[expr]`,
+      `"a b"`, numbers) makes an anonymous function-like container: no entity,
+      body still walked.
+    * A Rust impl's type identity is its path type: references and pointers
+      unwrap to the pointee, generics to their base. A type without one (tuple,
+      array, slice, fn pointer, ...) makes the trait the container
+      (`impl X for (A, B)` names `X`); an inherent impl on such a type adds no
+      scope segment.
+    * Remaining source-text splitting is confined to nodes whose text is
+      already a path (Ruby `constant`/`scope_resolution`, Rust path types and
+      impl paths, callee fallback), where `::`/`.` are the only separators.
+
+  ### Evaluation scope
+
+  A definition's header is evaluated in the ENCLOSING scope (the outer
+  receiver and `from`); only its body sees the new scope.
+
+    * Python parameter defaults, annotations and class bases.
+    * JS/TS class heritage (`extends <expr>`) and computed member keys, for
+      class members and object-literal methods alike.
+    * Ruby superclass expressions, and the `expr` of `class << expr`.
+
+  ### Receiver binding
+
+  The receiver is what `self`/`this` calls qualify to (`WalkState.receiver`).
+  An unresolved receiver leaves the callee bare; never guess.
+
+    * Python: a method binds its class only if it takes `self`. A class body
+      keeps the outer receiver. A nested def or lambda that takes `self`
+      shadows the outer one.
+    * JS/TS: ordinary functions (declarations, expressions, generators) and
+      object-literal methods rebind `this`, so it is unresolved inside them.
+      Arrow functions inherit it. Anonymous classes are boundaries.
+    * Java: anonymous class bodies (`new T() { ... }`, enum constant bodies)
+      are boundaries.
+    * Rust: `self` calls in `impl Trait for T` target `T`, where the inherent
+      members live, while definitions are scoped `T.Trait`. A rooted impl type
+      path (`crate::`, `self::`, `super::`) resolves against the enclosing
+      MODULE path only, never function or impl names.
+    * Ruby: `def self.x` binds the class. `def A.x` binds `A` (not re-prefixed
+      when already inside `A`). Singleton methods and singleton classes on an
+      unresolvable receiver clear it. A nested `def` defines on the containing
+      class, not on the enclosing method.
+
+  ### Callees
+
+  Only identifier, path and member callees are named, after unwrapping
+  grouping parentheses and Rust generic/turbofish wrappers. Any other callee
+  expression emits no reference, but the calls nested inside it are still
+  collected.
+
+  ### Limits
+
+  The item cap and the symbol-size limit are enforced only in `add_entity/2` and
+  `add_reference/2`, the single emission choke point. The walkers' `at_cap?/1`
+  checks are early exits, never the enforcement.
+
+  ### Change discipline
+
+  A fix states the rule it implements and checks the same construct in every
+  language this module handles.
   """
 
   @behaviour RetrievalNode.Graph.Extractor
 
+  alias RetrievalNode.Graph.Extractor.TreeSitter.WalkState
   alias TreeSitterLanguagePack, as: TS
 
   @max_items 10_000
@@ -172,15 +234,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     import_kinds = Map.get(@import_kinds, language, [])
     lang_ctx = %{def_kinds: def_kinds, call_kind: call_kind, import_kinds: import_kinds}
 
-    state = %{
-      scope: [],
-      mod_scope: [],
-      container_kind: nil,
-      enclosing_qname: nil,
-      class_qname: nil,
-      pending_class: nil,
-      self_name: nil
-    }
+    state = %WalkState{}
 
     acc = %{entities: [], references: [], count: 0}
 
@@ -220,8 +274,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         handle_import(child, source, language, state, acc)
 
       anonymous_function?(language, kind) ->
-        class_qname = if this_rebinding?(language, kind), do: nil, else: state.class_qname
-        state = %{state | container_kind: :function_like, class_qname: class_qname}
+        receiver = if this_rebinding?(language, kind), do: nil, else: state.receiver
+        state = %{state | container_kind: :function_like, receiver: receiver}
         walk(child, source, language, lang_ctx, state, acc)
 
       true ->
@@ -232,7 +286,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp process_scope_child(child, kind, source, language, lang_ctx, state, acc) do
     cond do
       this_rebinding?(language, kind) ->
-        walk(child, source, language, lang_ctx, %{state | class_qname: nil}, acc)
+        walk(child, source, language, lang_ctx, %{state | receiver: nil}, acc)
 
       python_self_lambda?(child, kind, source, language) ->
         walk_python_lambda(child, source, language, lang_ctx, state, acc)
@@ -241,7 +295,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         walk_ruby_singleton_class(child, source, language, lang_ctx, state, acc)
 
       java_anonymous_class_body?(language, kind, child) ->
-        state = %{state | container_kind: :class_like, class_qname: nil}
+        state = %{state | container_kind: :class_like, receiver: nil}
         walk(child, source, language, lang_ctx, state, acc)
 
       true ->
@@ -276,10 +330,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
               do: base,
               else: base ++ segs
 
-          %{state | scope: scope, class_qname: Enum.join(scope, ".")}
+          %{state | scope: scope, receiver: Enum.join(scope, ".")}
 
         _ ->
-          %{state | class_qname: nil}
+          %{state | receiver: nil}
       end
 
     walk_nodes(List.wrap(body), source, language, lang_ctx, inner, acc)
@@ -300,7 +354,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     params = TS.node_child_by_field_name(node, "parameters")
     body = TS.node_child_by_field_name(node, "body")
     acc = walk(params, source, language, lang_ctx, state, acc)
-    walk_nodes(List.wrap(body), source, language, lang_ctx, %{state | class_qname: nil}, acc)
+    walk_nodes(List.wrap(body), source, language, lang_ctx, %{state | receiver: nil}, acc)
   end
 
   # Ordinary js/ts functions bind their own `this`; arrow functions inherit
@@ -468,21 +522,24 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
     state = %{state | scope: scope}
 
-    name =
-      case type_name && TS.node_child_by_field_name(child, "trait") do
-        nil ->
-          type_name
+    trait_name =
+      case TS.node_child_by_field_name(child, "trait") do
+        nil -> nil
+        trait_node -> rust_trait_name(trait_node, source)
+      end
 
-        trait_node ->
-          case rust_trait_name(trait_node, source) do
-            nil -> type_name
-            trait_name -> type_name <> "." <> trait_name
-          end
+    # A type without path identity makes the trait the container; with neither
+    # there is no impl scope segment.
+    name =
+      case {type_name, trait_name} do
+        {nil, trait} -> trait
+        {type, nil} -> type
+        {type, trait} -> type <> "." <> trait
       end
 
     # Trait-qualified scope names the definitions, but `self.x()` resolves to
     # the impl's TYPE, where the inherent members live.
-    state = %{state | self_name: type_name}
+    state = %{state | self_target: type_name}
     handle_definition_category(child, category, name, source, language, lang_ctx, state, acc)
   end
 
@@ -529,7 +586,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
              Enum.reverse(String.split(receiver, "."))
            ),
            do: {state, name},
-           else: {%{state | self_name: receiver}, receiver <> "." <> name}
+           else: {%{state | self_target: receiver}, receiver <> "." <> name}
 
       handle_definition_category(
         child,
@@ -544,7 +601,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     else
       # `def other.run`: `self` inside is an unresolvable object.
       state =
-        if object && TS.node_kind(object) != "self", do: %{state | class_qname: nil}, else: state
+        if object && TS.node_kind(object) != "self", do: %{state | receiver: nil}, else: state
 
       handle_definition_category(
         child,
@@ -567,12 +624,12 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
          source,
          "ruby" = language,
          lang_ctx,
-         %{container_kind: container, class_qname: class_qname} = state,
+         %{container_kind: container, receiver: receiver} = state,
          acc
        )
-       when container in [:function_like, :method_like] and is_binary(class_qname) do
+       when container in [:function_like, :method_like] and is_binary(receiver) do
     name = name_field(child, language, kind, source)
-    state = %{state | scope: String.split(class_qname, ".")}
+    state = %{state | scope: String.split(receiver, ".")}
     handle_definition_category(child, :method_like, name, source, language, lang_ctx, state, acc)
   end
 
@@ -677,45 +734,45 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
-  # Scope/qname/class_qname threading, identical once `category` and `name`
+  # Scope/qname/receiver threading, identical once `category` and `name`
   # are known regardless of how they were derived.
   defp handle_definition_category(child, category, name, source, language, lang_ctx, state, acc) do
-    {new_scope, new_enclosing_qname, new_class_qname, acc} =
+    {new_scope, new_enclosing_qname, new_receiver, acc} =
       case name do
         nil ->
-          {state.scope, state.enclosing_qname, state.class_qname, acc}
+          {state.scope, state.enclosing_qname, state.receiver, acc}
 
         _ ->
           qname = Enum.join(state.scope ++ [name], ".")
           entity_kind = entity_kind_for(category, state.container_kind)
           entity = %{qualified_name: qname, kind: entity_kind, line: line(child)}
 
-          class_qname =
-            if receiver_owner?(category, state.self_name),
-              do: Enum.join(state.scope ++ [state.self_name || name], "."),
-              else: state.class_qname
+          receiver =
+            if receiver_owner?(category, state.self_target),
+              do: Enum.join(state.scope ++ [state.self_target || name], "."),
+              else: state.receiver
 
-          {state.scope ++ [name], qname, class_qname, add_entity(acc, entity)}
+          {state.scope ++ [name], qname, receiver, add_entity(acc, entity)}
       end
 
-    {new_class_qname, pending_class} =
-      python_class_receiver(language, category, state, new_class_qname, child, source)
+    {new_receiver, pending_receiver} =
+      python_class_receiver(language, category, state, new_receiver, child, source)
 
     if at_cap?(acc) do
       acc
     else
-      new_state = %{
+      new_state = %WalkState{
         scope: new_scope,
         mod_scope: next_mod_scope(state.mod_scope, language, category, name),
         container_kind: category,
         enclosing_qname: new_enclosing_qname,
-        class_qname:
+        receiver:
           if(receiver_boundary?(child, source, language, category, name, state),
             do: nil,
-            else: new_class_qname
+            else: new_receiver
           ),
-        pending_class: pending_class,
-        self_name: nil
+        pending_receiver: pending_receiver,
+        self_target: nil
       }
 
       walk_definition(child, category, language, source, lang_ctx, state, new_state, acc)
@@ -753,7 +810,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
             acc
 
           Map.has_key?(lang_ctx.def_kinds, TS.node_kind(member)) ->
-            keys_state = Map.put(inner_state, :keys_done, true)
+            keys_state = %{inner_state | keys_done: true}
             process_child(member, source, language, lang_ctx, keys_state, acc)
 
           true ->
@@ -768,9 +825,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   # Entering a python class does not bind `self`: its direct statements keep the
   # outer receiver and only functions defined directly in the body get the
-  # class (held in `pending_class` meanwhile) as theirs.
-  defp python_class_receiver("python", :class_like, state, class_qname, _node, _source),
-    do: {state.class_qname, class_qname}
+  # class (held in `pending_receiver` meanwhile) as theirs.
+  defp python_class_receiver("python", :class_like, state, receiver, _node, _source),
+    do: {state.receiver, receiver}
 
   defp python_class_receiver(
          "python",
@@ -781,12 +838,12 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
          source
        ) do
     if python_binds_self?(node, source),
-      do: {state.pending_class || state.class_qname, nil},
-      else: {state.class_qname, nil}
+      do: {state.pending_receiver || state.receiver, nil},
+      else: {state.receiver, nil}
   end
 
-  defp python_class_receiver(_language, _category, _state, class_qname, _node, _source),
-    do: {class_qname, nil}
+  defp python_class_receiver(_language, _category, _state, receiver, _node, _source),
+    do: {receiver, nil}
 
   defp python_binds_self?(node, source) do
     case TS.node_child_by_field_name(node, "parameters") do
@@ -810,11 +867,11 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     walk_nodes(List.wrap(body), source, language, lang_ctx, inner_state, acc)
   end
 
-  defp receiver_owner?(category, _self_name) when category in [:class_like, :module_like],
+  defp receiver_owner?(category, _self_target) when category in [:class_like, :module_like],
     do: true
 
-  defp receiver_owner?(:method_like, self_name), do: not is_nil(self_name)
-  defp receiver_owner?(_category, _self_name), do: false
+  defp receiver_owner?(:method_like, self_target), do: not is_nil(self_target)
+  defp receiver_owner?(_category, _self_target), do: false
 
   defp next_mod_scope(mod_scope, "rust", :module_like, name) when is_binary(name),
     do: mod_scope ++ [name]
@@ -855,7 +912,16 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
        do: walk_js_class(node, source, lang, lang_ctx, outer, inner, acc)
 
   # A class member's computed key was already walked in the class's enclosing state.
-  defp walk_definition(node, _category, lang, source, lang_ctx, %{keys_done: true}, inner, acc)
+  defp walk_definition(
+         node,
+         _category,
+         lang,
+         source,
+         lang_ctx,
+         %WalkState{keys_done: true},
+         inner,
+         acc
+       )
        when lang in ["javascript", "typescript"] do
     children = node |> named_children() |> Enum.reject(&computed_key?/1)
     walk_nodes(children, source, lang, lang_ctx, inner, acc)
@@ -908,7 +974,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
           :not_import ->
             add_reference(acc, %{
-              name: scoped_callee_name(name, self_receiver?, state.class_qname),
+              name: scoped_callee_name(name, self_receiver?, state.receiver),
               kind: :call,
               from: state.enclosing_qname,
               line: line(child)
@@ -922,10 +988,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   # lexically the enclosing class. Scoped only when a class-like/module-like
   # ancestor is actually in scope (e.g. a top-level JS `this.x()` has none --
   # falls back to the bare name).
-  defp scoped_callee_name(name, true, class_qname) when is_binary(class_qname),
-    do: class_qname <> "." <> name
+  defp scoped_callee_name(name, true, receiver) when is_binary(receiver),
+    do: receiver <> "." <> name
 
-  defp scoped_callee_name(name, _self_receiver?, _class_qname), do: name
+  defp scoped_callee_name(name, _self_receiver?, _receiver), do: name
 
   defp callee_name(call_node, source, "python") do
     with fn_node when not is_nil(fn_node) <- callee_node(call_node) do
@@ -1457,22 +1523,45 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp name_field(node, "rust", "impl_item", source) do
     case TS.node_child_by_field_name(node, "type") do
       nil -> nil
-      type_node -> source |> slice(rust_base_type_node(type_node)) |> rust_dotted()
+      type_node -> rust_impl_type_name(type_node, source)
     end
   end
 
-  defp name_field(node, _language, _kind, source) do
+  defp name_field(node, language, _kind, source) do
     case TS.node_child_by_field_name(node, "name") do
       nil -> nil
-      name_node -> definition_name_text(name_node, source)
+      name_node -> definition_name_text(name_node, source, language)
     end
   end
 
-  # js/ts allow string-literal method names (`"helper"() {}`).
-  defp definition_name_text(name_node, source) do
-    if TS.node_kind(name_node) == "string",
-      do: string_content(name_node, source),
-      else: slice(source, name_node)
+  # js/ts members are named only by a statically identifier-like key: a plain
+  # identifier, a `#private` name (kept with its `#`, matching the `C.#helper`
+  # callee `this.#helper()` resolves to), or a string literal (also inside
+  # `[...]`) whose content is an identifier. Anything else (`[expr]`, `"a b"`,
+  # numbers) yields nil, i.e. an anonymous function-like container.
+  @js_identifier ~r/\A[A-Za-z_$][A-Za-z0-9_$]*\z/
+  @js_private_identifier ~r/\A#[A-Za-z_$][A-Za-z0-9_$]*\z/
+
+  defp definition_name_text(name_node, source, language)
+       when language in ["javascript", "typescript"] do
+    {text, pattern} =
+      case TS.node_kind(name_node) do
+        "string" -> {string_content(name_node, source), @js_identifier}
+        "computed_property_name" -> {computed_key_string(name_node, source), @js_identifier}
+        "private_property_identifier" -> {slice(source, name_node), @js_private_identifier}
+        _ -> {slice(source, name_node), @js_identifier}
+      end
+
+    if is_binary(text) and text =~ pattern, do: text
+  end
+
+  defp definition_name_text(name_node, source, _language), do: slice(source, name_node)
+
+  defp computed_key_string(node, source) do
+    case named_children(node) do
+      [str] -> if TS.node_kind(str) == "string", do: string_content(str, source)
+      _ -> nil
+    end
   end
 
   defp rust_dotted(path),
@@ -1485,13 +1574,29 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp ruby_dotted(name), do: name |> String.split("::") |> Enum.map_join(".", &String.trim/1)
 
-  # `Foo<T>` -> `Foo`: type arguments are not part of a symbol's identity.
-  defp rust_base_type_node(type_node) do
-    with "generic_type" <- TS.node_kind(type_node),
-         inner when not is_nil(inner) <- TS.node_child_by_field_name(type_node, "type") do
-      inner
-    else
-      _ -> type_node
+  # A Rust impl's type identity is its PATH type: references and pointers are
+  # unwrapped to the pointee, generics to their base type. A type with no path
+  # identity (tuple, array, slice, fn pointer, `dyn`, ...) yields nil.
+  defp rust_impl_type_name(type_node, source) do
+    case rust_path_type_node(type_node) do
+      nil -> nil
+      node -> source |> slice(node) |> rust_dotted()
+    end
+  end
+
+  defp rust_path_type_node(node) do
+    case TS.node_kind(node) do
+      kind when kind in ["generic_type", "reference_type", "pointer_type"] ->
+        case TS.node_child_by_field_name(node, "type") do
+          nil -> nil
+          inner -> rust_path_type_node(inner)
+        end
+
+      kind when kind in ["type_identifier", "scoped_type_identifier", "primitive_type"] ->
+        node
+
+      _ ->
+        nil
     end
   end
 

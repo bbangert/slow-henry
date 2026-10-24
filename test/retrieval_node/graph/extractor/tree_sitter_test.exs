@@ -18,7 +18,70 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
   defp extract(source, language) do
     root = parse(source, language)
     {:ok, result} = GraphTS.extract({root, source}, language, [])
+    assert_invariants!(result)
     result
+  end
+
+  @max_items 10_000
+  @symbol_forbidden [
+    {"`::`", "::"},
+    {"a double quote", "\""},
+    {"a single quote", "'"},
+    {"a backtick", "`"},
+    {"`(`", "("},
+    {"`)`", ")"},
+    {"`..`", ".."}
+  ]
+  @import_forbidden [
+    {"a double quote", "\""},
+    {"a single quote", "'"},
+    {"a backtick", "`"},
+    {"`(`", "("},
+    {"`)`", ")"}
+  ]
+
+  # Invariants every extraction result must satisfy, whatever the source.
+  defp assert_invariants!(%{entities: entities, references: references}) do
+    total = length(entities) + length(references)
+    assert total <= @max_items, "cap: #{total} entities+references exceeds #{@max_items}"
+
+    for %{qualified_name: name} = entity <- entities do
+      assert_symbol!(name, "entity #{inspect(entity)} qualified_name", @symbol_forbidden, true)
+    end
+
+    qnames = MapSet.new(entities, & &1.qualified_name)
+
+    for %{name: name, kind: kind, from: from} = ref <- references do
+      if kind == :import do
+        assert_symbol!(name, "import #{inspect(ref)} name", @import_forbidden, false)
+      else
+        assert_symbol!(name, "reference #{inspect(ref)} name", @symbol_forbidden, true)
+      end
+
+      assert is_nil(from) or MapSet.member?(qnames, from),
+             "from validity: reference #{inspect(ref)} has `from` #{inspect(from)} " <>
+               "that is not the qualified_name of any entity in the result"
+    end
+
+    :ok
+  end
+
+  defp assert_symbol!(name, label, forbidden, dotted?) do
+    assert is_binary(name) and name != "",
+           "#{label}: must be a non-empty string, got #{inspect(name)}"
+
+    assert not String.match?(name, ~r/\s/),
+           "#{label}: must not contain whitespace, got #{inspect(name)}"
+
+    for {desc, bad} <- forbidden do
+      assert not String.contains?(name, bad),
+             "#{label}: must not contain #{desc}, got #{inspect(name)}"
+    end
+
+    if dotted? do
+      assert not (String.starts_with?(name, ".") or String.ends_with?(name, ".")),
+             "#{label}: must not start or end with `.`, got #{inspect(name)}"
+    end
   end
 
   describe "python" do
@@ -1160,7 +1223,9 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       src = "class Outer { make() { class Inner { [this.key()]() {} } } }"
 
       for lang <- ["javascript", "typescript"] do
-        assert calls(src, lang) == [{"Outer.key", "Outer.make"}]
+        assert calls(src, lang) == [
+                 {"Outer.key", "Outer.make"}
+               ]
       end
     end
 
@@ -1213,6 +1278,77 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
         assert Enum.any?(r, &(&1.name == "Outer.key" and &1.from == "Outer.make"))
         refute Enum.any?(r, &(&1.name == "key"))
       end
+    end
+  end
+
+  describe "member names and impl types without a static identity" do
+    test "js/ts: #private methods are entities matching their this.#x callees" do
+      for lang <- ["javascript", "typescript"] do
+        %{entities: e, references: r} =
+          extract("class C { #helper() {} run() { this.#helper(); } }", lang)
+
+        assert %{kind: :method} = find(e, "C.#helper")
+        assert Enum.any?(r, &(&1.name == "C.#helper" and &1.from == "C.run"))
+      end
+    end
+
+    test "js/ts: only identifier-like member keys become entities" do
+      for lang <- ["javascript", "typescript"] do
+        src = """
+        class C {
+          plain() {}
+          ["helper"]() {}
+          [this.key()]() { this.plain(); }
+          ['a b']() {}
+          "q c"() {}
+          "ok"() {}
+          [Symbol.iterator]() {}
+        }
+        """
+
+        assert ents(src, lang) == [
+                 {"C", :class},
+                 {"C.plain", :method},
+                 {"C.helper", :method},
+                 {"C.ok", :method}
+               ]
+
+        # Anonymous members still walk their bodies with the class receiver and
+        # the enclosing named definition as `from`.
+        assert calls(src, lang) == [{"key", nil}, {"C.plain", "C"}]
+      end
+    end
+
+    test "js/ts: anonymous object-literal member rebinds this" do
+      src = "class C { m() { return { [k()]() { this.x(); } }; } }"
+
+      for lang <- ["javascript", "typescript"] do
+        assert calls(src, lang) == [{"k", "C.m"}, {"x", "C.m"}]
+      end
+    end
+
+    test "rust: impl type identity is its path type" do
+      cases = [
+        {"impl Foo for &Bar { fn a(&self) { self.b(); } }", ["Bar.Foo", "Bar.Foo.a"], "Bar.b"},
+        {"impl Foo for &mut Bar { fn a(&self) { self.b(); } }", ["Bar.Foo", "Bar.Foo.a"],
+         "Bar.b"},
+        {"impl<'a, T> Foo for &'a T { fn a(&self) { self.b(); } }", ["T.Foo", "T.Foo.a"], "T.b"},
+        {"impl Foo for (A, B) { fn a(&self) { self.b(); } }", ["Foo", "Foo.a"], "Foo.b"},
+        {"impl Foo for [u8] { fn a(&self) { self.b(); } }", ["Foo", "Foo.a"], "Foo.b"},
+        {"impl Foo for [u8; 4] { fn a(&self) { self.b(); } }", ["Foo", "Foo.a"], "Foo.b"},
+        {"impl Foo for fn(u8) -> u8 { fn a(&self) { self.b(); } }", ["Foo", "Foo.a"], "Foo.b"},
+        {"impl Foo for *const Bar { fn a(&self) { self.b(); } }", ["Bar.Foo", "Bar.Foo.a"],
+         "Bar.b"}
+      ]
+
+      for {src, names, callee} <- cases do
+        assert Enum.map(ents(src, "rust"), &elem(&1, 0)) == names, src
+        assert [{^callee, _}] = calls(src, "rust"), src
+      end
+    end
+
+    test "rust: an inherent impl on a non-path type has no impl scope segment" do
+      assert ents("impl (A, B) { fn a(&self) {} }", "rust") == [{"a", :method}]
     end
   end
 
