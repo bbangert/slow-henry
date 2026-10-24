@@ -1144,6 +1144,19 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
       refute Enum.any?(calls, fn {n, _} -> n in ~w(f g is_integer) end)
     end
 
+    test "a bare pipeline step is a call; plain variables are not" do
+      src = ~S"""
+      defmodule M do
+        def f(x), do: x |> helper |> Mod.fun |> other()
+        def g(y), do: y
+      end
+      """
+
+      %{references: r} = extract(src, "elixir")
+      calls = for %{kind: :call, name: n, from: f} <- r, do: {n, f}
+      assert Enum.sort(calls) == Enum.sort([{"helper", "M.f"}, {"fun", "M.f"}, {"other", "M.f"}])
+    end
+
     test "calls inside import forms are still collected" do
       src = ~S"""
       defmodule M do

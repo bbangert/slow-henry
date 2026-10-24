@@ -130,7 +130,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   collected.
 
   Elixir: `f(x)` names `f`, `Mod.f(x)` names `f` (a `dot` whose member is not an
-  identifier names nothing). `@attr value` and `@attr` are not calls, calls in
+  identifier names nothing). The right operand of `|>` is always a call, so a
+  bare `x |> helper` names `helper`; other bare identifiers are variables. `@attr value` and `@attr` are not calls, calls in
   the value are; typespec attributes (`@spec`, `@type`, ...) are skipped
   entirely. `alias`/`import`/`use`/`require` emit one import reference: the
   first argument's module alias (`alias Foo.{A, B}` is `Foo`); calls in their
@@ -325,10 +326,26 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   end
 
   defp process_child(child, source, "elixir" = language, lang_ctx, state, acc) do
-    if TS.node_kind(child) == "call" do
-      handle_elixir_call(child, source, language, lang_ctx, state, acc)
-    else
-      walk(child, source, language, lang_ctx, state, acc)
+    cond do
+      TS.node_kind(child) == "call" ->
+        handle_elixir_call(child, source, language, lang_ctx, state, acc)
+
+      bare_pipe_callee(child, source) ->
+        # `x |> helper` calls helper/1: the right operand of `|>` is always a
+        # call, but without parens the grammar makes it a bare identifier.
+        callee = bare_pipe_callee(child, source)
+        left = List.wrap(TS.node_child_by_field_name(child, "left"))
+        acc = walk_nodes(left, source, language, lang_ctx, state, acc)
+
+        add_reference(acc, %{
+          name: callee,
+          kind: :call,
+          from: state.enclosing_qname,
+          line: line(child)
+        })
+
+      true ->
+        walk(child, source, language, lang_ctx, state, acc)
     end
   end
 
@@ -1088,6 +1105,19 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp entity_kind_for(:function_like, _container), do: :function
 
   # --- elixir ---------------------------------------------------------------
+
+  # The identifier on the right of `x |> name` (no parens), or nil. Anything else
+  # there (a `call`, `Mod.fun`) is already a call node handled normally.
+  defp bare_pipe_callee(node, source) do
+    with "binary_operator" <- TS.node_kind(node),
+         op when not is_nil(op) <- TS.node_child_by_field_name(node, "operator"),
+         "|>" <- slice(source, op),
+         right when not is_nil(right) <- TS.node_child_by_field_name(node, "right") do
+      elixir_identifier(right, source)
+    else
+      _ -> nil
+    end
+  end
 
   defp walk_elixir_def_body_node(node, source, lang_ctx, state, acc) do
     case TS.node_kind(node) do
