@@ -36,6 +36,8 @@ defmodule RetrievalNode.Ingest.Workers.JiraSync do
       states: [:available, :scheduled, :executing, :retryable, :suspended]
     ]
 
+  require Logger
+
   alias RetrievalNode.Chunking
   alias RetrievalNode.Ingest.{Jira, PendingChunks, SourceOwner}
   alias RetrievalNode.Repo
@@ -44,6 +46,16 @@ defmodule RetrievalNode.Ingest.Workers.JiraSync do
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"source_id" => source_id}}) do
     source = Repo.get!(Source, source_id)
+
+    if Source.syncable?(source) do
+      sync(source)
+    else
+      Logger.info("source=#{source.name} not syncable (inactive or denied); cancelling sync")
+      {:cancel, :ineligible}
+    end
+  end
+
+  defp sync(%Source{id: source_id} = source) do
     state = get_or_create_sync_state(source_id)
     watermark = Map.get(state.cursor || %{}, "resolutiondate_watermark")
 

@@ -65,6 +65,20 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
     assert state.cursor["last_sha"] == head
   end
 
+  for {label, attrs} <- [inactive: %{active: false}, denied: %{policy: :deny}] do
+    test "a #{label} source is cancelled before any work", ctx do
+      commit(ctx.src, [{"a.py", "def a(): pass\n"}])
+
+      ctx.source |> Ecto.Changeset.change(unquote(Macro.escape(attrs))) |> Repo.update!()
+
+      assert {:cancel, :ineligible} = perform_job(RepoSync, %{"source_id" => ctx.source.id})
+
+      refute Repo.get_by(SyncState, source_id: ctx.source.id)
+      assert Repo.all(PendingChunk) == []
+      refute File.exists?(Application.get_env(:retrieval_node, :git_mirror_root))
+    end
+  end
+
   test "an unchanged repo is a no-op on the second sync but still refreshes last_synced_at",
        ctx do
     commit(ctx.src, [{"a.py", "x\n"}])

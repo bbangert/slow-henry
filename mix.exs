@@ -114,6 +114,8 @@ defmodule RetrievalNode.MixProject do
       # as a transitive dep of req/anubis_mcp.
       {:finch, "~> 0.23"},
       {:sourceror, "~> 1.0"},
+      # sources.toml (the list of sources to index, see RetrievalNode.SourcesFile)
+      {:toml, "~> 0.7"},
 
       # Tooling used by per-phase verification (mix credo/sobelow) and CI (dialyzer, argus)
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

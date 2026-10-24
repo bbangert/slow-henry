@@ -29,6 +29,11 @@ defmodule RetrievalNode.Retrieval.Source do
   @required [:source_type, :name, :identifier]
   @optional [:policy, :active, :config]
 
+  @doc "True when the source is eligible to sync: active and policy `:allow`."
+  @spec syncable?(t()) :: boolean()
+  def syncable?(%__MODULE__{active: active, policy: policy}),
+    do: active == true and policy == :allow
+
   def create_changeset(source, attrs) do
     source
     |> cast(attrs, @required ++ @optional)

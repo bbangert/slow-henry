@@ -27,6 +27,10 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   failure-marked row get another look on every cron tick without this job
   needing to know anything about failure state.
 
+  `perform/1` first re-checks `Source.syncable?/1`: a job queued before the
+  source was deactivated or denied (or a retry) returns `{:cancel, :ineligible}`
+  before touching the mirror, the sync state or the staging table.
+
   Two edge cases short-circuit before any staging happens:
 
     * An **empty repo** (no commits) resolves `HEAD` to `{:error, :empty_repo}` —
@@ -77,6 +81,16 @@ defmodule RetrievalNode.Ingest.Workers.RepoSync do
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"source_id" => source_id}}) do
     source = Repo.get!(Source, source_id)
+
+    if Source.syncable?(source) do
+      sync(source)
+    else
+      Logger.info("source=#{source.name} not syncable (inactive or denied); cancelling sync")
+      {:cancel, :ineligible}
+    end
+  end
+
+  defp sync(%Source{id: source_id} = source) do
     sync_state = get_or_create_sync_state(source_id)
     slug = repo_slug(source)
     last_sha = Map.get(sync_state.cursor || %{}, "last_sha")

@@ -187,12 +187,14 @@ defmodule RetrievalNode.Inventory do
   cron scheduler); any other source returns `{:error, :ineligible}` and no job
   is inserted.
   """
-  def enqueue_sync(%Source{active: true, policy: :allow} = source) do
-    worker = Map.fetch!(@sync_workers, source.source_type)
-    Oban.insert(worker.new(%{"source_id" => source.id}))
+  def enqueue_sync(%Source{} = source) do
+    if Source.syncable?(source) do
+      worker = Map.fetch!(@sync_workers, source.source_type)
+      Oban.insert(worker.new(%{"source_id" => source.id}))
+    else
+      {:error, :ineligible}
+    end
   end
-
-  def enqueue_sync(%Source{}), do: {:error, :ineligible}
 
   defp escape_like(term), do: String.replace(term, ~w(\\ % _), &("\\" <> &1))
 end
