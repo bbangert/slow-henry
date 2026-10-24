@@ -100,6 +100,16 @@ defmodule RetrievalNode.Bench.RerankEvalTest do
       assert unresolvable_row.modes == %{}
     end
 
+    test "skips a cutoff below 5 instead of misreporting Hit@5" do
+      source = source_fixture("repo-c")
+      _chunk = chunk_fixture(source, repo: "repo-c")
+      path = write_queries!([%{"query" => "q", "relevant" => [%{"repo" => "repo-c"}]}])
+
+      assert {:skipped, reason} = RerankEval.run(queries_path: path, top_k: 2)
+      assert reason =~ "Hit@5"
+      assert {:ok, %{top_k: 5}} = RerankEval.run(queries_path: path, top_k: 5)
+    end
+
     test "skips when the corpus is empty" do
       path = write_queries!([%{"query" => "q", "relevant" => [%{"repo" => "r"}]}])
 

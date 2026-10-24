@@ -41,11 +41,12 @@ defmodule RetrievalNode.Bench.RerankEval do
       actually run (a caller-supplied 0 measures at the clamp's default 20,
       not "0"; a caller-supplied 1_000 measures at the clamp's max 100, not
       "1000" — either raw value in the report would misdescribe Hit@5 in
-      particular).
+      particular). A normalized cutoff below 5 is skipped: the report always
+      includes Hit@5, which a shorter result list cannot measure.
 
   Returns `{:ok, result}` or `{:skipped, reason}` — never raises for an unmet
-  precondition (empty corpus, unwarmed embedding serving, unwarmed reranking
-  serving).
+  precondition (cutoff below 5, empty corpus, unwarmed embedding serving,
+  unwarmed reranking serving).
   """
   @spec run(keyword()) :: section
   def run(opts \\ []) do
@@ -53,6 +54,9 @@ defmodule RetrievalNode.Bench.RerankEval do
     top_k = opts |> Keyword.get(:top_k, 10) |> HybridQuery.clamp_top_k()
 
     cond do
+      top_k < 5 ->
+        {:skipped, "top_k #{top_k} is below 5; Hit@5 needs at least 5 results per query"}
+
       not Runner.corpus_seeded?() ->
         {:skipped,
          "corpus not seeded — ingest at least one source before running mix rn.rerank_eval"}

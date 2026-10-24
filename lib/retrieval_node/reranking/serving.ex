@@ -60,8 +60,23 @@ defmodule RetrievalNode.Reranking.Serving do
         defn_options: [compiler: EXLA]
       )
 
-    Nx.Serving.child_spec(serving: serving, name: @name, batch_timeout: batch_timeout())
+    %{start: {Nx.Serving, :start_link, [nx_opts]}} =
+      spec = Nx.Serving.child_spec(serving: serving, name: @name, batch_timeout: batch_timeout())
+
+    spec
+    |> Map.put(:start, {__MODULE__, :start_link, [nx_opts]})
     |> Supervisor.child_spec(id: @name)
+  end
+
+  @doc """
+  Starts the `Nx.Serving`, clearing the readiness flag FIRST. Every (re)start of
+  the serving goes through here, so a crash-restart invalidates readiness before
+  the replacement initializes — not only once the Warmer restarts after it — and
+  `/healthz` never reports ready against a serving that is still starting.
+  """
+  def start_link(nx_opts) do
+    reset_ready()
+    Nx.Serving.start_link(nx_opts)
   end
 
   @doc """
