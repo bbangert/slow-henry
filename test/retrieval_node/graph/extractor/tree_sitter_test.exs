@@ -1282,6 +1282,36 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitterTest do
   end
 
   describe "member names and impl types without a static identity" do
+    test "js/ts: parser identifiers keep Unicode names and their receiver" do
+      for lang <- ["javascript", "typescript"] do
+        src = "class Café { método() { this.otro(); } otro() {} }"
+        %{entities: e, references: r} = extract(src, lang)
+        assert find(e, "Café") && find(e, "Café.método") && find(e, "Café.otro")
+        assert Enum.any?(r, &(&1.name == "Café.otro" and &1.from == "Café.método"))
+      end
+    end
+
+    test "js/ts: comments inside a computed string key don't drop the member" do
+      for lang <- ["javascript", "typescript"] do
+        %{entities: e} = extract(~s|class C { ["helper" /* why */]() {} }|, lang)
+        assert find(e, "C.helper")
+      end
+    end
+
+    test "typescript: dotted namespaces and string modules keep their scope" do
+      src = """
+      namespace A.B { export function run() {} }
+      namespace C.D { export function run() {} }
+      declare module "pkg-a" { export function g(): void {} }
+      declare module "@scope/pkg" { export function g(): void {} }
+      """
+
+      %{entities: e} = extract(src, "typescript")
+
+      for name <- ~w(A.B.run C.D.run pkg-a pkg-a.g @scope/pkg @scope/pkg.g),
+          do: assert(find(e, name), "missing #{name}")
+    end
+
     test "js/ts: #private methods are entities matching their this.#x callees" do
       for lang <- ["javascript", "typescript"] do
         %{entities: e, references: r} =

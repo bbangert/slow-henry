@@ -40,12 +40,15 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       parentheses or `..`, and never start or end with ".". Import references
       are module/path strings and are exempt from the `::`/`..`/dot rules. The
       test helper asserts all of this on every result.
-    * A JS/TS member is an entity only when its key is statically
-      identifier-like: a plain identifier, a `#private` name (kept with its `#`,
-      matching the `this.#x` callee), or a string literal (also inside `[...]`)
-      whose content matches `[A-Za-z_$][A-Za-z0-9_$]*`. Any other key (`[expr]`,
-      `"a b"`, numbers) makes an anonymous function-like container: no entity,
-      body still walked.
+    * JS/TS names the parser recognises as identifiers are taken as-is:
+      Unicode identifiers, `#private` names (kept with their `#`, matching the
+      `this.#x` callee) and `namespace A.B`. Only LITERAL member keys are
+      validated: a string literal (also inside `[...]`, comments ignored) names
+      the member when its content is a JS identifier (Unicode-aware). Any other
+      key (`[expr]`, `"a b"`, numbers) makes an anonymous function-like
+      container: no entity, body still walked. A TS ambient module is named by
+      its path string (`"pkg-a"`, `"@scope/pkg"`) when that satisfies the
+      output naming rules.
     * A Rust impl's type identity is its path type: references and pointers
       unwrap to the pointee, generics to their base. A type without one (tuple,
       array, slice, fn pointer, ...) makes the trait the container
@@ -1527,6 +1530,15 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
+  # A TS ambient module (`declare module "pkg-a" {}`) is named by its module
+  # path string; keep it when the path is a hygienic symbol, else anonymous.
+  defp name_field(node, "typescript", "module", source) do
+    case TS.node_child_by_field_name(node, "name") do
+      nil -> nil
+      name_node -> module_path_name(name_node, source)
+    end
+  end
+
   defp name_field(node, language, _kind, source) do
     case TS.node_child_by_field_name(node, "name") do
       nil -> nil
@@ -1534,34 +1546,49 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end
   end
 
-  # js/ts members are named only by a statically identifier-like key: a plain
-  # identifier, a `#private` name (kept with its `#`, matching the `C.#helper`
-  # callee `this.#helper()` resolves to), or a string literal (also inside
-  # `[...]`) whose content is an identifier. Anything else (`[expr]`, `"a b"`,
-  # numbers) yields nil, i.e. an anonymous function-like container.
-  @js_identifier ~r/\A[A-Za-z_$][A-Za-z0-9_$]*\z/
-  @js_private_identifier ~r/\A#[A-Za-z_$][A-Za-z0-9_$]*\z/
+  # js/ts definition names. A name node the PARSER recognised as an identifier
+  # is taken as-is: Unicode identifiers, `#private` names (kept with their `#`,
+  # matching the `C.#helper` callee `this.#helper()` resolves to) and TS
+  # `namespace A.B` (`nested_identifier`). Only LITERAL member keys are
+  # validated: a string literal (also inside `[...]`, ignoring comments) names
+  # the member when its content is a JS identifier. Anything else (`[expr]`,
+  # `"a b"`, numbers) yields nil, i.e. an anonymous function-like container.
+  @js_identifier_nodes ~w(identifier property_identifier type_identifier private_property_identifier nested_identifier)
+  @js_identifier ~r/\A[\p{L}\p{Nl}$_][\p{L}\p{Nl}\p{Mn}\p{Mc}\p{Nd}\p{Pc}$\x{200C}\x{200D}]*\z/u
 
   defp definition_name_text(name_node, source, language)
        when language in ["javascript", "typescript"] do
-    {text, pattern} =
-      case TS.node_kind(name_node) do
-        "string" -> {string_content(name_node, source), @js_identifier}
-        "computed_property_name" -> {computed_key_string(name_node, source), @js_identifier}
-        "private_property_identifier" -> {slice(source, name_node), @js_private_identifier}
-        _ -> {slice(source, name_node), @js_identifier}
-      end
-
-    if is_binary(text) and text =~ pattern, do: text
+    case TS.node_kind(name_node) do
+      kind when kind in @js_identifier_nodes -> slice(source, name_node)
+      "string" -> name_node |> string_content(source) |> literal_identifier()
+      "computed_property_name" -> name_node |> computed_key_string(source) |> literal_identifier()
+      _ -> nil
+    end
   end
 
   defp definition_name_text(name_node, source, _language), do: slice(source, name_node)
 
+  defp literal_identifier(text) when is_binary(text),
+    do: if(text =~ @js_identifier, do: text)
+
+  defp literal_identifier(_text), do: nil
+
   defp computed_key_string(node, source) do
-    case named_children(node) do
+    case node |> named_children() |> Enum.reject(&(TS.node_kind(&1) =~ "comment")) do
       [str] -> if TS.node_kind(str) == "string", do: string_content(str, source)
       _ -> nil
     end
+  end
+
+  # Module path strings (`pkg-a`, `@scope/pkg`) keep `-`, `@` and `/`, but must
+  # still satisfy the output naming rules (see the moduledoc).
+  defp module_path_name(name_node, source) do
+    text = if TS.node_kind(name_node) == "string", do: string_content(name_node, source)
+
+    if is_binary(text) and text != "" and not String.match?(text, ~r/[\s"'`()]/u) and
+         not String.contains?(text, ["::", ".."]) and
+         not (String.starts_with?(text, ".") or String.ends_with?(text, ".")),
+       do: text
   end
 
   defp rust_dotted(path),
