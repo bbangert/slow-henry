@@ -131,6 +131,9 @@ defmodule RetrievalNode.Ingest do
   end
 
   @waiting_states ~w(available scheduled retryable)
+  # Oban's `replace:` keys, as literals: String.to_existing_atom/1 is load-order
+  # dependent and raised on "scheduled" in `mix rn.graph.backfill`'s lean boot.
+  @waiting_state_atoms [:available, :scheduled, :retryable]
 
   # `replace: [args: ...]` for the waiting states only: a conflicting job that
   # is still queued is upgraded in place (Oban returns it with `conflict?`),
@@ -140,7 +143,7 @@ defmodule RetrievalNode.Ingest do
                                                                                 {:ok, acc} ->
       job =
         RepoSync.new(%{"source_id" => source.id, "full" => true},
-          replace: Enum.map(@waiting_states, &{String.to_existing_atom(&1), [:args]})
+          replace: Enum.map(@waiting_state_atoms, &{&1, [:args]})
         )
 
       case Oban.insert(job) do
