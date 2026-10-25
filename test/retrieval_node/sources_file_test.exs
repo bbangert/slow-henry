@@ -76,6 +76,19 @@ defmodule RetrievalNode.SourcesFileTest do
       assert {:error, "duplicate url " <> _} =
                SourcesFile.parse(%{"git" => [git("adr", @url_a), git("other", @url_a)]})
     end
+
+    test "accepts a leading dot in names like .github" do
+      assert {:ok, [%{name: ".github"}]} = SourcesFile.parse(%{"git" => [git(".github", @url_a)]})
+    end
+
+    test "rejects names that are just a dot or path traversal patterns" do
+      invalid_names = [".", "..", "..github", ".-x", "./x", "../etc"]
+
+      Enum.each(invalid_names, fn invalid_name ->
+        assert {:error, "[[git]] #1: invalid name " <> _} =
+                 SourcesFile.parse(%{"git" => [git(invalid_name, @url_a)]})
+      end)
+    end
   end
 
   describe "apply/1" do
