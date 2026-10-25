@@ -14,12 +14,21 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   costs regular-scheduler fairness, and no in-VM guard catches a C-level segfault
   — that's the peer-node escape hatch's job, deferred to v1.1.
 
-  v1 covers the mainstream code languages; Elixir/HEEx/EEx fall through to the
-  heuristic chunker until the native-AST Elixir path lands (fast-follow).
+  v1 AST-chunks the mainstream code languages; Elixir/HEEx/EEx fall through to
+  the heuristic chunker until their native-AST path lands (fast-follow).
+
+  Graph-only languages (`@graph_only_languages`, currently `elixir`) are parsed
+  by `chunk_with_graph/2` purely to extract entities/references; their `chunks`
+  stay the heuristic chunker's, so text outside definitions (ExUnit `test`
+  blocks, Ecto `schema`, router scopes, `@moduledoc`, `use` lines) remains
+  indexed. `chunk/2` rejects them as `:unsupported_language`, exactly as for any
+  heuristic-only language. Elixir moves to AST chunking only together with
+  top-level (gap) chunking, which preserves that coverage.
   """
 
   @behaviour RetrievalNode.Chunking
 
+  alias RetrievalNode.Chunking.HeuristicImpl
   alias RetrievalNode.Graph.Extractor
   alias TreeSitterLanguagePack, as: TS
 
@@ -33,6 +42,9 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   @supervisor RetrievalNode.ChunkTaskSupervisor
 
   @allowed_languages ~w(python javascript typescript go rust ruby java)
+
+  # Parsed for the graph only; chunk text comes from the heuristic chunker.
+  @graph_only_languages ~w(elixir)
 
   # Node kinds that mark a chunk boundary, per language. A node is emitted as a
   # chunk only if it has no chunkable descendants (leaf-most def); a container
@@ -58,7 +70,7 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   def chunk(source, language) when is_binary(source) do
     # Cheapest check first: an O(1) allowlist lookup short-circuits before the
     # O(n) binary-content scan of an up-to-2MB blob.
-    with :ok <- check_language_allowlist(language),
+    with :ok <- check_language_allowlist(language, @allowed_languages),
          :ok <- check_size(source),
          :ok <- check_binary_content(source) do
       guarded(fn -> parse_to_chunks(source, language) end)
@@ -70,10 +82,11 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   parse, two consumers — see `RetrievalNode.Graph.Extractor.TreeSitter`'s
   moduledoc). Same pre-flight guards and `guarded/1` Task isolation as
   `chunk/2`; only plain maps (never NIF node refs) cross back out of the task.
+  Graph-only languages return heuristic chunks (see the moduledoc).
   """
   @impl true
   def chunk_with_graph(source, language) when is_binary(source) do
-    with :ok <- check_language_allowlist(language),
+    with :ok <- check_language_allowlist(language, @allowed_languages ++ @graph_only_languages),
          :ok <- check_size(source),
          :ok <- check_binary_content(source) do
       guarded(fn -> parse_to_chunks_and_graph(source, language) end)
@@ -130,8 +143,8 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   defp check_binary_content(bin),
     do: if(RetrievalNode.Chunking.binary_content?(bin), do: {:error, :binary_content}, else: :ok)
 
-  defp check_language_allowlist(lang),
-    do: if(lang in @allowed_languages, do: :ok, else: {:error, :unsupported_language})
+  defp check_language_allowlist(lang, allowed),
+    do: if(lang in allowed, do: :ok, else: {:error, :unsupported_language})
 
   defp parse_to_chunks(source, language) do
     with {:ok, root} <- parse_root(source, language) do
@@ -145,10 +158,17 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   defp parse_to_chunks_and_graph(source, language) do
     with {:ok, root} <- parse_root(source, language),
          {:ok, graph} <- Extractor.TreeSitter.extract({root, source}, language, []) do
-      chunks = extract(root, source, language, [])
+      chunks = graph_chunks(root, source, language)
       {:ok, %{chunks: chunks, entities: graph.entities, references: graph.references}}
     end
   end
+
+  defp graph_chunks(_root, source, language) when language in @graph_only_languages do
+    {:ok, chunks} = HeuristicImpl.chunk(source, language)
+    chunks
+  end
+
+  defp graph_chunks(root, source, language), do: extract(root, source, language, [])
 
   defp parse_root(source, language) do
     parser = TS.parser_new()

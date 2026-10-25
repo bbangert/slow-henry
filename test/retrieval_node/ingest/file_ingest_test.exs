@@ -223,6 +223,38 @@ defmodule RetrievalNode.Ingest.FileIngestTest do
     end
   end
 
+  describe "re-ingest refreshes staged-row columns" do
+    test "lang, repo and source_type follow the latest staged row", %{source: source} do
+      natural_key = "repo:acme/app:ready.exs"
+      force_chunk(chunk_result([{"IO.puts(\"ready\")", "", 1, 1}]))
+
+      raw1 =
+        seed_row(source, %{
+          natural_key: natural_key,
+          lang: nil,
+          repo: "old/repo",
+          metadata: %{"path" => "ready.exs"}
+        })
+
+      assert {:ok, _} = FileIngest.apply(raw1, [])
+      assert [%Chunk{lang: nil, repo: "old/repo"} = first] = chunks_for(source, "ready.exs")
+
+      raw2 =
+        seed_row(source, %{
+          natural_key: natural_key,
+          lang: "elixir",
+          repo: "acme/app",
+          metadata: %{"path" => "ready.exs"}
+        })
+
+      assert {:ok, _} = FileIngest.apply(raw2, [])
+      assert [%Chunk{} = second] = chunks_for(source, "ready.exs")
+      assert second.id == first.id
+      assert second.lang == "elixir"
+      assert second.repo == "acme/app"
+    end
+  end
+
   describe "unindexable content" do
     test "scrub cancel (content too large) reaps the raw row AND removes the file's prior chunks",
          %{source: source} do

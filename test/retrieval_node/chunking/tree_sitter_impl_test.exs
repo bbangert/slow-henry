@@ -6,6 +6,7 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
   # rather than splitting it out, to keep this file simple.
   use ExUnit.Case, async: false
 
+  alias RetrievalNode.Chunking.HeuristicImpl
   alias RetrievalNode.Chunking.TreeSitterImpl, as: TSI
 
   describe "pre-flight guards (NIF-free — reject before reaching the parser)" do
@@ -22,9 +23,10 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
       assert {:error, :unsupported_language} = TSI.chunk("x = 1", "cobol")
     end
 
-    test "allowed_languages/0 is the mainstream code set" do
+    test "allowed_languages/0 is the AST-chunked set; elixir is graph-only" do
       assert "python" in TSI.allowed_languages()
       refute "elixir" in TSI.allowed_languages()
+      assert {:error, :unsupported_language} = TSI.chunk("def a, do: 1", "elixir")
     end
   end
 
@@ -95,6 +97,37 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
       assert "foo" in crumbs
       assert "A > bar" in crumbs
       assert Enum.all?(chunks, &(&1.parse_status == :ok))
+    end
+  end
+
+  describe "chunk_with_graph/2: elixir (graph-only)" do
+    @describetag :tree_sitter
+
+    test "returns heuristic chunks covering the whole file plus the extracted graph" do
+      src = """
+      defmodule Pay do
+        @moduledoc "Pays."
+
+        def run(x), do: helper(x)
+        defp helper(x), do: x
+      end
+
+      IO.puts("done")
+      """
+
+      {:ok, heuristic} = HeuristicImpl.chunk(src, "elixir")
+
+      assert {:ok, %{chunks: ^heuristic, entities: entities, references: references}} =
+               TSI.chunk_with_graph(src, "elixir")
+
+      assert Enum.any?(entities, &(&1.qualified_name == "Pay" and &1.kind == :module))
+      assert Enum.any?(entities, &(&1.qualified_name == "Pay.run" and &1.kind == :function))
+      assert Enum.any?(references, &(&1.kind == :call and &1.name == "helper"))
+      assert Enum.map_join(heuristic, "\n", & &1.text) =~ "IO.puts(\"done\")"
+    end
+
+    test "keeps the size and binary guards" do
+      assert {:error, :binary_content} = TSI.chunk_with_graph("ok\x00bad", "elixir")
     end
   end
 
