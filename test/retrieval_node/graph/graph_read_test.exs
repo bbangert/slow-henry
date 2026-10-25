@@ -553,6 +553,99 @@ defmodule RetrievalNode.GraphReadTest do
     end
   end
 
+  describe "name aliasing (reference-only vs qualified definitions)" do
+    # `helper` is called by its bare name, so the write path stores a
+    # reference-only entity `helper` next to the definition
+    # `Payment.Processor.helper`.
+    setup %{source: source} do
+      ingest(source, [
+        {"c1",
+         [def_("Payment.Processor.helper"), def_("Payment.Processor.process"), def_("leaf")],
+         [call("helper", "Payment.Processor.process"), call("leaf", "Payment.Processor.helper")],
+         []}
+      ])
+
+      %{
+        helper_ref: entity!(source, "helper"),
+        helper: entity!(source, "Payment.Processor.helper"),
+        process: entity!(source, "Payment.Processor.process"),
+        leaf: entity!(source, "leaf")
+      }
+    end
+
+    defp names(results), do: results |> Enum.map(& &1.entity.qualified_name) |> Enum.sort()
+
+    test "callees of the bare name resolve to the definition's callees", ctx do
+      assert names(Graph.related_entities([ctx.helper_ref.id], :callees)) == ["leaf"]
+    end
+
+    test "callers of the qualified definition include callers of the bare name", ctx do
+      assert names(Graph.related_entities([ctx.helper.id], :callers)) ==
+               ["Payment.Processor.process"]
+    end
+
+    test "hop 2 callees: a reference-only hop-1 row is resolved before traversing on", ctx do
+      results = Graph.related_entities([ctx.process.id], :callees, 2)
+
+      assert %{entity: %{qualified_name: "helper"}, hop: 1} =
+               Enum.find(results, &(&1.hop == 1))
+
+      assert %{entity: %{qualified_name: "leaf"}, hop: 2} = Enum.find(results, &(&1.hop == 2))
+    end
+
+    test "hop 2 callers: the definition's callers via its alias", ctx do
+      results = Graph.related_entities([ctx.leaf.id], :callers, 2)
+
+      assert %{entity: %{qualified_name: "Payment.Processor.helper"}, hop: 1} =
+               Enum.find(results, &(&1.hop == 1))
+
+      assert %{entity: %{qualified_name: "Payment.Processor.process"}, hop: 2} =
+               Enum.find(results, &(&1.hop == 2))
+    end
+
+    test "a bare name is attributed to every definition it aliases", %{source: source} do
+      ingest(source, [
+        {"c2", [def_("A.shared"), def_("B.shared"), def_("caller")], [call("shared", "caller")],
+         []}
+      ])
+
+      for name <- ["A.shared", "B.shared"] do
+        assert names(Graph.related_entities([entity!(source, name).id], :callers)) == ["caller"]
+      end
+    end
+
+    test "aliasing stays within source and language", %{source: source} do
+      other = source_fixture()
+      ingest(other, [{"o1", [def_("Payment.Processor.helper")], [], []}])
+      ingest(source, [{"c3", [def_("Payment.Processor.helper")], [], [lang: "javascript"]}])
+
+      assert Graph.related_entities([entity!(other, "Payment.Processor.helper").id], :callers) ==
+               []
+
+      js = entity!(source, "Payment.Processor.helper", "javascript")
+      assert Graph.related_entities([js.id], :callers) == []
+    end
+
+    test "an entity's own aliases are never returned as its results", %{source: source} do
+      ingest(source, [
+        {"c4", [def_("Mod.rec")], [call("rec", "Mod.rec")], []}
+      ])
+
+      rec = entity!(source, "Mod.rec")
+      assert Graph.related_entities([rec.id], :callees, 2) == []
+      assert Graph.related_entities([rec.id], :callers, 2) == []
+    end
+
+    test "resolving a hot bare name stays bounded", %{source: source} do
+      defs = for i <- 1..600, do: def_("X#{i}.get")
+      refs = for i <- 1..600, do: call("t#{i}", "X#{i}.get")
+      ingest(source, [{"c5", defs ++ [def_("t0")], [call("get", "t0")] ++ refs, []}])
+
+      get = entity!(source, "get")
+      assert length(Graph.related_entities([get.id], :callees)) == 50
+    end
+  end
+
   describe "definition_snippets/2" do
     defp snippet_for(source, name, content, opts \\ []) do
       ingest(source, [{"k-#{name}", [def_(name)], [], [content: content] ++ opts}])

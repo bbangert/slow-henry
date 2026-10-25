@@ -270,6 +270,12 @@ defmodule RetrievalNode.Graph do
   # uncapped frontier would multiply, not bound, the hop-1 fan-out risk.
   @hop2_frontier_limit 100
 
+  # Alias expansion (expand_frontier/2): the frontier is capped at this many
+  # ids AFTER expansion, and each expansion query returns at most
+  # @alias_limit rows, so a hot bare name can't multiply the traversal.
+  @expanded_frontier_limit 300
+  @alias_limit 500
+
   @doc """
   Resolve `name` to matching entities, optionally scoped by `:repo`/`:lang`
   and capped at `:limit` (default #{@find_entities_default_limit}, max
@@ -467,6 +473,24 @@ defmodule RetrievalNode.Graph do
   an unbounded traversal. Raises `ArgumentError` for an unknown `relation`
   or `hops` outside 1..2.
 
+  Name aliasing: the write path stores a call/import target under the name
+  used at the reference site, so `helper` is a reference-only entity (no
+  `:definition` mention) separate from the definition
+  `Payment.Processor.helper`. Within one source and language, a reference-only
+  entity aliases a definition when its name equals the definition's or is a
+  `.`-delimited suffix of it (`helper`, `Processor.helper`); extractors
+  normalize other separators to `.`. Because there is no import resolution, a
+  bare name is attributed to EVERY definition it aliases (`A.helper` and
+  `B.helper` both gain a caller of `helper`). Incoming relations
+  (`:callers`/`:importers`) traverse into the entities plus their aliases;
+  outgoing ones (`:callees`/`:imports`) start from definition-bearing
+  entities, resolving reference-only inputs to the definitions they alias. This
+  runs at every hop. Hop-1 rows are returned as stored (possibly a
+  reference-only name); the resolved definitions only seed the next hop. The
+  expanded frontier is capped at #{@expanded_frontier_limit} ids and each
+  expansion query at #{@alias_limit} rows; an entity's own aliases are never
+  returned as its results.
+
   Traversal never crosses sources: edges are written between entities of one
   source, and the mention legs join on a shared chunk.
   """
@@ -492,9 +516,12 @@ defmodule RetrievalNode.Graph do
   defp clamp_seed_ids(ids), do: ids |> Enum.uniq() |> Enum.take(@max_seed_ids)
 
   defp traverse(seed_list, relation, hops) do
+    direction = direction(relation)
+    seed_expansion = expand_frontier(seed_list, direction)
+
     hop1 =
-      seed_list
-      |> traverse_edges(relation, seed_list)
+      seed_expansion.frontier
+      |> traverse_edges(relation, seed_expansion.excluded)
       |> dedup_max_weight()
 
     tagged_hop1 = Enum.map(hop1, &Map.put(&1, :hop, 1))
@@ -503,19 +530,27 @@ defmodule RetrievalNode.Graph do
       if hops == 1 do
         tagged_hop1
       else
-        excluded = Enum.uniq(seed_list ++ Enum.map(hop1, & &1.entity_id))
-
         # hop-1 is already bounded by @edge_fanout_limit per query, but
         # feeding all of it into a second traversal would multiply that
         # fan-out instead of bounding it.
-        hop2_frontier =
+        hop1_ids =
           hop1
           |> rank()
           |> Enum.take(@hop2_frontier_limit)
           |> Enum.map(& &1.entity_id)
 
+        # The hop-1 rows are kept as-is (often reference-only names like
+        # `helper`); expansion only changes what the next hop traverses from.
+        hop2_expansion = expand_frontier(hop1_ids, direction)
+
+        excluded =
+          Enum.uniq(
+            seed_expansion.excluded ++
+              Enum.map(hop1, & &1.entity_id) ++ hop2_expansion.excluded
+          )
+
         hop2 =
-          hop2_frontier
+          hop2_expansion.frontier
           |> traverse_edges(relation, excluded)
           |> dedup_max_weight()
           |> Enum.map(&Map.put(&1, :hop, 2))
@@ -534,6 +569,160 @@ defmodule RetrievalNode.Graph do
         :error -> []
       end
     end)
+  end
+
+  defp direction(relation) when relation in [:callers, :importers], do: :incoming
+  defp direction(relation) when relation in [:callees, :imports], do: :outgoing
+
+  # Alias expansion — the one choke point for name aliasing. The write path
+  # stores a call/import target under the name used at the reference site
+  # (`helper`), a reference-only entity (no :definition mention) separate from
+  # the definition `Payment.Processor.helper`. Within one (source_id,
+  # language), reference-only R aliases definition D when R.qualified_name is
+  # D's name or a "."-delimited suffix of it (the extractor normalizes `::`
+  # and other language separators to "." — see Extractor.TreeSitter). Without
+  # import resolution a bare name is attributed to EVERY definition it aliases.
+  #
+  #   * :incoming (callers/importers) traverses edges INTO the frontier, so the
+  #     frontier is the entities, the definitions any reference-only entity
+  #     resolves to, and every reference-only alias of those definitions.
+  #   * :outgoing (callees/imports) needs definition-bearing entities (only
+  #     they have outgoing edges): reference-only ids are replaced by the
+  #     definitions they resolve to.
+  #
+  # `excluded` always holds every id involved (inputs, resolved definitions,
+  # aliases) so an entity's alias is never returned as its own result. The
+  # frontier is capped at @expanded_frontier_limit AFTER expansion, and each
+  # expansion query is LIMITed at @alias_limit.
+  defp expand_frontier(ids, direction) do
+    infos = load_frontier_infos(ids)
+    {defined, ref_only} = Enum.split_with(infos, & &1.defined?)
+
+    resolved = resolve_definitions(ref_only)
+    definitions = defined ++ resolved
+    aliases = alias_entities(definitions)
+
+    frontier_ids =
+      case direction do
+        :incoming -> Enum.map(infos ++ resolved ++ aliases, & &1.id)
+        :outgoing -> Enum.map(definitions, & &1.id)
+      end
+
+    %{
+      frontier: frontier_ids |> Enum.uniq() |> Enum.take(@expanded_frontier_limit),
+      excluded: Enum.uniq(ids ++ Enum.map(resolved ++ aliases, & &1.id))
+    }
+  end
+
+  defp load_frontier_infos([]), do: []
+
+  defp load_frontier_infos(ids) do
+    from(e in Entity,
+      where: e.id in ^ids,
+      select: %{
+        id: e.id,
+        source_id: e.source_id,
+        language: e.language,
+        qualified_name: e.qualified_name,
+        defined?:
+          fragment(
+            "EXISTS (SELECT 1 FROM entity_mentions m WHERE m.entity_id = ? AND m.kind = 'definition')",
+            e.id
+          )
+      }
+    )
+    |> Repo.all()
+  end
+
+  # Reference-only entities aliasing `definitions`: exact equality against
+  # each definition's generated suffix list, so the unique
+  # (source_id, language, qualified_name) index drives the lookup.
+  defp alias_entities([]), do: []
+
+  defp alias_entities(definitions) do
+    triples =
+      for d <- definitions, name <- name_suffixes(d.qualified_name) do
+        {d.source_id, d.language, name}
+      end
+
+    {source_ids, languages, names} = unzip3(Enum.uniq(triples))
+
+    from(e in Entity,
+      as: :entity,
+      join:
+        t in fragment(
+          "SELECT * FROM unnest(?::text[], ?::text[], ?::text[]) AS t(source_id, language, name)",
+          ^source_ids,
+          ^languages,
+          ^names
+        ),
+      on:
+        e.qualified_name == t.name and e.language == t.language and
+          e.source_id == fragment("?::uuid", t.source_id),
+      where: not exists(definition_mention_of(:entity)),
+      select: %{id: e.id},
+      order_by: [asc: e.id],
+      limit: @alias_limit
+    )
+    |> Repo.all()
+  end
+
+  # Definitions that reference-only `ref_only` entities alias: equality or a
+  # "." + name suffix match (LIKE metacharacters escaped), same source and
+  # language. Bounded by @alias_limit.
+  defp resolve_definitions([]), do: []
+
+  defp resolve_definitions(ref_only) do
+    rows = Enum.uniq_by(ref_only, &{&1.source_id, &1.language, &1.qualified_name})
+    source_ids = Enum.map(rows, & &1.source_id)
+    languages = Enum.map(rows, & &1.language)
+    names = Enum.map(rows, & &1.qualified_name)
+    patterns = Enum.map(names, &("%." <> escape_like(&1)))
+
+    from(e in Entity,
+      as: :entity,
+      join:
+        t in fragment(
+          "SELECT * FROM unnest(?::text[], ?::text[], ?::text[], ?::text[]) AS t(source_id, language, name, pattern)",
+          ^source_ids,
+          ^languages,
+          ^names,
+          ^patterns
+        ),
+      on:
+        e.language == t.language and e.source_id == fragment("?::uuid", t.source_id) and
+          (e.qualified_name == t.name or
+             fragment("? LIKE ? ESCAPE '\\'", e.qualified_name, t.pattern)),
+      where: exists(definition_mention_of(:entity)),
+      distinct: true,
+      select: %{
+        id: e.id,
+        source_id: e.source_id,
+        language: e.language,
+        qualified_name: e.qualified_name
+      },
+      order_by: [asc: e.id],
+      limit: @alias_limit
+    )
+    |> Repo.all()
+  end
+
+  defp definition_mention_of(binding) do
+    from(m in EntityMention,
+      where: m.entity_id == parent_as(^binding).id and m.kind == :definition,
+      select: 1
+    )
+  end
+
+  # "Payment.Processor.helper" -> all "."-delimited suffixes including itself.
+  defp name_suffixes(name) do
+    segments = String.split(name, ".")
+    for n <- length(segments)..1//-1, do: segments |> Enum.take(-n) |> Enum.join(".")
+  end
+
+  defp unzip3(triples) do
+    {Enum.map(triples, &elem(&1, 0)), Enum.map(triples, &elem(&1, 1)),
+     Enum.map(triples, &elem(&1, 2))}
   end
 
   defp rank(rows), do: Enum.sort_by(rows, &{-&1.weight, &1.entity_id})
