@@ -512,6 +512,87 @@ defmodule RetrievalNode.Ingest.FileIngestTest do
     refute is_nil(chunk_after.embedding)
   end
 
+  defp key_by_crumb(source, path) do
+    Map.new(chunks_for(source, path), fn c ->
+      {c.context_breadcrumb |> String.split(" > ") |> List.last(), c.chunk_key}
+    end)
+  end
+
+  describe "embedding reuse is keyed on content, not position" do
+    test "a chunk inserted upstream re-keys later chunks but they keep their vectors", %{
+      source: source
+    } do
+      natural_key = "repo:acme/app:insert.py"
+      v1 = [{"text a", "fn_a", 1, 1}, {"text b", "fn_b", 2, 2}, {"text c", "fn_c", 3, 3}]
+
+      force_chunk(chunk_result(v1))
+
+      assert {:ok, %{embedded: 3, reused: 0}} =
+               FileIngest.apply(seed_raw(source, "v1", natural_key, "insert.py"), [])
+
+      keys_before = key_by_crumb(source, "insert.py")
+      vectors_before = Map.new(~w(fn_a fn_b fn_c), &{&1, embedding_for(source, "insert.py", &1)})
+
+      force_chunk(chunk_result([{"text new", "fn_new", 1, 1} | v1]))
+
+      assert {:ok, summary} =
+               FileIngest.apply(seed_raw(source, "v2", natural_key, "insert.py"), [])
+
+      assert summary.embedded == 1
+      assert summary.reused == 3
+
+      keys_after = key_by_crumb(source, "insert.py")
+      assert keys_after["fn_b"] != keys_before["fn_b"]
+      assert keys_after["fn_c"] != keys_before["fn_c"]
+
+      for crumb <- ~w(fn_a fn_b fn_c) do
+        assert embedding_for(source, "insert.py", crumb) == vectors_before[crumb]
+      end
+
+      # Old rows under the stale keys were reconciled away — no duplicates.
+      assert length(chunks_for(source, "insert.py")) == 4
+    end
+
+    test "a chunk removed upstream leaves the remaining chunks reused", %{source: source} do
+      natural_key = "repo:acme/app:remove.py"
+      rest = [{"text b", "fn_b", 2, 2}, {"text c", "fn_c", 3, 3}]
+
+      force_chunk(chunk_result([{"text a", "fn_a", 1, 1} | rest]))
+
+      assert {:ok, %{embedded: 3}} =
+               FileIngest.apply(seed_raw(source, "v1", natural_key, "remove.py"), [])
+
+      force_chunk(chunk_result(rest))
+
+      assert {:ok, summary} =
+               FileIngest.apply(seed_raw(source, "v2", natural_key, "remove.py"), [])
+
+      assert summary.embedded == 0
+      assert summary.reused == 2
+      assert length(chunks_for(source, "remove.py")) == 2
+    end
+
+    test "same text under a different breadcrumb is re-embedded", %{source: source} do
+      natural_key = "repo:acme/app:rename.py"
+
+      force_chunk(chunk_result([{"same text", "fn_old", 1, 1}]))
+
+      assert {:ok, %{embedded: 1}} =
+               FileIngest.apply(seed_raw(source, "v1", natural_key, "rename.py"), [])
+
+      vector_before = embedding_for(source, "rename.py", "fn_old")
+
+      force_chunk(chunk_result([{"same text", "fn_new", 1, 1}]))
+
+      assert {:ok, summary} =
+               FileIngest.apply(seed_raw(source, "v2", natural_key, "rename.py"), [])
+
+      assert summary.embedded == 1
+      assert summary.reused == 0
+      refute embedding_for(source, "rename.py", "fn_new") == vector_before
+    end
+  end
+
   describe "unresolvable file identity" do
     test "a deletion entry with blank identity is rejected and its row survives", %{
       source: source

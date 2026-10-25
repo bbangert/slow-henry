@@ -39,7 +39,7 @@ defmodule RetrievalNode.Ingest.FileIngest do
 
     * `:force` (default `row.force`) — re-chunk even though the file's content
       hash is unchanged. Embeddings are still reused wherever
-      `(chunk_key, content_hash)` matches — see "Embedding reuse" below.
+      `(breadcrumb, content_hash)` matches — see "Embedding reuse" below.
     * `:on_parse_crash` (default `:error`) — `:heuristic` on a row's FINAL
       attempt (the caller decides "final"; this module has no attempt
       counter of its own).
@@ -278,6 +278,8 @@ defmodule RetrievalNode.Ingest.FileIngest do
   # It embeds the chunk's INDEX, so a boundary shift earlier in a file (a def
   # added/removed) re-keys every chunk after it — reconcile_file_chunks below
   # is what sheds the old rows under the stale keys once this batch commits.
+  # Embedding reuse is keyed on content, not chunk_key, so it survives the
+  # re-key.
   defp chunk_key(row, chunk, index) do
     :crypto.hash(:sha256, "#{row.natural_key}|#{index}|#{chunk.breadcrumb}")
     |> Base.encode16(case: :lower)
@@ -408,27 +410,20 @@ defmodule RetrievalNode.Ingest.FileIngest do
   end
 
   # Embedding reuse: load the file's EXISTING chunks (by file identity, not by
-  # this batch's keys — a boundary shift means a chunk at the same ordinal can
-  # have a different key than before) and reuse an embedding wherever a new
-  # entry's (chunk_key, content_hash) matches an existing row's exactly — same
-  # key AND same chunk text means the embedding is still correct. Everything
-  # else goes through Embedding.embed_batch/1 in ONE call. Reuse applies
-  # unconditionally (force or not) — the model is deterministic, so an
-  # unchanged chunk always re-embeds to the same vector; skipping the work
-  # instead is what makes a `force: true` re-derive cheap.
+  # this batch's keys) and reuse an embedding wherever a new entry's
+  # (breadcrumb, content_hash) matches an existing row's — together they fully
+  # determine the embedded text (embed_text/1), so the vector is identical.
+  # chunk_key (which embeds the chunk's index) plays no part: a chunk that only
+  # shifted position keeps its vector. Everything else goes through
+  # Embedding.embed_batch/1 in ONE call. Reuse applies unconditionally (force
+  # or not) — the model is deterministic, so an unchanged chunk always
+  # re-embeds to the same vector; skipping the work instead is what makes a
+  # `force: true` re-derive cheap.
   defp embed_with_reuse(row, built) do
     existing = load_existing_chunks(row)
 
     {reused_entries, to_embed} =
-      Enum.split_with(built, fn entry ->
-        case Map.get(existing, entry.chunk_key) do
-          # Reuse only when the text is unchanged AND the stored row actually
-          # HAS an embedding — Chunk.embedding is nullable, and reusing a nil
-          # would persist an unembedded chunk and skip embedding it.
-          %{content_hash: hash, embedding: emb} -> hash == entry.content_hash and not is_nil(emb)
-          nil -> false
-        end
-      end)
+      Enum.split_with(built, &Map.has_key?(existing, reuse_key(&1)))
 
     texts = Enum.map(to_embed, &embed_text/1)
     vectors = if texts == [], do: [], else: Embedding.embed_batch(texts)
@@ -447,12 +442,19 @@ defmodule RetrievalNode.Ingest.FileIngest do
 
     reused_by_key =
       Map.new(reused_entries, fn entry ->
-        {entry.chunk_key, Map.fetch!(existing, entry.chunk_key).embedding}
+        {entry.chunk_key, Map.fetch!(existing, reuse_key(entry))}
       end)
 
     {Map.merge(fresh_by_key, reused_by_key), length(to_embed), length(reused_entries)}
   end
 
+  defp reuse_key(entry), do: {entry.breadcrumb, entry.content_hash}
+
+  # {context_breadcrumb, content_hash} => embedding. Rows with a NULL embedding
+  # (Chunk.embedding is nullable) are excluded so one can never be reused —
+  # that would persist an unembedded chunk and skip embedding it. Two
+  # identical chunks in one file collide on the key harmlessly: identical
+  # input, identical vector, so either row's embedding is right.
   defp load_existing_chunks(row) do
     case Ingest.file_chunks_query(row.source_id, row.source_type, row.metadata) do
       nil ->
@@ -460,7 +462,8 @@ defmodule RetrievalNode.Ingest.FileIngest do
 
       query ->
         query
-        |> select([c], {c.chunk_key, %{content_hash: c.content_hash, embedding: c.embedding}})
+        |> where([c], not is_nil(c.embedding))
+        |> select([c], {{c.context_breadcrumb, c.content_hash}, c.embedding})
         |> Repo.all()
         |> Map.new()
     end

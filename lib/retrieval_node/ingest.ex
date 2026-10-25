@@ -79,7 +79,7 @@ defmodule RetrievalNode.Ingest do
   tagged `force: true`, and still advances the watermark to `HEAD`. This is how
   newly added graph extraction (entities/mentions/edges) backfills onto a corpus
   ingested before it existed; `FileIngest` reuses embeddings wherever
-  `(chunk_key, content_hash)` matches, so the re-derive is cheap.
+  `(breadcrumb, content_hash)` matches, so the re-derive is cheap.
 
   Only sources passing `Source.syncable?/1` (active, `policy: :allow`) are
   enqueued; inactive, denied and non-git sources are left alone.
