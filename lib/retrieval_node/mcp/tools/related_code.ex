@@ -18,11 +18,16 @@ defmodule RetrievalNode.MCP.Tools.RelatedCode do
     * `"imports"`     — entities the matched entities import, resolved the
       same way
 
-  Name matching is heuristic (no import resolution): a call recorded under a
-  bare name (`helper`) is attributed to EVERY same-source, same-language
-  definition whose qualified name ends in it (`A.helper`, `B.helper`), so
-  `callers` of either includes that call, and `callees`/`imports` of the bare
-  name use the definitions it resolves to.
+  Name matching is heuristic (no import resolution). A call recorded under a
+  bare name (`helper`) is a reference-only entity, attributed to EVERY
+  same-source, same-language definition whose qualified name ends in it
+  (`A.helper`, `B.helper`), so `callers` of either includes that call.
+  Precisely, the alias class of a definition is itself plus the reference-only
+  names that are suffixes of its name; the class of a reference-only name is
+  itself, the definitions it is a suffix of, and the other reference-only
+  names that are suffixes of those same definitions. `callers`/`importers`
+  traverse into a class; `callees`/`imports` start from its definitions. An
+  input's own class is never returned as its results.
 
   `hops: 2` extends `callers`/`callees`/`importers`/`imports` one edge
   further (transitive callers-of-callers, etc); `hops` is ignored for
