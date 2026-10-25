@@ -386,9 +386,9 @@ defmodule RetrievalNode.GraphReadTest do
 
       a = entity!(source, "a")
       b = entity!(source, "b")
-      os = entity!(source, "os")
+      os_id = entity!(source, "os").id
 
-      assert [%{entity: %{qualified_name: "os"}, weight: 1}] =
+      assert [%{entity: %{id: ^os_id}, weight: 1}] =
                Graph.related_entities([a.id, b.id], :imports)
 
       # mirror: two imported seeds sharing one importing definition
