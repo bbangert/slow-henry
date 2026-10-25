@@ -50,7 +50,7 @@ defmodule Mix.Tasks.Rn.Bench do
 
   use Mix.Task
 
-  alias RetrievalNode.Bench.Runner
+  alias RetrievalNode.Bench.{RerankEval, Runner}
 
   # run/1 ends in System.halt/1 (ensure_all_started boots the full supervision
   # tree, which would otherwise keep the VM alive after the report prints), so
@@ -59,12 +59,27 @@ defmodule Mix.Tasks.Rn.Bench do
   @impl Mix.Task
   def run(args) do
     Mix.Task.run("app.config")
+    # This task is routinely pointed at the dev database while the dev server
+    # is running. Booting the full tree with Oban's queues/plugins or ingest
+    # owners would make this VM a second writer (Oban's notifier is
+    # cluster-wide over the shared DB), so neither is started; the endpoint
+    # does not bind a port without PHX_SERVER. Only Repo, Search and the
+    # embedding/reranking servings are needed.
+    Application.put_env(
+      :retrieval_node,
+      Oban,
+      admin_oban_config(Application.get_env(:retrieval_node, Oban, []))
+    )
+
+    Application.put_env(:retrieval_node, :ingest_resume_on_boot, false)
     {:ok, _} = Application.ensure_all_started(:retrieval_node)
 
     {opts, _rest} =
       OptionParser.parse!(args,
         strict: [queries: :string, top_k: :integer, skip_embed_probe: :boolean]
       )
+
+    await_readiness(System.monotonic_time(:millisecond))
 
     run_opts =
       [
@@ -88,6 +103,38 @@ defmodule Mix.Tasks.Rn.Bench do
     # halt, `mix rn.bench` would hang after printing (a script/CI invocation
     # would need to be killed rather than exiting on its own).
     System.halt(0)
+  end
+
+  @doc false
+  # Oban config for a VM that may insert jobs but must never run or schedule
+  # any: no queues, no plugins (Cron/Pruner/Lifeline), and no peer, so it can't
+  # take leadership from the dev node's plugins. `queues: []` (not `false`)
+  # is what `Ingest.Supervisor.running_ingest_queues?/0` reads as "not an
+  # ingest VM".
+  @spec admin_oban_config(keyword()) :: keyword()
+  def admin_oban_config(oban_config) do
+    Keyword.merge(oban_config, queues: [], plugins: [], peer: false)
+  end
+
+  # A fresh VM boots with cold servings (model load + JIT), and the runner
+  # reports SKIPPED rather than waiting, so poll for readiness first.
+  @poll_interval_ms 1_000
+  @poll_timeout_ms 180_000
+
+  defp await_readiness(started_at) do
+    ready? = Runner.embedding_ready?() and RerankEval.reranking_ready?()
+
+    cond do
+      ready? ->
+        :ok
+
+      System.monotonic_time(:millisecond) - started_at > @poll_timeout_ms ->
+        :ok
+
+      true ->
+        Process.sleep(@poll_interval_ms)
+        await_readiness(started_at)
+    end
   end
 
   # -- Quality: nDCG@10 + latency percentiles --------------------------------
@@ -120,6 +167,12 @@ defmodule Mix.Tasks.Rn.Bench do
         format_num(q.mean_ndcg_at_k) <> unresolved_note
       ),
       row(
+        "nDCG@10 (mean over ALL, unresolvable = 0, n=#{q.queries_total})",
+        "INFO",
+        "comparable across corpora",
+        format_num(q.mean_ndcg_all)
+      ),
+      row(
         "Query latency p50/p95/p99",
         p99_status,
         "p99 <= 300 ms",
@@ -127,6 +180,29 @@ defmodule Mix.Tasks.Rn.Bench do
           "#{format_num(q.latency_ms_percentiles[95])} / #{format_num(p99)} ms"
       )
     ])
+
+    print_per_query(q.per_query)
+  end
+
+  # One line per query: index, nDCG (or "-" when no corpus chunk matches its
+  # matchers), rank of the first relevant hit in the top-k, and the query text.
+  defp print_per_query(per_query) do
+    Mix.shell().info("\n  #    nDCG   rank  query")
+
+    per_query
+    |> Enum.with_index(1)
+    |> Enum.each(fn {q, i} ->
+      ndcg = if q.resolvable, do: format_num(q.ndcg), else: "-"
+      rank = if q.best_rank, do: Integer.to_string(q.best_rank), else: "-"
+
+      Mix.shell().info(
+        "  #{String.pad_leading(Integer.to_string(i), 2)}  " <>
+          "#{String.pad_leading(ndcg, 6)}  #{String.pad_leading(rank, 4)}  " <>
+          String.slice(q.query, 0, 70)
+      )
+    end)
+
+    Mix.shell().info("")
   end
 
   # -- Embed throughput + RAM --------------------------------------------------

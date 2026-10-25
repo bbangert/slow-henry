@@ -204,6 +204,7 @@ defmodule RetrievalNode.Bench.Runner do
       queries_resolved: length(scored),
       queries_unresolved: length(per_query) - length(scored),
       mean_ndcg_at_k: mean(Enum.map(scored, & &1.ndcg)),
+      mean_ndcg_all: mean_ndcg_all(per_query),
       latency_ms_percentiles: Metrics.percentiles(latencies, [50, 95, 99]),
       per_query: per_query
     }
@@ -213,7 +214,14 @@ defmodule RetrievalNode.Bench.Runner do
     relevant_ids = resolve_relevant_ids(q["relevant"])
 
     if MapSet.size(relevant_ids) == 0 do
-      %{query: text, note: q["note"], resolvable: false, ndcg: nil, latency_ms: nil}
+      %{
+        query: text,
+        note: q["note"],
+        resolvable: false,
+        ndcg: nil,
+        best_rank: nil,
+        latency_ms: nil
+      }
     else
       {elapsed_us, hits} = :timer.tc(fn -> Search.hybrid_search(text, top_k: top_k) end)
       ranked_ids = Enum.map(hits, & &1.chunk.id)
@@ -224,10 +232,29 @@ defmodule RetrievalNode.Bench.Runner do
         note: q["note"],
         resolvable: true,
         ndcg: ndcg,
+        best_rank: best_rank(ranked_ids, relevant_ids),
         latency_ms: elapsed_us / 1000
       }
     end
   end
+
+  @doc """
+  1-based rank of the first relevant id in `ranked_ids`, or nil if none.
+  """
+  @spec best_rank([term()], MapSet.t()) :: pos_integer() | nil
+  def best_rank(ranked_ids, relevant_ids) do
+    case Enum.find_index(ranked_ids, &MapSet.member?(relevant_ids, &1)) do
+      nil -> nil
+      idx -> idx + 1
+    end
+  end
+
+  @doc """
+  Mean nDCG over every query, counting unresolvable queries (`ndcg: nil`) as 0,
+  so runs over a corpus that gains coverage stay comparable. nil when empty.
+  """
+  @spec mean_ndcg_all([%{ndcg: float() | nil}]) :: float() | nil
+  def mean_ndcg_all(per_query), do: mean(Enum.map(per_query, &(&1.ndcg || 0.0)))
 
   defp mean([]), do: nil
   defp mean(values), do: Enum.sum(values) / length(values)

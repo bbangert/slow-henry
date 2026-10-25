@@ -43,6 +43,18 @@ defmodule RetrievalNode.Bench.RunnerTest do
     path
   end
 
+  describe "best_rank/2 and mean_ndcg_all/1" do
+    test "best_rank is the 1-based first relevant position, nil when absent" do
+      assert Runner.best_rank([:a, :b, :c], MapSet.new([:c, :b])) == 2
+      assert Runner.best_rank([:a], MapSet.new([:z])) == nil
+    end
+
+    test "mean_ndcg_all counts unresolvable queries as zero" do
+      assert Runner.mean_ndcg_all([%{ndcg: 1.0}, %{ndcg: nil}]) == 0.5
+      assert Runner.mean_ndcg_all([]) == nil
+    end
+  end
+
   describe "load_queries!/1" do
     test "parses a valid JSONL file into a list of maps" do
       path =
@@ -52,6 +64,13 @@ defmodule RetrievalNode.Bench.RunnerTest do
 
       assert [%{"query" => "where is X", "relevant" => [%{"repo" => "r"}]}] =
                Runner.load_queries!(path)
+    end
+
+    test "the shipped query sets load and validate" do
+      for file <- ["queries.jsonl", "toplevel_queries.jsonl"] do
+        queries = Runner.load_queries!(Path.join(["priv", "bench", file]))
+        assert queries != [], file
+      end
     end
 
     test "raises when a query is missing required keys" do
