@@ -351,6 +351,54 @@ defmodule RetrievalNode.GraphReadTest do
       assert found.id == os.id
     end
 
+    test "a scoped import on a shared chunk is attributed only to its importing definition", %{
+      source: source
+    } do
+      # A and B share a chunk; only B imports X (scoped, so it writes an
+      # :imports edge AND an :import mention).
+      ingest(source, [{"c1", [def_("a"), def_("b")], [import_("x", "b")], []}])
+
+      a = entity!(source, "a")
+      b = entity!(source, "b")
+      x = entity!(source, "x")
+
+      assert [%{entity: found}] = Graph.related_entities([x.id], :importers)
+      assert found.id == b.id
+      assert [%{entity: found}] = Graph.related_entities([b.id], :imports)
+      assert found.id == x.id
+      assert Graph.related_entities([a.id], :imports) == []
+    end
+
+    test "a file-level import is still found next to a scoped import on the same chunk", %{
+      source: source
+    } do
+      ingest(source, [{"c1", [def_("a"), def_("b")], [import_("os"), import_("x", "b")], []}])
+
+      os = entity!(source, "os")
+      names = Graph.related_entities([os.id], :importers) |> Enum.map(& &1.entity.qualified_name)
+      assert Enum.sort(names) == ["a", "b"]
+    end
+
+    test "mention-leg weight is per (seed, result) pair, never summed across seeds", %{
+      source: source
+    } do
+      ingest(source, [{"c1", [def_("a"), def_("b")], [import_("os")], []}])
+
+      a = entity!(source, "a")
+      b = entity!(source, "b")
+      os = entity!(source, "os")
+
+      assert [%{entity: %{qualified_name: "os"}, weight: 1}] =
+               Graph.related_entities([a.id, b.id], :imports)
+
+      # mirror: two imported seeds sharing one importing definition
+      ingest(source, [{"c2", [def_("d")], [import_("m1"), import_("m2")], []}])
+      seeds = [entity!(source, "m1").id, entity!(source, "m2").id]
+
+      assert [%{entity: %{qualified_name: "d"}, weight: 1}] =
+               Graph.related_entities(seeds, :importers)
+    end
+
     test "a file-level import through the real FileIngest pipeline resolves both ways" do
       prev = Application.get_env(:retrieval_node, :chunking_impl)
       Application.put_env(:retrieval_node, :chunking_impl, FakeImpl)
@@ -455,6 +503,17 @@ defmodule RetrievalNode.GraphReadTest do
       assert snippet_for(source, "exact_chars", thousand).snippet == thousand
 
       assert snippet_for(source, "one_over", thousand <> "y").snippet == thousand <> "…"
+    end
+
+    test "decomposed (combining-character) text is cut on code points and marked", %{
+      source: source
+    } do
+      content = String.duplicate("e\u0301", 600)
+      snippet = snippet_for(source, "combining", content)
+
+      assert String.ends_with?(snippet.snippet, "…")
+      assert snippet.snippet == String.slice(content, 0, 500) <> "…"
+      assert snippet.snippet != content
     end
 
     test "a huge chunk yields a bounded snippet", %{source: source} do

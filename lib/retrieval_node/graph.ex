@@ -419,6 +419,14 @@ defmodule RetrievalNode.Graph do
        chunks' `:import` mentions). Weight is the count of qualifying import
        mentions.
 
+  The mention leg counts only import mentions that no `:imports` edge on the
+  same chunk explains (a scoped import writes both an edge and a mention; the
+  edge leg already attributes it). Mentions are unique per (entity, chunk,
+  kind), so a chunk holding both a file-level and a scoped import of the same
+  entity cannot be told apart: that mention is treated as explained, and only
+  the scoped importer is reported. Mention-leg weight is per (seed, result)
+  pair; pairs combine across seeds by max, not sum.
+
   `hops: 2` repeats the same resolution (both legs, for imports/importers)
   starting from the first hop's entities, unions the two hops, and dedups by
   entity — an entity reached at hop 1 is excluded from the hop-2 set (so it
@@ -554,15 +562,19 @@ defmodule RetrievalNode.Graph do
 
   # Mention-based leg of :importers (see related_entities/3): the :definition
   # mentions on chunks carrying an :import mention of one of `ids`. Weight is
-  # the count of qualifying import mentions. Bounded like edges_query/4.
+  # per (seed, importer) pair — the count of qualifying import mentions — and
+  # pairs are combined across seeds by dedup_max_weight/1, never summed.
+  # Bounded like edges_query/4.
   defp importers_by_mention(ids) do
     from(m in EntityMention,
+      as: :imp,
       join: d in EntityMention,
       on: d.chunk_id == m.chunk_id and d.kind == :definition,
       where: m.kind == :import and m.entity_id in ^ids and d.entity_id not in ^ids,
-      group_by: d.entity_id,
+      where: not exists(import_edge_on_chunk(:imp)),
+      group_by: [m.entity_id, d.entity_id],
       select: %{entity_id: d.entity_id, weight: count(m.id)},
-      order_by: [desc: count(m.id), asc: d.entity_id],
+      order_by: [desc: count(m.id), asc: d.entity_id, asc: m.entity_id],
       limit: @edge_fanout_limit
     )
     |> Repo.all()
@@ -572,14 +584,30 @@ defmodule RetrievalNode.Graph do
   defp imports_by_mention(ids) do
     from(m in EntityMention,
       join: i in EntityMention,
+      as: :imp,
       on: i.chunk_id == m.chunk_id and i.kind == :import,
       where: m.kind == :definition and m.entity_id in ^ids and i.entity_id not in ^ids,
-      group_by: i.entity_id,
+      where: not exists(import_edge_on_chunk(:imp)),
+      group_by: [m.entity_id, i.entity_id],
       select: %{entity_id: i.entity_id, weight: count(i.id)},
-      order_by: [desc: count(i.id), asc: i.entity_id],
+      order_by: [desc: count(i.id), asc: i.entity_id, asc: m.entity_id],
       limit: @edge_fanout_limit
     )
     |> Repo.all()
+  end
+
+  # An :import mention that an :imports edge on the same chunk explains: a
+  # scoped import (reference with a `from`) writes both, and the edge leg
+  # already attributes it to the right definition. The mention leg must only
+  # count what no edge explains (file-level imports), or every other
+  # definition sharing the chunk would be misreported.
+  defp import_edge_on_chunk(binding) do
+    from(e in EntityEdge,
+      where:
+        e.kind == :imports and e.target_entity_id == parent_as(^binding).entity_id and
+          e.chunk_id == parent_as(^binding).chunk_id,
+      select: 1
+    )
   end
 
   defp load_entities([]), do: %{}
@@ -599,10 +627,10 @@ defmodule RetrievalNode.Graph do
   so the cut is deterministic.
 
   Each snippet is the defining chunk's `content` truncated to whichever of
-  #{@snippet_max_lines} lines or #{@snippet_max_chars} chars cuts first
-  (line cut applied before the char cut), with a trailing "…" marker when
-  either cut actually truncated the content. The prefix is cut in SQL so a
-  large chunk's full content never reaches the BEAM.
+  #{@snippet_max_lines} lines or #{@snippet_max_chars} code points cuts
+  first, with a trailing "…" marker exactly when the snippet differs from the
+  stored content. The code-point cut happens in SQL so a large chunk's full
+  content never reaches the BEAM; the line cut is applied to that prefix.
   """
   @spec definition_snippets([Ecto.UUID.t()], keyword()) :: [map()]
   def definition_snippets(entity_ids, opts \\ [])
@@ -611,9 +639,7 @@ defmodule RetrievalNode.Graph do
 
   def definition_snippets(entity_ids, opts) when is_list(entity_ids) do
     limit = opts |> Keyword.get(:limit, @definition_snippets_limit) |> clamp_snippet_limit()
-    # One char past the cap, so truncate_snippet/1 can tell "exactly at the
-    # cap" from "longer than it".
-    prefix_chars = @snippet_max_chars + 1
+    max_chars = @snippet_max_chars
 
     from(m in EntityMention,
       join: c in Chunk,
@@ -626,7 +652,8 @@ defmodule RetrievalNode.Graph do
         lang: c.lang,
         path: fragment("?->>'path'", c.metadata),
         breadcrumb: c.context_breadcrumb,
-        content: fragment("left(?, ?)", c.content, ^prefix_chars)
+        content: fragment("left(?, ?)", c.content, ^max_chars),
+        char_truncated?: fragment("char_length(?) > ?", c.content, ^max_chars)
       },
       limit: ^limit
     )
@@ -644,25 +671,16 @@ defmodule RetrievalNode.Graph do
       lang: row.lang,
       path: row.path,
       breadcrumb: row.breadcrumb,
-      snippet: truncate_snippet(row.content || "")
+      snippet: truncate_snippet(row.content || "", row.char_truncated?)
     }
   end
 
-  defp truncate_snippet(content) do
-    lines = String.split(content, "\n")
+  defp truncate_snippet(prefix, char_truncated?) do
+    lines = String.split(prefix, "\n")
     line_capped? = length(lines) > @snippet_max_lines
     by_lines = lines |> Enum.take(@snippet_max_lines) |> Enum.join("\n")
 
-    cond do
-      String.length(by_lines) > @snippet_max_chars ->
-        String.slice(by_lines, 0, @snippet_max_chars) <> "…"
-
-      line_capped? ->
-        by_lines <> "…"
-
-      true ->
-        by_lines
-    end
+    if char_truncated? or line_capped?, do: by_lines <> "…", else: by_lines
   end
 
   # --- staged-graph sanitation --------------------------------------------
