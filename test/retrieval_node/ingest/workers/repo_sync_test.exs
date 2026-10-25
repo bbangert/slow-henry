@@ -550,7 +550,6 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
       assert text =~ ~s(test "pays the order")
       assert text =~ "use ExUnit.Case"
 
-      # Heuristic text chunks are stored as such, not as AST-derived.
       statuses =
         Repo.all(
           from c in Chunk,
@@ -559,7 +558,7 @@ defmodule RetrievalNode.Ingest.Workers.RepoSyncTest do
             select: c.parse_status
         )
 
-      assert statuses == [:heuristic_fallback]
+      assert statuses == [:ok]
 
       names =
         Repo.all(

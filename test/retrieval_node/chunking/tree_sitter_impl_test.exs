@@ -6,8 +6,9 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
   # rather than splitting it out, to keep this file simple.
   use ExUnit.Case, async: false
 
-  alias RetrievalNode.Chunking.HeuristicImpl
   alias RetrievalNode.Chunking.TreeSitterImpl, as: TSI
+
+  defp definitions(chunks), do: Enum.reject(chunks, &(&1.kind == "toplevel"))
 
   describe "pre-flight guards (NIF-free — reject before reaching the parser)" do
     test "rejects a file over the size cap" do
@@ -23,10 +24,9 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
       assert {:error, :unsupported_language} = TSI.chunk("x = 1", "cobol")
     end
 
-    test "allowed_languages/0 is the AST-chunked set; elixir is graph-only" do
+    test "allowed_languages/0 is the mainstream code set plus elixir" do
       assert "python" in TSI.allowed_languages()
-      refute "elixir" in TSI.allowed_languages()
-      assert {:error, :unsupported_language} = TSI.chunk("def a, do: 1", "elixir")
+      assert "elixir" in TSI.allowed_languages()
     end
   end
 
@@ -86,7 +86,8 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
       src = "class A:\n    def one(self):\n        pass\n    def two(self):\n        pass\n"
       {:ok, chunks} = TSI.chunk(src, "python")
 
-      assert Enum.map(chunks, & &1.breadcrumb) |> Enum.sort() == ["A > one", "A > two"]
+      assert chunks |> definitions() |> Enum.map(& &1.breadcrumb) |> Enum.sort() ==
+               ["A > one", "A > two"]
     end
 
     test "chunks javascript functions and class methods" do
@@ -100,34 +101,115 @@ defmodule RetrievalNode.Chunking.TreeSitterImplTest do
     end
   end
 
-  describe "chunk_with_graph/2: elixir (graph-only)" do
+  describe "real AST chunking: elixir" do
     @describetag :tree_sitter
 
-    test "returns heuristic chunks covering the whole file plus the extracted graph" do
+    test "chunks def/defp/defmacro/defdelegate at module-scoped boundaries" do
+      src = """
+      defmodule Payment.Processor do
+        def process(order) do
+          helper(order)
+        end
+
+        defp helper(o), do: o
+
+        defmacro mymacro(x) do
+          quote do
+            unquote(x)
+          end
+        end
+
+        defdelegate size(list), to: Enum, as: :count
+      end
+      """
+
+      {:ok, chunks} = TSI.chunk(src, "elixir")
+
+      crumbs = Enum.map(chunks, & &1.breadcrumb)
+      assert "Payment.Processor > process" in crumbs
+      assert "Payment.Processor > helper" in crumbs
+      assert "Payment.Processor > mymacro" in crumbs
+      assert "Payment.Processor > size" in crumbs
+      assert Enum.all?(chunks, &(&1.parse_status == :ok))
+    end
+
+    test "names guard clauses and zero-arity no-paren defs, and nests modules" do
+      src = """
+      defmodule Outer do
+        defmodule Inner do
+          def zero, do: 0
+          def guarded(x) when is_integer(x), do: x
+        end
+      end
+      """
+
+      {:ok, chunks} = TSI.chunk(src, "elixir")
+
+      assert chunks |> definitions() |> Enum.map(& &1.breadcrumb) |> Enum.sort() ==
+               ["Outer > Inner > guarded", "Outer > Inner > zero"]
+    end
+
+    test "canonicalises Elixir.-rooted module names and names defimpl by its protocol" do
+      src = """
+      defmodule Elixir.Rooted do
+        def a, do: 1
+      end
+
+      defimpl Sized, for: Thing do
+        def size(_), do: 0
+      end
+      """
+
+      {:ok, chunks} = TSI.chunk(src, "elixir")
+
+      crumbs = Enum.map(chunks, & &1.breadcrumb)
+      assert "Rooted > a" in crumbs
+      assert "Sized > size" in crumbs
+    end
+
+    test "a rooted Elixir. module nested in another resets the breadcrumb scope, as the extractor does" do
+      src = """
+      defmodule Outer do
+        defmodule Elixir.Shared do
+          def s, do: 1
+        end
+
+        def o, do: 2
+      end
+      """
+
+      assert {:ok, %{chunks: chunks, entities: entities}} =
+               TSI.chunk_with_graph(src, "elixir")
+
+      crumbs = Enum.map(chunks, & &1.breadcrumb)
+      assert "Shared > s" in crumbs
+      assert "Outer > o" in crumbs
+      refute "Outer > Shared > s" in crumbs
+      assert Enum.any?(entities, &(&1.qualified_name == "Shared.s"))
+    end
+
+    test "a module-less top-level def (script) still chunks" do
+      {:ok, chunks} = TSI.chunk("def top(x) do\n  x + 1\nend\n", "elixir")
+
+      assert chunks |> definitions() |> Enum.map(& &1.breadcrumb) == ["top"]
+    end
+
+    test "chunk_with_graph/2 yields the same chunks plus entities and call references" do
       src = """
       defmodule Pay do
-        @moduledoc "Pays."
-
         def run(x), do: helper(x)
         defp helper(x), do: x
       end
-
-      IO.puts("done")
       """
 
-      {:ok, heuristic} = HeuristicImpl.chunk(src, "elixir")
+      {:ok, chunks} = TSI.chunk(src, "elixir")
 
-      assert {:ok, %{chunks: ^heuristic, entities: entities, references: references}} =
+      assert {:ok, %{chunks: ^chunks, entities: entities, references: references}} =
                TSI.chunk_with_graph(src, "elixir")
 
       assert Enum.any?(entities, &(&1.qualified_name == "Pay" and &1.kind == :module))
       assert Enum.any?(entities, &(&1.qualified_name == "Pay.run" and &1.kind == :function))
       assert Enum.any?(references, &(&1.kind == :call and &1.name == "helper"))
-      assert Enum.map_join(heuristic, "\n", & &1.text) =~ "IO.puts(\"done\")"
-    end
-
-    test "keeps the size and binary guards" do
-      assert {:error, :binary_content} = TSI.chunk_with_graph("ok\x00bad", "elixir")
     end
   end
 

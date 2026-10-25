@@ -323,15 +323,29 @@ defmodule RetrievalNode.Ingest.GraphIngestTest do
       assert mentioned == ["helper", "other"]
     end
 
-    test "a file with no definition boundaries still indexes (heuristic chunks) and keeps its import",
+    test "a file with no definition boundaries is indexed as ok toplevel chunks with its import",
          %{source: source} do
       raw = seed_raw(source, "import os\nX = 1\n", "consts.py")
 
       assert {:ok, %{action: :indexed}} = FileIngest.apply(raw, [])
 
       [chunk] = chunks_for(source, "consts.py")
-      assert chunk.parse_status == :heuristic_fallback
+      assert chunk.parse_status == :ok
       assert mention_pairs(chunk) == MapSet.new([{"os", :import}])
+    end
+
+    test "a top-level import is attached to its toplevel chunk, not chunk 0", %{source: source} do
+      src = "def first():\n    return 1\n\nimport os\n\ndef second():\n    return os\n"
+      raw = seed_raw(source, src, "mid.py")
+
+      assert {:ok, %{action: :indexed}} = FileIngest.apply(raw, [])
+
+      chunks = chunks_for(source, "mid.py")
+      import_chunk = Enum.find(chunks, &(&1.content == "import os"))
+      first_chunk = Enum.find(chunks, &(&1.content =~ "def first"))
+
+      assert {"os", :import} in mention_pairs(import_chunk)
+      refute {"os", :import} in mention_pairs(first_chunk)
     end
 
     test "a whitespace-only file still yields no chunks", %{source: source} do

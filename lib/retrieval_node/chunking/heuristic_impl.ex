@@ -26,6 +26,14 @@ defmodule RetrievalNode.Chunking.HeuristicImpl do
   # yields one chunk — bounded by the upstream 2MB file cap in TreeSitterImpl.)
   @hard_max_bytes 6_000
 
+  @doc "Soft target chunk size in bytes; also the gap splitter's soft cap in `TreeSitterImpl`."
+  @spec max_chunk_bytes() :: pos_integer()
+  def max_chunk_bytes, do: @max_chunk_bytes
+
+  @doc "Hard ceiling in bytes (a single line may still exceed it)."
+  @spec hard_max_bytes() :: pos_integer()
+  def hard_max_bytes, do: @hard_max_bytes
+
   @impl true
   def allowed_languages, do: TreeSitterImpl.allowed_languages()
 

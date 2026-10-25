@@ -168,11 +168,11 @@ defmodule RetrievalNode.Ingest.FileIngest do
 
   defp chunk_and_index(row, content, opts, on_parse_crash) do
     case Chunking.chunk_with_graph(content, row.lang || "") do
+      # Tree-sitter chunking covers every non-whitespace byte, so zero chunks
+      # means whitespace-only content.
       {:ok, %{chunks: [], entities: entities, references: references}} ->
-        chunk_boundaryless(row, content, opts, entities, references)
+        finalize(row, [], "ok", opts, entities, references)
 
-      # The stored parse_status is the chunks' own: tree-sitter chunks are :ok,
-      # a graph-only language's heuristic chunks stay :heuristic_fallback.
       {:ok, %{chunks: chunks, entities: entities, references: references}} ->
         finalize(row, chunks, chunks_parse_status(chunks), opts, entities, references)
 
@@ -188,20 +188,6 @@ defmodule RetrievalNode.Ingest.FileIngest do
         else
           {:error, err}
         end
-    end
-  end
-
-  # A parse with no definition boundaries (e.g. an import-only python file)
-  # yields zero chunks. Non-blank content is still indexed via the heuristic
-  # chunker — so its text is searchable and its graph has chunks to attach to —
-  # and is marked "heuristic_fallback" because those chunks are not AST-derived.
-  # Whitespace-only content keeps producing no chunks.
-  defp chunk_boundaryless(row, content, opts, entities, references) do
-    if String.trim(content) == "" do
-      finalize(row, [], "ok", opts, entities, references)
-    else
-      {:ok, chunks} = HeuristicImpl.chunk(content, row.lang || "")
-      finalize(row, chunks, "heuristic_fallback", opts, entities, references)
     end
   end
 
@@ -289,11 +275,11 @@ defmodule RetrievalNode.Ingest.FileIngest do
 
   # Assigns each entity/reference to the chunk containing it: by byte range when
   # both the item and the chunk carry byte positions (disambiguates several
-  # definitions on one line), else by start_line..end_line; items matching no
-  # chunk (typically a top-level import sitting between two defs) attach to the
-  # FIRST chunk of the file rather than being dropped — imports are file-level
-  # signal and losing them would gut the imports leg of the graph. Chunks with
-  # no graph items get `nil`.
+  # definitions on one line), else by start_line..end_line. Tree-sitter chunks
+  # cover every non-whitespace byte, so a top-level import lands in its
+  # toplevel chunk; the fallback of attaching items matching no chunk to the
+  # FIRST chunk (rather than dropping them) only applies to chunks without byte
+  # positions (heuristic chunks). Chunks with no graph items get `nil`.
   @doc false
   def attach_graphs(chunks, entities, references) do
     index = build_chunk_index(chunks)
