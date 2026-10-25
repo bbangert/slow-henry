@@ -183,6 +183,45 @@ defmodule RetrievalNode.GraphReadTest do
     end
   end
 
+  describe "find_entities/2 defined_only" do
+    # A reference-only entity (no :definition mention) is what the write path
+    # creates for a call/import name it never saw defined.
+    test "excludes reference-only entities in the exact tier" do
+      a = source_fixture()
+      b = source_fixture()
+      ingest(a, [{"c1", [def_("tier_x")], [], []}])
+      ingest(b, [{"c2", [def_("caller")], [call("tier_x", "caller")], []}])
+
+      assert length(Graph.find_entities("tier_x")) == 2
+      assert [found] = Graph.find_entities("tier_x", defined_only: true)
+      assert found.source_id == a.id
+    end
+
+    test "falls through to the suffix tier past a reference-only exact match", %{source: source} do
+      ingest(source, [
+        {"c1", [def_("Pay.Processor.helper"), def_("caller")], [call("helper", "caller")], []}
+      ])
+
+      assert [%{qualified_name: "helper"}] = Graph.find_entities("helper")
+      assert [found] = Graph.find_entities("helper", defined_only: true)
+      assert found.qualified_name == "Pay.Processor.helper"
+    end
+
+    test "applies to the trigram tier too", %{source: source} do
+      ingest(source, [
+        {"c1", [def_("process_payment_now"), def_("caller")],
+         [call("process_payment_nowx", "caller")], []}
+      ])
+
+      names = fn opts ->
+        "process_paymnet_now" |> Graph.find_entities(opts) |> Enum.map(& &1.qualified_name)
+      end
+
+      assert "process_payment_nowx" in names.([])
+      assert names.(defined_only: true) == ["process_payment_now"]
+    end
+  end
+
   describe "related_entities/3" do
     test "callers: 1-hop, ordered by weight desc (weights aggregate repeated calls)", %{
       source: source
@@ -254,6 +293,62 @@ defmodule RetrievalNode.GraphReadTest do
 
       assert [%{entity: %{qualified_name: "caller_a"}}] =
                Graph.related_entities([entity!(source_a, "util").id], :callers, 2)
+    end
+
+    # Seen-entity rows must not consume the per-query fan-out slots. Built with
+    # insert_all (not the write path) because exceeding @edge_fanout_limit (500)
+    # via ingest would take 500+ distinct reference pairs; the limit is a
+    # module attribute with no test seam.
+    defp insert_calls(pairs) do
+      now = DateTime.utc_now()
+
+      rows =
+        for {from, to, weight} <- pairs do
+          %{
+            source_entity_id: from,
+            target_entity_id: to,
+            kind: :calls,
+            weight: weight,
+            inserted_at: now,
+            updated_at: now
+          }
+        end
+
+      for batch <- Enum.chunk_every(rows, 1_000), do: Repo.insert_all(EntityEdge, batch)
+    end
+
+    defp dense_cluster(source, prefix, n) do
+      ingest(source, [{"#{prefix}", for(i <- 1..n, do: def_("#{prefix}#{i}")), [], []}])
+      for i <- 1..n, do: entity!(source, "#{prefix}#{i}").id
+    end
+
+    test "hop 1: edges among the seeds (more than the fan-out limit) don't hide a new entity",
+         %{source: source} do
+      seeds = dense_cluster(source, "s", 30)
+      ingest(source, [{"n", [def_("fresh")], [], []}])
+      fresh = entity!(source, "fresh").id
+
+      # 30x30 = 900 seed->seed pairs (incl. self-loops), all heavier than the
+      # one edge to the new entity.
+      insert_calls(for(a <- seeds, b <- seeds, do: {a, b, 10}) ++ [{hd(seeds), fresh, 1}])
+
+      assert [%{entity: %{id: ^fresh}, hop: 1}] = Graph.related_entities(seeds, :callees, 1)
+    end
+
+    test "hop 2: edges among seen entities (more than the fan-out limit) don't hide a new one",
+         %{source: source} do
+      [seed | rest] = dense_cluster(source, "h", 31)
+      ingest(source, [{"n", [def_("fresh")], [], []}])
+      fresh = entity!(source, "fresh").id
+
+      insert_calls(
+        for(h <- rest, do: {seed, h, 5}) ++
+          for(a <- rest, b <- rest, do: {a, b, 10}) ++
+          for(h <- rest, do: {h, seed, 10}) ++ [{hd(rest), fresh, 1}]
+      )
+
+      results = Graph.related_entities([seed], :callees, 2)
+      assert %{hop: 2} = Enum.find(results, &(&1.entity.id == fresh))
     end
 
     test "results are capped at 50 and the cut is deterministic", %{source: source} do

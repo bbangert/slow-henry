@@ -265,6 +265,24 @@ defmodule RetrievalNode.MCP.ToolsTest do
       assert imported["qualified_name"] == "os"
     end
 
+    test "definitions skips a reference-only entity of the same bare name; callers still work" do
+      source = graph_source("ref")
+
+      index_graph(source, [
+        {graph_chunk(source, "p.py", "def helper(): pass"),
+         [def_("Payment.Processor.helper"), def_("run")], [call("helper", "run")]}
+      ])
+
+      assert %{"entities" => [found], "definitions" => [snippet]} =
+               ok(RelatedCode, %{entity: "helper"})
+
+      assert found["qualified_name"] == "Payment.Processor.helper"
+      assert snippet["snippet"] == "def helper(): pass"
+
+      assert %{"entities" => [%{"qualified_name" => "run"}]} =
+               ok(RelatedCode, %{entity: "helper", relation: "callers"})
+    end
+
     test "an invalid relation is rejected with a listing of valid values" do
       msg = err(RelatedCode, %{entity: "x", relation: "bogus"})
       assert msg =~ "unknown relation"

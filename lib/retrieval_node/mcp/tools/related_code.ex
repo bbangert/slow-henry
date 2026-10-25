@@ -101,9 +101,12 @@ defmodule RetrievalNode.MCP.Tools.RelatedCode do
   defp validate_text(name, _value), do: {:error, "#{name} must be a string"}
 
   defp run(entity, relation, hops, params, frame) do
+    # Only `definitions` needs a definition site; traversal relations keep
+    # reference-only entities because call/import edges target them.
     find_opts =
       [repo: Map.get(params, :repo), lang: Map.get(params, :lang)]
       |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+      |> Keyword.put(:defined_only, relation == :definitions)
 
     case Graph.find_entities(entity, find_opts) do
       [] ->

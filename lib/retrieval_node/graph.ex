@@ -260,7 +260,7 @@ defmodule RetrievalNode.Graph do
   # is a bind parameter per call, and every id fans out into its own edges.
   @max_seed_ids 100
 
-  # Bounds a single edges_query/4 traversal — hot symbols (e.g. `init`,
+  # Bounds a single edges_query/5 traversal — hot symbols (e.g. `init`,
   # `get`) can have six-figure in-degree in a many-repo corpus, and an
   # uncapped query would load every one of those edges into BEAM heap.
   @edge_fanout_limit 500
@@ -292,6 +292,10 @@ defmodule RetrievalNode.Graph do
   mention on a chunk tagged with that repo?) rather than a direct column
   filter.
 
+  `defined_only: true` restricts every tier to entities with at least one
+  `:definition` mention (excluding reference-only entities, which call edges
+  target but which have no definition site).
+
   Returns `[]` for a name or filter that can never match: not a valid
   string (non-UTF-8, contains NUL), blank, or over #{@max_name_bytes} bytes.
   """
@@ -308,6 +312,7 @@ defmodule RetrievalNode.Graph do
         from(e in Entity, as: :entity)
         |> filter_lang(lang)
         |> filter_repo(repo)
+        |> filter_defined(Keyword.get(opts, :defined_only, false))
 
       with [] <- base |> exact_name_query(name) |> run_limited(limit),
            [] <- base |> suffix_name_query(name) |> run_limited(limit) do
@@ -355,6 +360,23 @@ defmodule RetrievalNode.Graph do
         )
     )
   end
+
+  # Reference-only entities (a call/import name the write path never saw a
+  # definition for) have no :definition mention; with `defined_only: true`
+  # they are excluded from EVERY tier, so a bare-name tier can't stop on one.
+  defp filter_defined(query, true) do
+    from(e in query,
+      where:
+        exists(
+          from(m in EntityMention,
+            where: m.entity_id == parent_as(:entity).id and m.kind == :definition,
+            select: 1
+          )
+        )
+    )
+  end
+
+  defp filter_defined(query, _), do: query
 
   defp exact_name_query(base, name) do
     from(e in base,
@@ -439,7 +461,7 @@ defmodule RetrievalNode.Graph do
   Bounds: at most #{@max_seed_ids} distinct seed ids are used; each
   underlying query (edge or mention leg) is itself capped at
   #{@edge_fanout_limit} rows (ordered by weight/count desc — see
-  `edges_query/4` and the mention-leg query functions), and the hop-1 ->
+  `edges_query/5` and the mention-leg query functions), and the hop-1 ->
   hop-2 frontier is capped at #{@hop2_frontier_limit} entity ids (also by
   weight desc) so a hot symbol's fan-out can't compound across two hops into
   an unbounded traversal. Raises `ArgumentError` for an unknown `relation`
@@ -470,12 +492,9 @@ defmodule RetrievalNode.Graph do
   defp clamp_seed_ids(ids), do: ids |> Enum.uniq() |> Enum.take(@max_seed_ids)
 
   defp traverse(seed_list, relation, hops) do
-    seed_ids = MapSet.new(seed_list)
-
     hop1 =
       seed_list
-      |> traverse_edges(relation)
-      |> reject_seen(seed_ids)
+      |> traverse_edges(relation, seed_list)
       |> dedup_max_weight()
 
     tagged_hop1 = Enum.map(hop1, &Map.put(&1, :hop, 1))
@@ -484,7 +503,7 @@ defmodule RetrievalNode.Graph do
       if hops == 1 do
         tagged_hop1
       else
-        excluded = MapSet.union(seed_ids, MapSet.new(hop1, & &1.entity_id))
+        excluded = Enum.uniq(seed_list ++ Enum.map(hop1, & &1.entity_id))
 
         # hop-1 is already bounded by @edge_fanout_limit per query, but
         # feeding all of it into a second traversal would multiply that
@@ -497,8 +516,7 @@ defmodule RetrievalNode.Graph do
 
         hop2 =
           hop2_frontier
-          |> traverse_edges(relation)
-          |> reject_seen(excluded)
+          |> traverse_edges(relation, excluded)
           |> dedup_max_weight()
           |> Enum.map(&Map.put(&1, :hop, 2))
 
@@ -520,8 +538,6 @@ defmodule RetrievalNode.Graph do
 
   defp rank(rows), do: Enum.sort_by(rows, &{-&1.weight, &1.entity_id})
 
-  defp reject_seen(rows, ids), do: Enum.reject(rows, &MapSet.member?(ids, &1.entity_id))
-
   defp dedup_max_weight(rows) do
     rows
     |> Enum.reduce(%{}, fn %{entity_id: id, weight: w}, acc ->
@@ -530,28 +546,34 @@ defmodule RetrievalNode.Graph do
     |> Enum.map(fn {id, w} -> %{entity_id: id, weight: w} end)
   end
 
-  defp traverse_edges(ids, :callers),
-    do: edges_query(ids, :calls, :target_entity_id, :source_entity_id)
+  # `excluded` (seeds, plus hop-1 entities at hop 2) is applied INSIDE each
+  # query, before its LIMIT: filtering after the cut would let already-seen
+  # rows (a dense cycle, self-loops) fill the fan-out slots and hide new
+  # entities. It binds as one array param (`<> ALL($n)`) however long it is.
+  defp traverse_edges(ids, :callers, excluded),
+    do: edges_query(ids, excluded, :calls, :target_entity_id, :source_entity_id)
 
-  defp traverse_edges(ids, :callees),
-    do: edges_query(ids, :calls, :source_entity_id, :target_entity_id)
+  defp traverse_edges(ids, :callees, excluded),
+    do: edges_query(ids, excluded, :calls, :source_entity_id, :target_entity_id)
 
-  defp traverse_edges(ids, :importers),
+  defp traverse_edges(ids, :importers, excluded),
     do:
-      edges_query(ids, :imports, :target_entity_id, :source_entity_id) ++
-        importers_by_mention(ids)
+      edges_query(ids, excluded, :imports, :target_entity_id, :source_entity_id) ++
+        importers_by_mention(ids, excluded)
 
-  defp traverse_edges(ids, :imports),
+  defp traverse_edges(ids, :imports, excluded),
     do:
-      edges_query(ids, :imports, :source_entity_id, :target_entity_id) ++ imports_by_mention(ids)
+      edges_query(ids, excluded, :imports, :source_entity_id, :target_entity_id) ++
+        imports_by_mention(ids, excluded)
 
   # A logical (source, target, kind) edge can back onto MULTIPLE entity_edges
   # rows — one per contributing chunk (see EntityEdge's moduledoc) — so this
   # groups by the entity pair before a consumer ever sees a row, summing each
   # pair's chunk-level weights into one logical weight.
-  defp edges_query(ids, kind, filter_field, select_field) do
+  defp edges_query(ids, excluded, kind, filter_field, select_field) do
     from(e in EntityEdge,
       where: e.kind == ^kind and field(e, ^filter_field) in ^ids,
+      where: field(e, ^select_field) not in ^excluded,
       group_by: [e.source_entity_id, e.target_entity_id],
       select: %{entity_id: field(e, ^select_field), weight: type(sum(e.weight), :integer)},
       order_by: [desc: sum(e.weight), asc: field(e, ^select_field)],
@@ -564,13 +586,13 @@ defmodule RetrievalNode.Graph do
   # mentions on chunks carrying an :import mention of one of `ids`. Weight is
   # per (seed, importer) pair — the count of qualifying import mentions — and
   # pairs are combined across seeds by dedup_max_weight/1, never summed.
-  # Bounded like edges_query/4.
-  defp importers_by_mention(ids) do
+  # Bounded like edges_query/5.
+  defp importers_by_mention(ids, excluded) do
     from(m in EntityMention,
       as: :imp,
       join: d in EntityMention,
       on: d.chunk_id == m.chunk_id and d.kind == :definition,
-      where: m.kind == :import and m.entity_id in ^ids and d.entity_id not in ^ids,
+      where: m.kind == :import and m.entity_id in ^ids and d.entity_id not in ^excluded,
       where: not exists(import_edge_on_chunk(:imp)),
       group_by: [m.entity_id, d.entity_id],
       select: %{entity_id: d.entity_id, weight: count(m.id)},
@@ -580,13 +602,13 @@ defmodule RetrievalNode.Graph do
     |> Repo.all()
   end
 
-  # Mirror image of importers_by_mention/1.
-  defp imports_by_mention(ids) do
+  # Mirror image of importers_by_mention/2.
+  defp imports_by_mention(ids, excluded) do
     from(m in EntityMention,
       join: i in EntityMention,
       as: :imp,
       on: i.chunk_id == m.chunk_id and i.kind == :import,
-      where: m.kind == :definition and m.entity_id in ^ids and i.entity_id not in ^ids,
+      where: m.kind == :definition and m.entity_id in ^ids and i.entity_id not in ^excluded,
       where: not exists(import_edge_on_chunk(:imp)),
       group_by: [m.entity_id, i.entity_id],
       select: %{entity_id: i.entity_id, weight: count(i.id)},
