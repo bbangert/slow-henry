@@ -18,6 +18,17 @@ defmodule RetrievalNode.MCP.Tools.RelatedCode do
     * `"imports"`     — entities the matched entities import, resolved the
       same way
 
+  Name matching is heuristic (no import resolution). A call recorded under a
+  bare name (`helper`) is a reference-only entity, attributed to EVERY
+  same-source, same-language definition whose qualified name ends in it
+  (`A.helper`, `B.helper`), so `callers` of either includes that call.
+  Precisely, the alias class of a definition is itself plus the reference-only
+  names that are suffixes of its name; the class of a reference-only name is
+  itself, the definitions it is a suffix of, and the other reference-only
+  names that are suffixes of those same definitions. `callers`/`importers`
+  traverse into a class; `callees`/`imports` start from its definitions. An
+  input's own class is never returned as its results.
+
   `hops: 2` extends `callers`/`callees`/`importers`/`imports` one edge
   further (transitive callers-of-callers, etc); `hops` is ignored for
   `definitions`. Result sizes are bounded by `Graph` (see its docs). Matching zero entities is a
@@ -101,12 +112,13 @@ defmodule RetrievalNode.MCP.Tools.RelatedCode do
   defp validate_text(name, _value), do: {:error, "#{name} must be a string"}
 
   defp run(entity, relation, hops, params, frame) do
-    # Only `definitions` needs a definition site; traversal relations keep
-    # reference-only entities because call/import edges target them.
+    # Relations that read a definition site or outgoing edges need
+    # definition-bearing entities; callers/importers keep reference-only
+    # matches because call/import edges target them.
     find_opts =
       [repo: Map.get(params, :repo), lang: Map.get(params, :lang)]
       |> Enum.reject(fn {_k, v} -> is_nil(v) end)
-      |> Keyword.put(:defined_only, relation == :definitions)
+      |> Keyword.put(:defined_only, relation in [:definitions, :callees, :imports])
 
     case Graph.find_entities(entity, find_opts) do
       [] ->

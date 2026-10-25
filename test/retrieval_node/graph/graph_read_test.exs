@@ -553,6 +553,313 @@ defmodule RetrievalNode.GraphReadTest do
     end
   end
 
+  describe "name aliasing (reference-only vs qualified definitions)" do
+    # `helper` is called by its bare name, so the write path stores a
+    # reference-only entity `helper` next to the definition
+    # `Payment.Processor.helper`.
+    setup %{source: source} do
+      ingest(source, [
+        {"c1",
+         [def_("Payment.Processor.helper"), def_("Payment.Processor.process"), def_("leaf")],
+         [call("helper", "Payment.Processor.process"), call("leaf", "Payment.Processor.helper")],
+         []}
+      ])
+
+      %{
+        helper_ref: entity!(source, "helper"),
+        helper: entity!(source, "Payment.Processor.helper"),
+        process: entity!(source, "Payment.Processor.process"),
+        leaf: entity!(source, "leaf")
+      }
+    end
+
+    defp names(results), do: results |> Enum.map(& &1.entity.qualified_name) |> Enum.sort()
+
+    test "callees of the bare name resolve to the definition's callees", ctx do
+      assert names(Graph.related_entities([ctx.helper_ref.id], :callees)) == ["leaf"]
+    end
+
+    test "callers of the qualified definition include callers of the bare name", ctx do
+      assert names(Graph.related_entities([ctx.helper.id], :callers)) ==
+               ["Payment.Processor.process"]
+    end
+
+    test "hop 2 callees: a reference-only hop-1 row is resolved before traversing on", ctx do
+      results = Graph.related_entities([ctx.process.id], :callees, 2)
+
+      assert %{entity: %{qualified_name: "helper"}, hop: 1} =
+               Enum.find(results, &(&1.hop == 1))
+
+      assert %{entity: %{qualified_name: "leaf"}, hop: 2} = Enum.find(results, &(&1.hop == 2))
+    end
+
+    test "hop 2 callers: the definition's callers via its alias", ctx do
+      results = Graph.related_entities([ctx.leaf.id], :callers, 2)
+
+      assert %{entity: %{qualified_name: "Payment.Processor.helper"}, hop: 1} =
+               Enum.find(results, &(&1.hop == 1))
+
+      assert %{entity: %{qualified_name: "Payment.Processor.process"}, hop: 2} =
+               Enum.find(results, &(&1.hop == 2))
+    end
+
+    test "a bare name is attributed to every definition it aliases", %{source: source} do
+      ingest(source, [
+        {"c2", [def_("A.shared"), def_("B.shared"), def_("caller")], [call("shared", "caller")],
+         []}
+      ])
+
+      for name <- ["A.shared", "B.shared"] do
+        assert names(Graph.related_entities([entity!(source, name).id], :callers)) == ["caller"]
+      end
+    end
+
+    test "aliasing stays within source and language", %{source: source, helper: helper} do
+      other = source_fixture()
+      ingest(other, [{"o1", [def_("Payment.Processor.helper")], [], []}])
+      ingest(source, [{"c3", [def_("Payment.Processor.helper")], [], [lang: "javascript"]}])
+
+      # control: this source's python definition does get the bare-name caller
+      assert names(Graph.related_entities([helper.id], :callers)) ==
+               ["Payment.Processor.process"]
+
+      assert Graph.related_entities([entity!(other, "Payment.Processor.helper").id], :callers) ==
+               []
+
+      js = entity!(source, "Payment.Processor.helper", "javascript")
+      assert Graph.related_entities([js.id], :callers) == []
+    end
+
+    test "a distinct definition named like a suffix of the seed is a real caller/callee", %{
+      source: source
+    } do
+      ingest(source, [
+        {"c8", [def_("Mod.run"), def_("run")], [call("Mod.run", "run"), call("run", "Mod.run")],
+         []}
+      ])
+
+      mod_run = entity!(source, "Mod.run")
+      run = entity!(source, "run")
+
+      assert names(Graph.related_entities([mod_run.id], :callers)) == ["run"]
+      assert names(Graph.related_entities([mod_run.id], :callees)) == ["run"]
+      assert names(Graph.related_entities([run.id], :callers)) == ["Mod.run"]
+    end
+
+    test "a reference-only hop-1 input excludes its partial-name aliases at hop 2" do
+      source = source_fixture()
+      # `user` -> Processor.helper (reference-only); the definition behind it
+      # calls bare `helper`, which is in Processor.helper's alias class
+      # (helper <= Payment.Processor.helper >= Processor.helper).
+      ingest(source, [
+        {"c9", [def_("user"), def_("Payment.Processor.helper")],
+         [call("Processor.helper", "user"), call("helper", "Payment.Processor.helper")], []}
+      ])
+
+      results = Graph.related_entities([entity!(source, "user").id], :callees, 2)
+      assert names(results) == ["Processor.helper"]
+    end
+
+    test "a reference-only name sharing only a suffix with no common definition is kept", %{
+      source: source
+    } do
+      # requests.get has no definition, so it is not an alias of `get`
+      ingest(source, [
+        {"c10", [def_("run"), def_("Cache.get")],
+         [call("get", "run"), call("requests.get", "Cache.get")], []}
+      ])
+
+      results = Graph.related_entities([entity!(source, "run").id], :callees, 2)
+      assert names(results) == ["get", "requests.get"]
+    end
+
+    test "an entity's own aliases are never returned as its results", %{source: source} do
+      ingest(source, [
+        {"c4", [def_("Mod.rec")], [call("rec", "Mod.rec")], []}
+      ])
+
+      rec = entity!(source, "Mod.rec")
+      assert Graph.related_entities([rec.id], :callees, 2) == []
+      assert Graph.related_entities([rec.id], :callers, 2) == []
+    end
+
+    # The expansion caps (@alias_limit = 500) are module attributes with no test
+    # seam, so these build enough rows (800 / 600) to exceed them.
+    test "callees: recursive aliases beyond the lookup cap are still excluded", %{source: source} do
+      # 100 seeds, each calling all 8 of its own name suffixes (reference-only
+      # aliases of itself): 800 alias entities > the 500-row lookup limit.
+      prefix = "P.q.r.s.t.u.v"
+      seeds = for i <- 1..100, do: "#{prefix}.fn#{i}"
+
+      suffixes = fn name ->
+        parts = String.split(name, ".")
+        for n <- 1..length(parts), do: parts |> Enum.take(-n) |> Enum.join(".")
+      end
+
+      refs =
+        for s <- seeds, suffix <- suffixes.(s), do: call(suffix, s)
+
+      ingest(source, [
+        {"c6", Enum.map(seeds, &def_/1) ++ [def_("real")], [call("real", hd(seeds)) | refs], []}
+      ])
+
+      ids = for s <- seeds, do: entity!(source, s).id
+
+      assert [%{entity: %{qualified_name: "real"}}] = Graph.related_entities(ids, :callees)
+    end
+
+    test "callers of a bare name never return the definitions it aliases, past the cap", %{
+      source: source
+    } do
+      defs = for i <- 1..600, do: def_("X#{i}.get")
+      recursive = for i <- 1..600, do: call("get", "X#{i}.get")
+
+      ingest(source, [
+        {"c7", [def_("real_caller") | defs], [call("get", "real_caller") | recursive], []}
+      ])
+
+      results = Graph.related_entities([entity!(source, "get").id], :callers)
+      assert names(results) == ["real_caller"]
+    end
+
+    test "resolving a hot bare name stays bounded", %{source: source} do
+      defs = for i <- 1..600, do: def_("X#{i}.get")
+      refs = for i <- 1..600, do: call("t#{i}", "X#{i}.get")
+      ingest(source, [{"c5", defs ++ [def_("t0")], [call("get", "t0")] ++ refs, []}])
+
+      get = entity!(source, "get")
+      assert length(Graph.related_entities([get.id], :callees)) == 50
+    end
+  end
+
+  describe "alias-class traversal vs a reference model" do
+    # Pure-Elixir specification of the documented rule, over {name => defined?}
+    # (one source and language; names stand in for ids). `sub?(a, d)` is
+    # "a's name equals d's or is a '.'-suffix of it".
+    defp sub?(a, d), do: a == d or String.ends_with?(d, "." <> a)
+
+    defp alias_class(x, ents) do
+      defs = for {n, true} <- ents, do: n
+      refs = for {n, false} <- ents, do: n
+
+      if ents[x] do
+        MapSet.new([x | Enum.filter(refs, &sub?(&1, x))])
+      else
+        anchors = Enum.filter(defs, &sub?(x, &1))
+
+        MapSet.new(
+          [x] ++
+            anchors ++ Enum.filter(refs, fn r -> Enum.any?(anchors, &sub?(r, &1)) end)
+        )
+      end
+    end
+
+    defp union_classes(inputs, ents),
+      do: inputs |> Enum.map(&alias_class(&1, ents)) |> Enum.reduce(MapSet.new(), &MapSet.union/2)
+
+    defp model_frontier(inputs, :incoming, ents), do: union_classes(inputs, ents)
+
+    defp model_frontier(inputs, :outgoing, ents),
+      do: inputs |> union_classes(ents) |> Enum.filter(&ents[&1]) |> MapSet.new()
+
+    defp model_step(frontier, :incoming, edges),
+      do: for({from, to} <- edges, to in frontier, into: MapSet.new(), do: from)
+
+    defp model_step(frontier, :outgoing, edges),
+      do: for({from, to} <- edges, from in frontier, into: MapSet.new(), do: to)
+
+    defp model_traverse(seeds, direction, hops, ents, edges) do
+      excluded1 = MapSet.union(union_classes(seeds, ents), MapSet.new(seeds))
+
+      hop1 =
+        seeds
+        |> model_frontier(direction, ents)
+        |> model_step(direction, edges)
+        |> MapSet.difference(excluded1)
+
+      if hops == 1 do
+        hop1
+      else
+        inputs2 = MapSet.to_list(hop1)
+
+        excluded2 =
+          MapSet.union(
+            union_classes(seeds ++ inputs2, ents),
+            MapSet.union(MapSet.new(seeds), hop1)
+          )
+
+        hop2 =
+          inputs2
+          |> model_frontier(direction, ents)
+          |> model_step(direction, edges)
+          |> MapSet.difference(excluded2)
+
+        MapSet.union(hop1, hop2)
+      end
+    end
+
+    defp random_name(vocab) do
+      depth = :rand.uniform(3)
+      Enum.map_join(1..depth, ".", fn _ -> Enum.random(vocab) end)
+    end
+
+    # Small random graphs over a tiny segment vocabulary so suffix collisions
+    # are frequent. Written through upsert_from_staged (one chunk per graph):
+    # definitions are the staged entities, reference-only entities are
+    # whatever call targets are not defined. Sizes stay far below every cap.
+    test "callers/callees at hops 1 and 2 match the reference model on random graphs" do
+      :rand.seed(:exsss, {11, 22, 33})
+      vocab = ["a", "b", "get", "helper"]
+
+      for iteration <- 1..60 do
+        source = source_fixture()
+
+        defs =
+          2..5
+          |> Enum.random()
+          |> then(&Enum.map(1..&1, fn _ -> random_name(vocab) end))
+          |> Enum.uniq()
+
+        pool = Enum.uniq(defs ++ Enum.map(1..6, fn _ -> random_name(vocab) end))
+
+        calls =
+          1..Enum.random(3..9)
+          |> Enum.map(fn _ -> {Enum.random(defs), Enum.random(pool)} end)
+          |> Enum.uniq()
+
+        orphan_refs = for _ <- List.duplicate(nil, Enum.random(0..2)), do: Enum.random(pool)
+
+        refs =
+          Enum.map(calls, fn {from, to} -> call(to, from) end) ++
+            Enum.map(orphan_refs, &call(&1, nil))
+
+        ingest(source, [{"g#{iteration}", Enum.map(defs, &def_/1), refs, []}])
+
+        names_all = Enum.uniq(defs ++ Enum.map(calls, &elem(&1, 1)) ++ orphan_refs)
+        ents = Map.new(names_all, &{&1, &1 in defs})
+        ids = Map.new(names_all, &{&1, entity!(source, &1).id})
+
+        seeds = names_all |> Enum.shuffle() |> Enum.take(Enum.random(1..2))
+
+        for {relation, direction} <- [callers: :incoming, callees: :outgoing], hops <- [1, 2] do
+          expected = model_traverse(seeds, direction, hops, ents, calls)
+
+          actual =
+            seeds
+            |> Enum.map(&ids[&1])
+            |> Graph.related_entities(relation, hops)
+            |> Enum.map(& &1.entity.qualified_name)
+            |> MapSet.new()
+
+          assert actual == expected,
+                 "iteration #{iteration} #{relation} hops=#{hops} seeds=#{inspect(seeds)} " <>
+                   "defs=#{inspect(defs)} calls=#{inspect(calls)} orphans=#{inspect(orphan_refs)}\n" <>
+                   "expected=#{inspect(MapSet.to_list(expected))} actual=#{inspect(MapSet.to_list(actual))}"
+        end
+      end
+    end
+  end
+
   describe "definition_snippets/2" do
     defp snippet_for(source, name, content, opts \\ []) do
       ingest(source, [{"k-#{name}", [def_(name)], [], [content: content] ++ opts}])

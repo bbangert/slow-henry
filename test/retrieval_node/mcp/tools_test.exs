@@ -283,6 +283,21 @@ defmodule RetrievalNode.MCP.ToolsTest do
                ok(RelatedCode, %{entity: "helper", relation: "callers"})
     end
 
+    test "callees of a bare name resolve to the qualified definition's callees" do
+      source = graph_source("alias")
+
+      # `run` calls the bare name, so a reference-only `helper` entity exists
+      # and the exact tier would match it (it has no outgoing edges).
+      index_graph(source, [
+        {graph_chunk(source, "p.py", "x"),
+         [def_("Payment.Processor.helper"), def_("leaf"), def_("run")],
+         [call("leaf", "Payment.Processor.helper"), call("helper", "run")]}
+      ])
+
+      assert %{"entities" => [%{"qualified_name" => "leaf"}]} =
+               ok(RelatedCode, %{entity: "helper", relation: "callees"})
+    end
+
     test "an invalid relation is rejected with a listing of valid values" do
       msg = err(RelatedCode, %{entity: "x", relation: "bogus"})
       assert msg =~ "unknown relation"
