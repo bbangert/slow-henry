@@ -1,6 +1,7 @@
 defmodule RetrievalNode.Search.HybridQueryTest do
   use RetrievalNode.DataCase, async: true
 
+  alias RetrievalNode.Graph
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.{Chunk, Source}
   alias RetrievalNode.Search
@@ -53,6 +54,50 @@ defmodule RetrievalNode.Search.HybridQueryTest do
       |> Map.update!(:embedding, &Pgvector.new/1)
 
     Repo.insert!(struct(Chunk, attrs))
+  end
+
+  # A chunk with no embedding and content chosen not to match the FTS query
+  # under test — reachable, if at all, only via the entity leg. `embedding`
+  # is nullable at the DB level (chunks awaiting embedding), so this is a
+  # legitimate real state, not a test-only hack.
+  defp graph_only_chunk_fixture(source, attrs) do
+    defaults = %{
+      source_id: source.id,
+      source_type: :git_repo,
+      chunk_key: "key-#{System.unique_integer([:positive])}",
+      content_hash: "hash-#{System.unique_integer([:positive])}",
+      context_breadcrumb: "lib/foo.ex > Foo",
+      metadata: %{},
+      embedding: nil
+    }
+
+    Repo.insert!(struct(Chunk, Map.merge(defaults, Map.new(attrs))))
+  end
+
+  # A symbol is named here and bound to chunks by `mention_fixture/3`, which
+  # writes through the real Graph.upsert_from_staged/3 so entity/mention rows
+  # have exactly the shape ingest produces.
+  defp entity_fixture(source, attrs),
+    do: %{source: source, name: Keyword.fetch!(attrs, :qualified_name)}
+
+  defp mention_fixture(%{source: source, name: name}, chunk, kind) do
+    graph =
+      case kind do
+        :definition -> %{entities: [%{qualified_name: name, kind: :function, line: 1}]}
+        :call -> %{references: [%{name: name, kind: :call, from: nil, line: 1}]}
+        :import -> %{references: [%{name: name, kind: :import, from: nil, line: 1}]}
+      end
+
+    row = %{
+      source_id: source.id,
+      lang: "python",
+      chunk_key: chunk.chunk_key,
+      natural_key: "repo:#{source.identifier}:x.py",
+      metadata: %{},
+      graph: graph
+    }
+
+    {:ok, _} = Graph.upsert_from_staged(Repo, [row], %{chunk.chunk_key => chunk.id})
   end
 
   describe "search/1 RRF ordering" do
@@ -326,6 +371,386 @@ defmodule RetrievalNode.Search.HybridQueryTest do
         # non-integer top_k reaching Enum.take/2 or Postgres' $4 bind).
         assert length(rerank_hits) == length(chunks)
         assert length(non_rerank_hits) == length(chunks)
+      end
+    end
+  end
+
+  describe "significant_terms/1" do
+    test "keeps snake_case symbols intact as one term" do
+      assert HybridQuery.significant_terms("check process_payment flow") ==
+               ["check", "process_payment", "flow"]
+    end
+
+    test "drops terms shorter than 3 chars" do
+      assert HybridQuery.significant_terms("a to is payment") == ["payment"]
+    end
+
+    test "dedups preserving first-seen order" do
+      assert HybridQuery.significant_terms("payment payment refund payment") ==
+               ["payment", "refund"]
+    end
+
+    test "caps at 8 terms" do
+      text = Enum.map_join(1..12, " ", &"term#{&1}")
+
+      assert HybridQuery.significant_terms(text) ==
+               Enum.map(1..8, &"term#{&1}")
+    end
+
+    test "empty (or all-short-word) query yields no terms" do
+      assert HybridQuery.significant_terms("") == []
+      assert HybridQuery.significant_terms("to a is") == []
+    end
+
+    test "drops terms longer than 64 chars" do
+      giant = String.duplicate("a", 65)
+
+      assert HybridQuery.significant_terms("short #{giant} term") == ["short", "term"]
+    end
+
+    test ~s(drops stopwords like "the" and "how" while keeping real terms) do
+      assert HybridQuery.significant_terms("how does the process work") == ["process", "work"]
+    end
+
+    test "does not drop code-symbol words that double as stopword-length terms (get/all/run)" do
+      assert HybridQuery.significant_terms("get all run") == ["get", "all", "run"]
+    end
+
+    test "an all-stopwords query (not just all-short-word) yields no terms" do
+      assert HybridQuery.significant_terms("how does this and that would") == []
+    end
+  end
+
+  describe "search/1 graph leg toggle" do
+    test "graph: false (and default-off) leave two-leg ranking unchanged" do
+      source = source_fixture("repo-a")
+
+      match =
+        chunk_fixture(source,
+          repo: "repo-a",
+          content: "the quick brown fox jumps",
+          embedding: axis(0)
+        )
+
+      _miss =
+        chunk_fixture(source,
+          repo: "repo-a",
+          content: "entirely unrelated lorem ipsum",
+          embedding: axis(1)
+        )
+
+      # An entity/mention that COULD contribute via the graph leg if it ran —
+      # its presence must not change anything while the leg is off.
+      entity = entity_fixture(source, qualified_name: "PaymentProcessor.process_payment")
+
+      graph_only =
+        graph_only_chunk_fixture(source,
+          repo: "repo-a",
+          content: "totally unrelated filler about zebras"
+        )
+
+      mention_fixture(entity, graph_only, :definition)
+
+      query_text = "quick brown fox payment"
+
+      default_results = HybridQuery.search(embedding: axis(0), text_query: query_text)
+
+      explicit_off_results =
+        HybridQuery.search(embedding: axis(0), text_query: query_text, graph: false)
+
+      assert Enum.map(default_results, & &1.chunk_id) ==
+               Enum.map(explicit_off_results, & &1.chunk_id)
+
+      returned_ids = Enum.map(default_results, & &1.chunk_id)
+      assert hd(default_results).chunk_id == match.id
+      refute graph_only.id in returned_ids
+    end
+
+    test "graph: true surfaces a chunk reachable only via an entity mention" do
+      source = source_fixture("repo-a")
+      entity = entity_fixture(source, qualified_name: "PaymentProcessor.process_payment")
+
+      graph_only =
+        graph_only_chunk_fixture(source,
+          repo: "repo-a",
+          content: "totally unrelated filler about zebras"
+        )
+
+      mention_fixture(entity, graph_only, :definition)
+
+      # Decoy: no entity mention, and matches neither the vector nor FTS query.
+      _decoy =
+        graph_only_chunk_fixture(source,
+          repo: "repo-a",
+          content: "more unrelated filler about giraffes"
+        )
+
+      results_off =
+        HybridQuery.search(embedding: axis(0), text_query: "payment processing", graph: false)
+
+      results_on =
+        HybridQuery.search(embedding: axis(0), text_query: "payment processing", graph: true)
+
+      refute graph_only.id in Enum.map(results_off, & &1.chunk_id)
+      assert graph_only.id in Enum.map(results_on, & &1.chunk_id)
+    end
+
+    test "three-way mention-kind ordering: definition > call > import for the same entity match" do
+      source = source_fixture("repo-a")
+      entity = entity_fixture(source, qualified_name: "PaymentProcessor.process_payment")
+
+      # Content/embedding on all three chunks are chosen so neither the
+      # vector nor FTS leg contributes anything — the only signal is each
+      # chunk's entity mention kind.
+      def_chunk =
+        graph_only_chunk_fixture(source, repo: "repo-a", content: "unrelated filler alpha")
+
+      call_chunk =
+        graph_only_chunk_fixture(source, repo: "repo-a", content: "unrelated filler gamma")
+
+      import_chunk =
+        graph_only_chunk_fixture(source, repo: "repo-a", content: "unrelated filler beta")
+
+      mention_fixture(entity, def_chunk, :definition)
+      mention_fixture(entity, call_chunk, :call)
+      mention_fixture(entity, import_chunk, :import)
+
+      results = HybridQuery.search(embedding: axis(0), text_query: "payment", graph: true)
+
+      ids = Enum.map(results, & &1.chunk_id)
+      def_rank = Enum.find_index(ids, &(&1 == def_chunk.id))
+      call_rank = Enum.find_index(ids, &(&1 == call_chunk.id))
+      import_rank = Enum.find_index(ids, &(&1 == import_chunk.id))
+
+      assert is_integer(def_rank)
+      assert is_integer(call_rank)
+      assert is_integer(import_rank)
+      assert def_rank < call_rank
+      assert call_rank < import_rank
+    end
+
+    test "entity leg respects the repo filter" do
+      source = source_fixture("repo-a")
+      entity = entity_fixture(source, qualified_name: "PaymentProcessor.process_payment")
+
+      wrong_repo_chunk =
+        graph_only_chunk_fixture(source, repo: "repo-b", content: "unrelated filler alpha")
+
+      right_repo_chunk =
+        graph_only_chunk_fixture(source, repo: "repo-a", content: "unrelated filler beta")
+
+      mention_fixture(entity, wrong_repo_chunk, :definition)
+      mention_fixture(entity, right_repo_chunk, :definition)
+
+      results =
+        HybridQuery.search(
+          embedding: axis(0),
+          text_query: "payment",
+          graph: true,
+          repo: "repo-a"
+        )
+
+      ids = Enum.map(results, & &1.chunk_id)
+
+      refute wrong_repo_chunk.id in ids
+      assert right_repo_chunk.id in ids
+    end
+
+    test "graph: true with no significant terms runs the two-leg query without crashing" do
+      source = source_fixture("repo-a")
+
+      match =
+        chunk_fixture(source,
+          repo: "repo-a",
+          content: "the quick brown fox jumps",
+          embedding: axis(0)
+        )
+
+      results = HybridQuery.search(embedding: axis(0), text_query: "to a is", graph: true)
+
+      assert Enum.map(results, & &1.chunk_id) == [match.id]
+    end
+
+    test "entity leg respects the source_id filter, even for the same symbol in two sources" do
+      a = source_fixture("repo-a")
+      b = source_fixture("repo-b")
+
+      in_a = graph_only_chunk_fixture(a, repo: "repo-a", content: "unrelated filler alpha")
+      in_b = graph_only_chunk_fixture(b, repo: "repo-b", content: "unrelated filler beta")
+
+      mention_fixture(
+        entity_fixture(a, qualified_name: "PaymentProcessor.process_payment"),
+        in_a,
+        :definition
+      )
+
+      mention_fixture(
+        entity_fixture(b, qualified_name: "PaymentProcessor.process_payment"),
+        in_b,
+        :definition
+      )
+
+      ids =
+        [embedding: axis(0), text_query: "payment", graph: true, source_id: a.id]
+        |> HybridQuery.search()
+        |> Enum.map(& &1.chunk_id)
+
+      assert ids == [in_a.id]
+    end
+
+    test "only an explicit true enables the graph leg" do
+      source = source_fixture("repo-a")
+      entity = entity_fixture(source, qualified_name: "PaymentProcessor.process_payment")
+      chunk = graph_only_chunk_fixture(source, repo: "repo-a", content: "unrelated filler")
+      mention_fixture(entity, chunk, :definition)
+
+      for flag <- [false, nil, "true", 1, :yes] do
+        results = HybridQuery.search(embedding: axis(0), text_query: "payment", graph: flag)
+        refute chunk.id in Enum.map(results, & &1.chunk_id)
+      end
+    end
+
+    test "a misconfigured graph_leg_weight falls back instead of breaking fusion" do
+      source = source_fixture("repo-a")
+      entity = entity_fixture(source, qualified_name: "PaymentProcessor.process_payment")
+      chunk = graph_only_chunk_fixture(source, repo: "repo-a", content: "unrelated filler")
+      mention_fixture(entity, chunk, :definition)
+
+      prev = Application.get_env(:retrieval_node, :graph_leg_weight)
+      on_exit(fn -> Application.put_env(:retrieval_node, :graph_leg_weight, prev) end)
+
+      for bad <- [-1, "heavy", nil, 1] do
+        Application.put_env(:retrieval_node, :graph_leg_weight, bad)
+
+        results = HybridQuery.search(embedding: axis(0), text_query: "payment", graph: true)
+        assert chunk.id in Enum.map(results, & &1.chunk_id)
+        assert Enum.all?(results, &(&1.fused_score > 0))
+      end
+    end
+
+    test "Search.hybrid_search/2 forwards the :graph option" do
+      source = source_fixture("repo-a")
+      entity = entity_fixture(source, qualified_name: "PaymentProcessor.process_payment")
+      chunk = graph_only_chunk_fixture(source, repo: "repo-a", content: "unrelated filler")
+      mention_fixture(entity, chunk, :definition)
+
+      off = Search.hybrid_search("payment", embedding: axis(0), graph: false)
+      on = Search.hybrid_search("payment", embedding: axis(0), graph: true)
+
+      refute chunk.id in Enum.map(off, & &1.chunk.id)
+      assert chunk.id in Enum.map(on, & &1.chunk.id)
+    end
+
+    test "a term matching more entities than the cap is dropped; rarer terms still work" do
+      source = source_fixture("repo-a")
+
+      # 201 entities share "widgetx": over the cap, so the term is dropped.
+      hot_chunk = graph_only_chunk_fixture(source, repo: "repo-a", content: "filler hot")
+
+      hot_defs =
+        for n <- 1..201, do: %{qualified_name: "Mod#{n}.widgetx", kind: :function, line: 1}
+
+      row = %{
+        source_id: source.id,
+        lang: "python",
+        chunk_key: hot_chunk.chunk_key,
+        natural_key: "repo:x:x.py",
+        metadata: %{},
+        graph: %{entities: hot_defs}
+      }
+
+      {:ok, _} = Graph.upsert_from_staged(Repo, [row], %{hot_chunk.chunk_key => hot_chunk.id})
+
+      rare_chunk = graph_only_chunk_fixture(source, repo: "repo-a", content: "filler rare")
+
+      mention_fixture(
+        entity_fixture(source, qualified_name: "Mod.zebrafind"),
+        rare_chunk,
+        :definition
+      )
+
+      ids =
+        [embedding: axis(0), text_query: "widgetx zebrafind", graph: true]
+        |> HybridQuery.search()
+        |> Enum.map(& &1.chunk_id)
+
+      assert rare_chunk.id in ids
+      refute hot_chunk.id in ids
+
+      # 3 entities (under the cap) are matched as usual
+      few = graph_only_chunk_fixture(source, repo: "repo-a", content: "filler few")
+      mention_fixture(entity_fixture(source, qualified_name: "Few.gizmoq"), few, :definition)
+
+      assert few.id in (HybridQuery.search(embedding: axis(0), text_query: "gizmoq", graph: true)
+                        |> Enum.map(& &1.chunk_id))
+    end
+
+    test "underscores in a term are literal, not LIKE wildcards" do
+      source = source_fixture("repo-a")
+      wrong = graph_only_chunk_fixture(source, repo: "repo-a", content: "filler wrong")
+      right = graph_only_chunk_fixture(source, repo: "repo-a", content: "filler right")
+      mention_fixture(entity_fixture(source, qualified_name: "Mod.axbq"), wrong, :definition)
+      mention_fixture(entity_fixture(source, qualified_name: "Mod.a_bq"), right, :definition)
+
+      ids =
+        [embedding: axis(0), text_query: "a_bq", graph: true]
+        |> HybridQuery.search()
+        |> Enum.map(& &1.chunk_id)
+
+      assert right.id in ids
+      refute wrong.id in ids
+    end
+
+    test "the lang filter narrows the entity pre-selection to that language" do
+      source = source_fixture("repo-a")
+      py = graph_only_chunk_fixture(source, repo: "repo-a", lang: "python", content: "filler py")
+
+      js =
+        graph_only_chunk_fixture(source, repo: "repo-a", lang: "javascript", content: "filler js")
+
+      mention_fixture(entity_fixture(source, qualified_name: "Mod.sprocketz"), py, :definition)
+
+      row = %{
+        source_id: source.id,
+        lang: "javascript",
+        chunk_key: js.chunk_key,
+        natural_key: "repo:x:x.js",
+        metadata: %{},
+        graph: %{entities: [%{qualified_name: "Mod.sprocketz", kind: :function, line: 1}]}
+      }
+
+      {:ok, _} = Graph.upsert_from_staged(Repo, [row], %{js.chunk_key => js.id})
+
+      ids =
+        [embedding: axis(0), text_query: "sprocketz", graph: true, lang: "javascript"]
+        |> HybridQuery.search()
+        |> Enum.map(& &1.chunk_id)
+
+      assert ids == [js.id]
+    end
+  end
+
+  describe "run_graph_query/3 timeout safety net" do
+    test "a query over the timeout returns :timeout and restores statement_timeout" do
+      %{rows: [[before]]} = Repo.query!("SELECT current_setting('statement_timeout')")
+
+      assert HybridQuery.run_graph_query("SELECT pg_sleep(2)", [], 20) == :timeout
+
+      assert %{rows: [[^before]]} = Repo.query!("SELECT current_setting('statement_timeout')")
+    end
+
+    test "a fast query returns its result and restores statement_timeout" do
+      %{rows: [[before]]} = Repo.query!("SELECT current_setting('statement_timeout')")
+
+      assert {:ok, %Postgrex.Result{rows: [[1]]}} =
+               HybridQuery.run_graph_query("SELECT 1", [], 500)
+
+      assert %{rows: [[^before]]} = Repo.query!("SELECT current_setting('statement_timeout')")
+    end
+
+    test "other database errors are re-raised, not swallowed" do
+      assert_raise Postgrex.Error, fn ->
+        HybridQuery.run_graph_query("SELECT 1/0", [], 500)
       end
     end
   end
