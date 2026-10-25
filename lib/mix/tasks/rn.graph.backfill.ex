@@ -29,10 +29,10 @@ defmodule Mix.Tasks.Rn.Graph.Backfill do
 
   `force: true` re-chunks/re-extracts even though a file's content is
   unchanged, but `FileIngest` REUSES existing embeddings wherever
-  `(chunk_key, content_hash)` matches an already-persisted chunk (see its
+  `(breadcrumb, content_hash)` matches an already-persisted chunk (see its
   moduledoc's "Embedding reuse") — so this is now cheap despite touching the
   whole corpus, unlike the old pipeline's full re-embed (which used to cost
-  hours). Chunks are keyed on `chunk_key`/`content_hash` regardless, so
+  hours). Chunks are keyed on `chunk_key` regardless, so
   re-processing unchanged content upserts the same row rather than
   duplicating it.
 
