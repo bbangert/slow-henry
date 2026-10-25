@@ -36,7 +36,10 @@ defmodule RetrievalNode.SourcesFile do
 
   @default_path "sources.toml"
   @managed_types [:git_repo]
-  @name_format ~r/\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
+  # One optional leading dot (GitHub's org-profile repo is `.github`), then an
+  # alphanumeric: `.`, `..`, `./x` and `../x` stay rejected. The name is also the
+  # default mirror slug; GitMirror.mirror_path/1 adds Path.safe_relative/1.
+  @name_format ~r/\A\.?[A-Za-z0-9][A-Za-z0-9._-]*\z/
   @url_schemes ~w(https:// http:// ssh:// git:// file://)
 
   @typedoc "A source as the file wants it."
