@@ -73,6 +73,11 @@ defmodule RetrievalNode.Bench.RunnerTest do
       end
     end
 
+    test "accepts a content_substring-only matcher" do
+      path = write_queries!([%{"query" => "q", "relevant" => [%{"content_substring" => "X"}]}])
+      assert [_] = Runner.load_queries!(path)
+    end
+
     test "raises when a query is missing required keys" do
       path = write_queries!([%{"query" => "no relevant key"}])
 
@@ -111,6 +116,37 @@ defmodule RetrievalNode.Bench.RunnerTest do
 
       assert ids == MapSet.new([both.id])
       refute wrong_repo.id in ids
+    end
+
+    test "content_substring keeps only same-file chunks containing the literal" do
+      source = source_fixture("repo-a")
+      meta = %{"path" => "lib/foo.ex"}
+      hit = chunk_fixture(source, repo: "repo-a", metadata: meta, content: "X = 1\nDOMAIN = 'a'")
+      _miss = chunk_fixture(source, repo: "repo-a", metadata: meta, content: "def f, do: 1")
+      _case = chunk_fixture(source, repo: "repo-a", metadata: meta, content: "domain = 'a'")
+
+      other =
+        chunk_fixture(source,
+          repo: "repo-a",
+          metadata: %{"path" => "lib/o.ex"},
+          content: "DOMAIN ="
+        )
+
+      assert Runner.resolve_relevant_ids([%{"content_substring" => "DOMAIN ="}]) ==
+               MapSet.new([hit.id, other.id])
+
+      assert Runner.resolve_relevant_ids([
+               %{"path_prefix" => "lib/foo.ex", "content_substring" => "DOMAIN ="}
+             ]) == MapSet.new([hit.id])
+    end
+
+    test "content_substring treats LIKE metacharacters literally" do
+      source = source_fixture("repo-a")
+      hit = chunk_fixture(source, content: "a_b 100% \\ done")
+      _wild = chunk_fixture(source, content: "axb 100x \\ done")
+
+      assert Runner.resolve_relevant_ids([%{"content_substring" => "a_b 100%"}]) ==
+               MapSet.new([hit.id])
     end
 
     test "OR's across multiple matchers in the list" do

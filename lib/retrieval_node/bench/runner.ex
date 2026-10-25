@@ -29,7 +29,7 @@ defmodule RetrievalNode.Bench.Runner do
   alias RetrievalNode.Search
 
   @default_queries_path "priv/bench/queries.jsonl"
-  @recognized_matcher_keys ~w(repo path_prefix breadcrumb_substring)
+  @recognized_matcher_keys ~w(repo path_prefix breadcrumb_substring content_substring)
 
   # Synthetic passages for the embed-throughput/RAM probe. The sentence is 13
   # words; 14 repeats lands ~180-200 words (~1.3 tokens/word for a typical
@@ -121,9 +121,9 @@ defmodule RetrievalNode.Bench.Runner do
   @doc """
   Resolve a list of relevance matchers (OR'd together) to the set of chunk ids
   currently in the corpus that any of them identify. Each individual matcher
-  ANDs together whichever of `repo` / `path_prefix` / `breadcrumb_substring`
-  it sets. Matching on these fields (not chunk ids) is what lets the same
-  query set survive a re-ingest that assigns fresh ids.
+  ANDs together whichever of `repo` / `path_prefix` / `breadcrumb_substring` /
+  `content_substring` (case-sensitive literal match on `Chunk.content`) it sets. Matching on these fields (not chunk ids) is what lets the
+  same query set survive a re-ingest that assigns fresh ids.
   """
   @spec resolve_relevant_ids([map()]) :: MapSet.t()
   def resolve_relevant_ids(matchers) when is_list(matchers) do
@@ -138,7 +138,13 @@ defmodule RetrievalNode.Bench.Runner do
     |> filter_repo(matcher["repo"])
     |> filter_path_prefix(matcher["path_prefix"])
     |> filter_breadcrumb(matcher["breadcrumb_substring"])
+    |> filter_content(matcher["content_substring"])
   end
+
+  defp filter_content(query, nil), do: query
+
+  defp filter_content(query, substring),
+    do: where(query, [c], fragment("strpos(?, ?) > 0", c.content, ^substring))
 
   defp filter_repo(query, nil), do: query
   defp filter_repo(query, repo), do: where(query, [c], c.repo == ^repo)

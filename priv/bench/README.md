@@ -41,9 +41,14 @@ A matcher is a JSON object with any (non-empty) combination of:
   git-relative file path; only set for `:git_repo` chunks).
 * `"breadcrumb_substring"` — case-insensitive substring match against
   `Chunk.context_breadcrumb`.
+* `"content_substring"` — case-**sensitive** literal substring of
+  `Chunk.content` (LIKE metacharacters are not special). Use it for
+  answer-level queries: relevance should mean "this chunk contains the
+  answer", not "this chunk is in the right file". Pick a short, single-line
+  literal so it can't be split across two chunks.
 
 Fields present on a single matcher are **AND'd together**. At least one of
-the three fields must be set — an empty matcher would match every chunk in
+the four fields must be set — an empty matcher would match every chunk in
 the corpus and silently inflate every nDCG score, so `Bench.Runner` raises
 loudly at load time if it sees one.
 
@@ -71,7 +76,8 @@ registrations, Go top-level `var`s. Before top-level (gap) chunks existed these
 were not indexed (files with no definitions produced zero chunks), so it is the
 measure for that feature. It targets the multi-repo seed corpus (`core`,
 `frontend`, `cli`, `supervisor`, `esphome`), with `repo` equal to the source
-name, and is unresolved (excluded from aggregates) on a corpus without them.
+name and a `content_substring` on every matcher so only chunks containing the
+answer count as relevant, and is unresolved (excluded from aggregates) on a corpus without them.
 
     mix rn.bench --queries priv/bench/toplevel_queries.jsonl
 
