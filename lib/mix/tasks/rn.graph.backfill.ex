@@ -199,9 +199,14 @@ defmodule Mix.Tasks.Rn.Graph.Backfill do
     #{Enum.map_join(busy, "\n", &"  - #{&1.name}")}
 
     Re-run this task once their in-flight sync finishes (it is idempotent):
-      mix rn.graph.backfill#{Enum.map_join(busy, "", &" --source #{&1.name}")}
+      mix rn.graph.backfill#{Enum.map_join(busy, "", &" --source #{shell_quote(&1.name)}")}
     """)
   end
+
+  # POSIX single-quoting: names are free-form (spaces, apostrophes), and the
+  # printed command must be runnable as-is.
+  @doc false
+  def shell_quote(value), do: "'" <> String.replace(value, "'", ~S('\'')) <> "'"
 
   # --- status (read-only) ---
 

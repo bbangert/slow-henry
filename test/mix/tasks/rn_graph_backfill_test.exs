@@ -55,4 +55,18 @@ defmodule Mix.Tasks.Rn.Graph.BackfillTest do
       assert message =~ "--bogus"
     end
   end
+
+  describe "shell_quote/1" do
+    test "quotes names so the printed rerun command is runnable as-is" do
+      assert Backfill.shell_quote("core") == "'core'"
+      assert Backfill.shell_quote("Payments API") == "'Payments API'"
+      assert Backfill.shell_quote("Bob's repo") == ~S('Bob'\''s repo')
+
+      # Round-trips through a real POSIX shell to the original value.
+      for name <- ["Payments API", "Bob's repo", "a\"b $HOME `x`"] do
+        {out, 0} = System.cmd("sh", ["-c", "printf %s " <> Backfill.shell_quote(name)])
+        assert out == name
+      end
+    end
+  end
 end

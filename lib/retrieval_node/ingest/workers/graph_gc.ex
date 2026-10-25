@@ -40,8 +40,12 @@ defmodule RetrievalNode.Ingest.Workers.GraphGc do
   # discovery jobs. Each source's own gc_orphaned_entities/1 call is itself
   # a batched loop, so a timeout-triggered retry resumes roughly where the
   # sweep left off — sources already fully reaped don't come back.
+  #
+  # Must stay BELOW Oban.Plugins.Lifeline's `rescue_after` (config.exs, 20
+  # minutes): Lifeline rescues by elapsed execution time, so a longer timeout
+  # would let it re-run a sweep that is still executing (enforced by a test).
   @impl Oban.Worker
-  def timeout(_job), do: :timer.minutes(30)
+  def timeout(_job), do: :timer.minutes(15)
 
   @impl Oban.Worker
   def perform(%Oban.Job{}) do

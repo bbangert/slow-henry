@@ -171,8 +171,10 @@ defmodule RetrievalNode.Ingest.FileIngest do
       {:ok, %{chunks: [], entities: entities, references: references}} ->
         chunk_boundaryless(row, content, opts, entities, references)
 
+      # The stored parse_status is the chunks' own: tree-sitter chunks are :ok,
+      # a graph-only language's heuristic chunks stay :heuristic_fallback.
       {:ok, %{chunks: chunks, entities: entities, references: references}} ->
-        finalize(row, chunks, "ok", opts, entities, references)
+        finalize(row, chunks, chunks_parse_status(chunks), opts, entities, references)
 
       {:error, :unsupported_language} ->
         heuristic_fallback(row, content, "heuristic_fallback", opts)
@@ -202,6 +204,9 @@ defmodule RetrievalNode.Ingest.FileIngest do
       finalize(row, chunks, "heuristic_fallback", opts, entities, references)
     end
   end
+
+  # Every chunk of one parse shares its status; chunks without one are :ok.
+  defp chunks_parse_status([first | _]), do: first |> Map.get(:parse_status, :ok) |> to_string()
 
   defp heuristic_fallback(row, content, parse_status, opts) do
     # The heuristic chunker has no AST to walk — no entities/references to attach.

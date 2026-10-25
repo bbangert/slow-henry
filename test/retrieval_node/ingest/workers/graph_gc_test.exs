@@ -83,7 +83,41 @@ defmodule RetrievalNode.Ingest.Workers.GraphGcTest do
     refute log =~ "graph_gc deleted"
   end
 
-  test "declares a 30-minute timeout so an unbounded orphan backlog can't squat an :sync slot forever" do
-    assert GraphGc.timeout(%Oban.Job{}) == :timer.minutes(30)
+  test "declares a 15-minute timeout so an unbounded orphan backlog can't squat an :sync slot forever" do
+    assert GraphGc.timeout(%Oban.Job{}) == :timer.minutes(15)
+  end
+
+  # Lifeline rescues by elapsed execution time: a worker whose timeout exceeds
+  # rescue_after can be rescued and re-run while still executing. Checked for
+  # EVERY Oban worker in the app against the real config (test config has no
+  # plugins).
+  test "every worker's timeout is below Lifeline's rescue_after" do
+    plugins =
+      "config/config.exs"
+      |> Config.Reader.read!(env: :prod)
+      |> get_in([:retrieval_node, Oban, :plugins])
+
+    rescue_after =
+      Enum.find_value(plugins, fn
+        {Oban.Plugins.Lifeline, opts} -> Keyword.fetch!(opts, :rescue_after)
+        _ -> nil
+      end)
+
+    {:ok, modules} = :application.get_key(:retrieval_node, :modules)
+
+    timeouts =
+      for m <- modules,
+          Code.ensure_loaded?(m),
+          function_exported?(m, :perform, 1) and function_exported?(m, :timeout, 1),
+          timeout = m.timeout(%Oban.Job{args: %{}}),
+          is_integer(timeout),
+          do: {m, timeout}
+
+    assert timeouts != [], "expected at least one worker with a timeout (GraphGc)"
+
+    for {m, timeout} <- timeouts do
+      assert timeout < rescue_after,
+             "#{inspect(m)} timeout #{timeout}ms >= Lifeline rescue_after #{rescue_after}ms"
+    end
   end
 end
