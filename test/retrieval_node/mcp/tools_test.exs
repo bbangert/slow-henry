@@ -5,8 +5,9 @@ defmodule RetrievalNode.MCP.ToolsTest do
   alias Anubis.Server.Frame
   alias Anubis.Server.Response
   alias RetrievalNode.Embedding
+  alias RetrievalNode.Graph
   alias RetrievalNode.Ingest.GitMirror
-  alias RetrievalNode.MCP.Tools.{GetFile, Grep, ListRepos, SemanticSearch}
+  alias RetrievalNode.MCP.Tools.{GetFile, Grep, ListRepos, RelatedCode, SemanticSearch}
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.{Chunk, Source}
 
@@ -204,6 +205,221 @@ defmodule RetrievalNode.MCP.ToolsTest do
       %{"results" => [hit | _]} = ok(SemanticSearch, %{query: "authentication"})
       refute Map.has_key?(hit, "fused_score")
     end
+  end
+
+  describe "related_code" do
+    test "definitions (default) returns the entity and its definition snippet" do
+      source = graph_source("d")
+
+      [chunk] =
+        index_graph(source, [
+          {graph_chunk(source, "process.py", "def process(): pass"),
+           [def_("PaymentProcessor.process")], []}
+        ])
+
+      assert %{"entities" => [found], "definitions" => [snippet]} =
+               ok(RelatedCode, %{entity: "process"})
+
+      assert found["qualified_name"] == "PaymentProcessor.process"
+      assert found["kind"] == "function"
+      assert found["language"] == "python"
+      assert found["source_id"] == source.id
+      assert snippet["repo"] == source.identifier
+      assert snippet["path"] == "process.py"
+      assert snippet["snippet"] == chunk.content
+      # the snippet carries the same entity_id so a caller can tie it back
+      assert snippet["entity_id"] == found["entity_id"]
+    end
+
+    test "callers with hops=2 returns transitive callers tagged with the right hop" do
+      source = graph_source("c")
+
+      index_graph(source, [
+        {graph_chunk(source, "a.py", "x"),
+         [def_("target_fn"), def_("caller1_fn"), def_("caller2_fn")],
+         List.duplicate(call("target_fn", "caller1_fn"), 3) ++
+           List.duplicate(call("caller1_fn", "caller2_fn"), 7)}
+      ])
+
+      assert %{"entities" => entities} =
+               ok(RelatedCode, %{entity: "target_fn", relation: "callers", hops: 2})
+
+      by_name = Map.new(entities, &{&1["qualified_name"], &1})
+      assert %{"weight" => 3, "hop" => 1} = by_name["caller1_fn"]
+      assert %{"weight" => 7, "hop" => 2} = by_name["caller2_fn"]
+    end
+
+    test "importers resolves a file-level import (no edge exists)" do
+      source = graph_source("imp")
+
+      index_graph(source, [
+        {graph_chunk(source, "app.py", "import os"), [def_("app_module")], [import_("os")]}
+      ])
+
+      assert %{"entities" => [found]} = ok(RelatedCode, %{entity: "os", relation: "importers"})
+      assert found["qualified_name"] == "app_module"
+
+      assert %{"entities" => [imported]} =
+               ok(RelatedCode, %{entity: "app_module", relation: "imports"})
+
+      assert imported["qualified_name"] == "os"
+    end
+
+    test "definitions skips a reference-only entity of the same bare name; callers still work" do
+      source = graph_source("ref")
+
+      index_graph(source, [
+        {graph_chunk(source, "p.py", "def helper(): pass"),
+         [def_("Payment.Processor.helper"), def_("run")], [call("helper", "run")]}
+      ])
+
+      assert %{"entities" => [found], "definitions" => [snippet]} =
+               ok(RelatedCode, %{entity: "helper"})
+
+      assert found["qualified_name"] == "Payment.Processor.helper"
+      assert snippet["snippet"] == "def helper(): pass"
+
+      assert %{"entities" => [%{"qualified_name" => "run"}]} =
+               ok(RelatedCode, %{entity: "helper", relation: "callers"})
+    end
+
+    test "an invalid relation is rejected with a listing of valid values" do
+      msg = err(RelatedCode, %{entity: "x", relation: "bogus"})
+      assert msg =~ "unknown relation"
+      assert msg =~ "callers"
+    end
+
+    test "invalid hops values are rejected with an error" do
+      for hops <- [0, 3, -1] do
+        assert err(RelatedCode, %{entity: "x", hops: hops}) =~ "invalid hops"
+      end
+    end
+
+    test "blank, oversized, and non-string arguments are rejected before any query" do
+      assert err(RelatedCode, %{entity: ""}) =~ "entity must not be blank"
+      assert err(RelatedCode, %{entity: "   "}) =~ "entity must not be blank"
+      assert err(RelatedCode, %{entity: String.duplicate("a", 257)}) =~ "entity too long"
+      assert err(RelatedCode, %{entity: "x", repo: ""}) =~ "repo must not be blank"
+      assert err(RelatedCode, %{entity: "x", lang: String.duplicate("a", 257)}) =~ "lang too long"
+      assert err(RelatedCode, %{entity: "a\0b"}) =~ "invalid entity"
+      assert err(RelatedCode, %{entity: 5}) =~ "entity must be a string"
+    end
+
+    test "an unmatched entity is a valid empty result, not an error" do
+      assert %{"entities" => [], "note" => note} =
+               ok(RelatedCode, %{entity: "NoSuchEntityAtAllZzz"})
+
+      assert note =~ "no entity matched"
+    end
+
+    test "entity: \"%\" does not walk the corpus — LIKE metacharacters are escaped" do
+      source = graph_source("esc")
+
+      index_graph(source, [
+        {graph_chunk(source, "a.py", "x"), [def_("PaymentProcessor.process")], []}
+      ])
+
+      assert %{"entities" => [], "note" => note} = ok(RelatedCode, %{entity: "%"})
+      assert note =~ "no entity matched"
+    end
+
+    test "repo filter scopes resolution to entities mentioned in that repo" do
+      source_a = graph_source("ra")
+      source_b = graph_source("rb")
+
+      index_graph(source_a, [{graph_chunk(source_a, "a.py", "a"), [def_("shared_fn")], []}])
+      index_graph(source_b, [{graph_chunk(source_b, "b.py", "b"), [def_("shared_fn")], []}])
+
+      assert %{"entities" => [found], "definitions" => [snippet]} =
+               ok(RelatedCode, %{entity: "shared_fn", repo: source_a.identifier})
+
+      assert found["source_id"] == source_a.id
+      assert snippet["repo"] == source_a.identifier
+    end
+
+    test "a matched entity with no traversal results carries a note explaining why" do
+      source = graph_source("empty")
+
+      index_graph(source, [{graph_chunk(source, "l.py", "x"), [def_("lonely_fn")], []}])
+
+      assert %{"entities" => [], "definitions" => [], "note" => note} =
+               ok(RelatedCode, %{entity: "lonely_fn", relation: "callers"})
+
+      assert note =~ "no call edges"
+
+      assert %{"note" => import_note} =
+               ok(RelatedCode, %{entity: "lonely_fn", relation: "importers"})
+
+      assert import_note =~ "no import mentions"
+    end
+
+    test "result sizes stay bounded: entities capped at 50, snippets at 50 even for 60 matches" do
+      source = graph_source("big")
+      callers = for n <- 1..60, do: def_("caller_#{n}")
+      refs = for n <- 1..60, do: call("hub_fn", "caller_#{n}")
+
+      index_graph(source, [
+        {graph_chunk(source, "hub.py", "x"), [def_("hub_fn") | callers], refs}
+      ])
+
+      assert %{"entities" => entities, "definitions" => defs} =
+               ok(RelatedCode, %{entity: "hub_fn", relation: "callers"})
+
+      assert length(entities) == 50
+      assert length(defs) <= 50
+
+      assert %{"entities" => matched} = ok(RelatedCode, %{entity: "caller_"})
+      assert length(matched) <= 50
+    end
+  end
+
+  # --- graph helpers ---
+
+  defp graph_source(tag) do
+    Repo.insert!(%Source{
+      source_type: :git_repo,
+      name: "acme/#{tag}",
+      identifier: "acme/#{tag}-#{System.unique_integer([:positive])}"
+    })
+  end
+
+  defp graph_chunk(source, path, content, opts \\ []) do
+    Repo.insert!(%Chunk{
+      source_id: source.id,
+      source_type: :git_repo,
+      repo: source.identifier,
+      lang: Keyword.get(opts, :lang, "python"),
+      chunk_key: "k-#{System.unique_integer([:positive])}",
+      content_hash: "h-#{System.unique_integer([:positive])}",
+      content: content,
+      context_breadcrumb: path,
+      metadata: %{"path" => path}
+    })
+  end
+
+  defp def_(name), do: %{qualified_name: name, kind: :function, line: 1}
+  defp call(name, from), do: %{name: name, kind: :call, from: from, line: 2}
+  defp import_(name), do: %{name: name, kind: :import, from: nil, line: 1}
+
+  # Writes graph rows through the real Graph.upsert_from_staged/3 so entities,
+  # mentions and edges have exactly the shape ingest produces. Entries are
+  # {chunk, entities, references}; returns the chunks.
+  defp index_graph(source, entries) do
+    rows =
+      for {chunk, entities, references} <- entries do
+        %{
+          source_id: source.id,
+          lang: chunk.lang || "python",
+          chunk_key: chunk.chunk_key,
+          natural_key: "repo:#{source.identifier}:#{chunk.metadata["path"]}",
+          metadata: chunk.metadata,
+          graph: %{entities: entities, references: references}
+        }
+      end
+
+    ids = Map.new(entries, fn {chunk, _, _} -> {chunk.chunk_key, chunk.id} end)
+    {:ok, _} = Graph.upsert_from_staged(Repo, rows, ids)
+    Enum.map(entries, &elem(&1, 0))
   end
 
   # --- helpers ---
