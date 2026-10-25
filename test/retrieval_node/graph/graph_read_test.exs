@@ -614,16 +614,36 @@ defmodule RetrievalNode.GraphReadTest do
       end
     end
 
-    test "aliasing stays within source and language", %{source: source} do
+    test "aliasing stays within source and language", %{source: source, helper: helper} do
       other = source_fixture()
       ingest(other, [{"o1", [def_("Payment.Processor.helper")], [], []}])
       ingest(source, [{"c3", [def_("Payment.Processor.helper")], [], [lang: "javascript"]}])
+
+      # control: this source's python definition does get the bare-name caller
+      assert names(Graph.related_entities([helper.id], :callers)) ==
+               ["Payment.Processor.process"]
 
       assert Graph.related_entities([entity!(other, "Payment.Processor.helper").id], :callers) ==
                []
 
       js = entity!(source, "Payment.Processor.helper", "javascript")
       assert Graph.related_entities([js.id], :callers) == []
+    end
+
+    test "a distinct definition named like a suffix of the seed is a real caller/callee", %{
+      source: source
+    } do
+      ingest(source, [
+        {"c8", [def_("Mod.run"), def_("run")], [call("Mod.run", "run"), call("run", "Mod.run")],
+         []}
+      ])
+
+      mod_run = entity!(source, "Mod.run")
+      run = entity!(source, "run")
+
+      assert names(Graph.related_entities([mod_run.id], :callers)) == ["run"]
+      assert names(Graph.related_entities([mod_run.id], :callees)) == ["run"]
+      assert names(Graph.related_entities([run.id], :callers)) == ["Mod.run"]
     end
 
     test "an entity's own aliases are never returned as its results", %{source: source} do
@@ -634,6 +654,45 @@ defmodule RetrievalNode.GraphReadTest do
       rec = entity!(source, "Mod.rec")
       assert Graph.related_entities([rec.id], :callees, 2) == []
       assert Graph.related_entities([rec.id], :callers, 2) == []
+    end
+
+    # The expansion caps (@alias_limit = 500) are module attributes with no test
+    # seam, so these build enough rows (800 / 600) to exceed them.
+    test "callees: recursive aliases beyond the lookup cap are still excluded", %{source: source} do
+      # 100 seeds, each calling all 8 of its own name suffixes (reference-only
+      # aliases of itself): 800 alias entities > the 500-row lookup limit.
+      prefix = "P.q.r.s.t.u.v"
+      seeds = for i <- 1..100, do: "#{prefix}.fn#{i}"
+
+      suffixes = fn name ->
+        parts = String.split(name, ".")
+        for n <- 1..length(parts), do: parts |> Enum.take(-n) |> Enum.join(".")
+      end
+
+      refs =
+        for s <- seeds, suffix <- suffixes.(s), do: call(suffix, s)
+
+      ingest(source, [
+        {"c6", Enum.map(seeds, &def_/1) ++ [def_("real")], [call("real", hd(seeds)) | refs], []}
+      ])
+
+      ids = for s <- seeds, do: entity!(source, s).id
+
+      assert [%{entity: %{qualified_name: "real"}}] = Graph.related_entities(ids, :callees)
+    end
+
+    test "callers of a bare name never return the definitions it aliases, past the cap", %{
+      source: source
+    } do
+      defs = for i <- 1..600, do: def_("X#{i}.get")
+      recursive = for i <- 1..600, do: call("get", "X#{i}.get")
+
+      ingest(source, [
+        {"c7", [def_("real_caller") | defs], [call("get", "real_caller") | recursive], []}
+      ])
+
+      results = Graph.related_entities([entity!(source, "get").id], :callers)
+      assert names(results) == ["real_caller"]
     end
 
     test "resolving a hot bare name stays bounded", %{source: source} do
