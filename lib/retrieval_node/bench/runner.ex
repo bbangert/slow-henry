@@ -122,8 +122,9 @@ defmodule RetrievalNode.Bench.Runner do
   Resolve a list of relevance matchers (OR'd together) to the set of chunk ids
   currently in the corpus that any of them identify. Each individual matcher
   ANDs together whichever of `repo` / `path_prefix` / `breadcrumb_substring` /
-  `content_substring` (case-sensitive literal match on `Chunk.content`) it sets. Matching on these fields (not chunk ids) is what lets the
-  same query set survive a re-ingest that assigns fresh ids.
+  `content_substring` (case-sensitive literal match on `Chunk.content`) it
+  sets. Matching on these fields (not chunk ids) is what lets the same query
+  set survive a re-ingest that assigns fresh ids.
   """
   @spec resolve_relevant_ids([map()]) :: MapSet.t()
   def resolve_relevant_ids(matchers) when is_list(matchers) do
