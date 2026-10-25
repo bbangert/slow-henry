@@ -24,7 +24,11 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   `use`/ExUnit `test` blocks — become `kind: "toplevel"` chunks. A container
   (a boundary node with nested boundaries) emits its nested chunks plus the
   gaps of its own byte range, scoped to the container; the root emits the
-  gaps of the whole file with an empty breadcrumb. Gaps are trimmed to their
+  gaps of the whole file with an empty breadcrumb. Elixir module forms
+  (`defmodule`/`defprotocol`/`defimpl`) are always containers, even with no
+  nested boundary: their bodies are arbitrary macro DSL (ExUnit, Ecto schemas,
+  config), so they are size-bounded `toplevel` chunks, never one unsplit
+  definition chunk. Gaps are trimmed to their
   non-whitespace extent and split at line boundaries using the heuristic
   chunker's size limits, working purely on byte offsets into the original
   source (so CRLF is preserved and `text == binary_part(source, ...)`).
@@ -55,8 +59,8 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   @allowed_languages ~w(python javascript typescript go rust ruby java elixir)
 
   # Elixir def-family forms that mark a chunk boundary when they're a `call`
-  # node's target identifier. defmodule/defprotocol/defimpl are containers
-  # (their do_block holds nested defs); the rest are leaf-most function chunks.
+  # node's target identifier. defmodule/defprotocol/defimpl are always
+  # containers (see `container_form?/3`); the rest are leaf-most function chunks.
   @elixir_module_forms ~w(defmodule defprotocol defimpl)
   @elixir_function_forms ~w(def defp defmacro defmacrop defguard defguardp defdelegate)
   @elixir_def_forms @elixir_module_forms ++ @elixir_function_forms
@@ -244,24 +248,42 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   # A chunkable node with chunkable descendants (a container, e.g. a class) yields
   # its members plus the gaps of its own range they leave uncovered (header,
   # docstring, fields), scoped to the container; a leaf-most one is emitted as a
-  # chunk itself.
+  # chunk itself. An Elixir module form is a container even with no nested
+  # boundaries, so its macro-DSL body is gap-split under the size limits.
   defp emit_or_recurse(child, source, language, scope, kind) do
     child_scope = enclosing_scope(child, source, language, scope) ++ [node_name(child, source)]
 
     case extract(child, source, language, child_scope) do
       [] ->
-        [to_chunk(child, source, kind, child_scope)]
+        if container_form?(child, source, language) do
+          emit_container(child, source, [], child_scope)
+        else
+          [to_chunk(child, source, kind, child_scope)]
+        end
 
       nested ->
-        add_gaps(
-          nested,
-          source,
-          TS.node_start_byte(child),
-          TS.node_end_byte(child),
-          Enum.join(child_scope, " > ")
-        )
+        emit_container(child, source, nested, child_scope)
     end
   end
+
+  defp emit_container(node, source, nested, child_scope) do
+    add_gaps(
+      nested,
+      source,
+      TS.node_start_byte(node),
+      TS.node_end_byte(node),
+      Enum.join(child_scope, " > ")
+    )
+  end
+
+  defp container_form?(node, source, "elixir") do
+    case TS.node_child_by_field_name(node, "target") do
+      nil -> false
+      target_node -> slice(source, target_node) in @elixir_module_forms
+    end
+  end
+
+  defp container_form?(_node, _source, _language), do: false
 
   # A rooted `defmodule Elixir.Foo` is absolute: it never nests under the
   # enclosing module, matching `Graph.Extractor.TreeSitter`.

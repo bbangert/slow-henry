@@ -333,6 +333,67 @@ defmodule RetrievalNode.Chunking.TreeSitterCoverageTest do
         assert [%{breadcrumb: "PayTest"}] = Enum.filter(toplevel, &(&1.text =~ needle))
       end
     end
+
+    test "a def-less ExUnit module over the hard cap is split into toplevel chunks" do
+      tests =
+        Enum.map_join(1..120, "\n", fn i ->
+          """
+            describe "group #{i}" do
+              test "case #{i}" do
+                assert String.duplicate("padding text ", 4) != "x#{i}"
+              end
+            end
+          """
+        end)
+
+      src = "defmodule BigTest do\n  use ExUnit.Case\n\n#{tests}end\n"
+      assert byte_size(src) > HeuristicImpl.hard_max_bytes()
+
+      assert_def_less_module(src, "BigTest")
+    end
+
+    test "a def-less Ecto schema module is split into toplevel chunks" do
+      fields = Enum.map_join(1..400, "\n", &"    field :field_number_#{&1}, :string")
+
+      src =
+        "defmodule Big.Schema do\n  use Ecto.Schema\n\n  schema \"things\" do\n#{fields}\n  end\nend\n"
+
+      assert byte_size(src) > HeuristicImpl.hard_max_bytes()
+
+      assert_def_less_module(src, "Big.Schema")
+    end
+
+    test "nested def-less modules scope their own content" do
+      src = """
+      defmodule Outer do
+        use Y
+
+        defmodule Inner do
+          use X
+        end
+      end
+      """
+
+      chunks = assert_covered(src, "elixir")
+      assert Enum.all?(chunks, &(&1.kind == "toplevel"))
+      assert [%{breadcrumb: "Outer > Inner"}] = Enum.filter(chunks, &(&1.text =~ "use X"))
+      assert [%{breadcrumb: "Outer"}] = Enum.filter(chunks, &(&1.text =~ "use Y"))
+    end
+
+    test "an empty module is one small toplevel chunk" do
+      chunks = assert_covered("defmodule Foo do\nend\n", "elixir")
+      assert [%{kind: "toplevel", breadcrumb: "Foo"}] = chunks
+    end
+  end
+
+  defp assert_def_less_module(src, name) do
+    chunks = assert_covered(src, "elixir")
+    assert length(chunks) > 1
+    assert Enum.all?(chunks, &(&1.kind == "toplevel" and &1.breadcrumb == name))
+
+    for chunk <- chunks do
+      assert byte_size(chunk.text) <= HeuristicImpl.hard_max_bytes()
+    end
   end
 
   # --- the one checker ------------------------------------------------------
