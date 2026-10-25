@@ -12,8 +12,11 @@ defmodule RetrievalNode.Graph do
   staged rows come from one source file (hence one `source_id`), so a source's
   single writer never races another caller for the same entities.
 
-  The read side of these tables (entity lookup, caller/callee traversal,
-  definition snippets) lands in a later change.
+  The read side (`find_entities/2`, `related_entities/3`,
+  `definition_snippets/2`) backs the `related_code` MCP tool. Every read here
+  is bounded at a single choke point per dimension (result limit, hops,
+  seed-id count, per-traversal fan-out, snippet size) so no caller can ask
+  for an unbounded query.
   """
 
   import Ecto.Query
@@ -22,6 +25,7 @@ defmodule RetrievalNode.Graph do
 
   alias RetrievalNode.Graph.{Entity, EntityEdge, EntityMention}
   alias RetrievalNode.Repo
+  alias RetrievalNode.Retrieval.Chunk
 
   # Same 65,535-bind-parameter ceiling as PendingChunks/FileIngest (see
   # PendingChunks' moduledoc) — every insert_all below batches at this size.
@@ -235,6 +239,430 @@ defmodule RetrievalNode.Graph do
         )
     )
     |> where([e], e.source_id == ^source_id)
+  end
+
+  # --- read-side queries ---------------------------------------------------
+
+  @find_entities_default_limit 20
+  @find_entities_max_limit 50
+  @related_entities_relations [:callers, :callees, :imports, :importers]
+  @related_entities_limit 50
+  @definition_snippets_limit 50
+  @snippet_max_lines 20
+  @snippet_max_chars 1000
+
+  # Symbols are capped at 256 bytes on write (@max_symbol_bytes), so a longer
+  # lookup name can never match exactly and would only make the trigram tier
+  # pay O(name x qualified_name) per candidate row.
+  @max_name_bytes 256
+
+  # Caps how many seed ids any traversal/snippet call accepts: an `IN` list
+  # is a bind parameter per call, and every id fans out into its own edges.
+  @max_seed_ids 100
+
+  # Bounds a single edges_query/4 traversal — hot symbols (e.g. `init`,
+  # `get`) can have six-figure in-degree in a many-repo corpus, and an
+  # uncapped query would load every one of those edges into BEAM heap.
+  @edge_fanout_limit 500
+
+  # Caps how many hop-1 entity ids (by weight desc) are carried into the
+  # hop-2 traversal — hop-2 fans out from EVERY id in the frontier, so an
+  # uncapped frontier would multiply, not bound, the hop-1 fan-out risk.
+  @hop2_frontier_limit 100
+
+  @doc """
+  Resolve `name` to matching entities, optionally scoped by `:repo`/`:lang`
+  and capped at `:limit` (default #{@find_entities_default_limit}, max
+  #{@find_entities_max_limit}). Three-tier resolution, each tier tried only
+  if the previous found nothing:
+
+    1. Exact `qualified_name` match.
+    2. Suffix match (`qualified_name ILIKE "%.<name>"`) — so a bare name
+       like `"process"` finds `"PaymentProcessor.process"`.
+    3. Trigram best-effort (`qualified_name %> name`, ordered by
+       `word_similarity(name, qualified_name)` desc) — for typos/near
+       matches, served by the `entities_qualified_name_trgm_idx` GIN index.
+
+  Exact and suffix results are ordered shortest-name-first, then by name and
+  id, so a limit cut is deterministic.
+
+  `entities` carries no `repo` column of its own — identity is scoped to
+  `source_id`, not repo — so `:repo` filters via `EXISTS` against
+  `entity_mentions` joined to `chunks` (does this entity have at least one
+  mention on a chunk tagged with that repo?) rather than a direct column
+  filter.
+
+  Returns `[]` for a name or filter that can never match: not a valid
+  string (non-UTF-8, contains NUL), blank, or over #{@max_name_bytes} bytes.
+  """
+  @spec find_entities(String.t(), keyword()) :: [Entity.t()]
+  def find_entities(name, opts \\ []) do
+    repo = Keyword.get(opts, :repo)
+    lang = Keyword.get(opts, :lang)
+
+    if valid_name?(name) and valid_filter?(repo) and valid_filter?(lang) do
+      limit = opts |> Keyword.get(:limit, @find_entities_default_limit) |> clamp_find_limit()
+      name = String.trim(name)
+
+      base =
+        from(e in Entity, as: :entity)
+        |> filter_lang(lang)
+        |> filter_repo(repo)
+
+      with [] <- base |> exact_name_query(name) |> run_limited(limit),
+           [] <- base |> suffix_name_query(name) |> run_limited(limit) do
+        base |> trigram_name_query(name) |> run_limited(limit)
+      else
+        rows -> rows
+      end
+    else
+      []
+    end
+  end
+
+  defp valid_name?(name) when is_binary(name) do
+    trimmed = String.trim(name)
+    trimmed != "" and byte_size(trimmed) <= @max_name_bytes and storable_text?(trimmed)
+  end
+
+  defp valid_name?(_), do: false
+
+  defp valid_filter?(nil), do: true
+  defp valid_filter?(text) when is_binary(text), do: storable_text?(text)
+  defp valid_filter?(_), do: false
+
+  # Postgres text params reject invalid UTF-8 and NUL bytes (Postgrex raises).
+  defp storable_text?(text), do: String.valid?(text) and not String.contains?(text, <<0>>)
+
+  defp clamp_find_limit(n) when is_integer(n) and n > 0, do: min(n, @find_entities_max_limit)
+  defp clamp_find_limit(_), do: @find_entities_default_limit
+
+  defp filter_lang(query, nil), do: query
+  defp filter_lang(query, lang), do: from(e in query, where: e.language == ^lang)
+
+  defp filter_repo(query, nil), do: query
+
+  defp filter_repo(query, repo) do
+    from(e in query,
+      where:
+        exists(
+          from(m in EntityMention,
+            join: c in Chunk,
+            on: c.id == m.chunk_id,
+            where: m.entity_id == parent_as(:entity).id and c.repo == ^repo,
+            select: 1
+          )
+        )
+    )
+  end
+
+  defp exact_name_query(base, name) do
+    from(e in base,
+      where: e.qualified_name == ^name,
+      order_by: [asc: e.qualified_name, asc: e.id]
+    )
+  end
+
+  defp suffix_name_query(base, name) do
+    # ilike/2 can't carry an ESCAPE clause, so the fragment form is required
+    # to escape caller-supplied LIKE metacharacters — otherwise e.g.
+    # `name: "%"` would ILIKE-match every dotted qualified_name corpus-wide.
+    pattern = "%." <> escape_like(name)
+
+    from(e in base,
+      where: fragment("? ILIKE ? ESCAPE '\\'", e.qualified_name, ^pattern),
+      order_by: [asc: fragment("length(?)", e.qualified_name), asc: e.qualified_name, asc: e.id]
+    )
+  end
+
+  defp escape_like(text), do: String.replace(text, ~r/([%_\\])/, "\\\\\\1")
+
+  defp trigram_name_query(base, name) do
+    from(e in base,
+      where: fragment("? %> ?", e.qualified_name, ^name),
+      order_by: [
+        desc: fragment("word_similarity(?, ?)", ^name, e.qualified_name),
+        asc: e.qualified_name,
+        asc: e.id
+      ]
+    )
+  end
+
+  defp run_limited(query, limit), do: query |> limit(^limit) |> Repo.all()
+
+  @doc """
+  Traverse from `entity_ids` along `relation`, 1 or 2 hops:
+
+    * `:callers`   — edges kind `:calls`, `target_entity_id` in the set;
+      returns the calling (source) entities.
+    * `:callees`   — edges kind `:calls`, `source_entity_id` in the set;
+      returns the called (target) entities.
+    * `:importers` — entities that import the matched entities.
+    * `:imports`   — entities the matched entities import.
+
+  `:callers`/`:callees` traverse `entity_edges` only. `:importers`/`:imports`
+  UNION two resolution legs, deduped by entity id (ties keep the larger
+  weight):
+
+    1. `entity_edges` kind `:imports` (same shape as callers/callees) — fires
+       when a reference happened to resolve a `from` (an import inside a
+       function/method scope, say).
+    2. Mention-based: a **file-level** import — the common case — carries
+       `from: nil` (no enclosing definition to source an edge from), so it
+       never produces an `entity_edges` row at all. Its only record is two
+       `entity_mentions` sharing one `chunk_id`: an `:import` mention of the
+       imported entity and a `:definition` mention of the importing file's
+       definition entity on that same chunk. `:importers` of X resolves this
+       by finding chunks with an `:import` mention of X, then those chunks'
+       `:definition` mentions; `:imports` of X resolves the opposite
+       direction (chunks with a `:definition` mention of X, then those
+       chunks' `:import` mentions). Weight is the count of qualifying import
+       mentions.
+
+  `hops: 2` repeats the same resolution (both legs, for imports/importers)
+  starting from the first hop's entities, unions the two hops, and dedups by
+  entity — an entity reached at hop 1 is excluded from the hop-2 set (so it
+  keeps its hop-1 weight/tag), and the original seed ids are excluded from
+  both hops (guards against a traversal cycling back to a seed). Ties within
+  a hop (the same entity reachable more than once) keep the larger weight.
+  Final results are ordered by weight desc (entity id breaks ties) and capped
+  at #{@related_entities_limit}.
+
+  Bounds: at most #{@max_seed_ids} distinct seed ids are used; each
+  underlying query (edge or mention leg) is itself capped at
+  #{@edge_fanout_limit} rows (ordered by weight/count desc — see
+  `edges_query/4` and the mention-leg query functions), and the hop-1 ->
+  hop-2 frontier is capped at #{@hop2_frontier_limit} entity ids (also by
+  weight desc) so a hot symbol's fan-out can't compound across two hops into
+  an unbounded traversal. Raises `ArgumentError` for an unknown `relation`
+  or `hops` outside 1..2.
+
+  Traversal never crosses sources: edges are written between entities of one
+  source, and the mention legs join on a shared chunk.
+  """
+  @spec related_entities([Ecto.UUID.t()], :callers | :callees | :imports | :importers, 1 | 2) ::
+          [%{entity: Entity.t(), weight: integer(), hop: 1 | 2}]
+  def related_entities(entity_ids, relation, hops \\ 1)
+
+  def related_entities(entity_ids, relation, hops)
+      when is_list(entity_ids) and relation in @related_entities_relations and hops in [1, 2] do
+    case clamp_seed_ids(entity_ids) do
+      [] -> []
+      seed_list -> traverse(seed_list, relation, hops)
+    end
+  end
+
+  def related_entities(_entity_ids, relation, hops) do
+    raise ArgumentError,
+          "related_entities/3 expects a list of ids, relation in " <>
+            "#{inspect(@related_entities_relations)} and hops 1 or 2, " <>
+            "got relation=#{inspect(relation)} hops=#{inspect(hops)}"
+  end
+
+  defp clamp_seed_ids(ids), do: ids |> Enum.uniq() |> Enum.take(@max_seed_ids)
+
+  defp traverse(seed_list, relation, hops) do
+    seed_ids = MapSet.new(seed_list)
+
+    hop1 =
+      seed_list
+      |> traverse_edges(relation)
+      |> reject_seen(seed_ids)
+      |> dedup_max_weight()
+
+    tagged_hop1 = Enum.map(hop1, &Map.put(&1, :hop, 1))
+
+    tagged =
+      if hops == 1 do
+        tagged_hop1
+      else
+        excluded = MapSet.union(seed_ids, MapSet.new(hop1, & &1.entity_id))
+
+        # hop-1 is already bounded by @edge_fanout_limit per query, but
+        # feeding all of it into a second traversal would multiply that
+        # fan-out instead of bounding it.
+        hop2_frontier =
+          hop1
+          |> rank()
+          |> Enum.take(@hop2_frontier_limit)
+          |> Enum.map(& &1.entity_id)
+
+        hop2 =
+          hop2_frontier
+          |> traverse_edges(relation)
+          |> reject_seen(excluded)
+          |> dedup_max_weight()
+          |> Enum.map(&Map.put(&1, :hop, 2))
+
+        tagged_hop1 ++ hop2
+      end
+
+    # Rank and cut BEFORE loading entity rows so at most
+    # @related_entities_limit rows are ever fetched.
+    top = tagged |> rank() |> Enum.take(@related_entities_limit)
+    entities_by_id = load_entities(Enum.map(top, & &1.entity_id))
+
+    Enum.flat_map(top, fn %{entity_id: id, weight: weight, hop: hop} ->
+      case Map.fetch(entities_by_id, id) do
+        {:ok, entity} -> [%{entity: entity, weight: weight, hop: hop}]
+        :error -> []
+      end
+    end)
+  end
+
+  defp rank(rows), do: Enum.sort_by(rows, &{-&1.weight, &1.entity_id})
+
+  defp reject_seen(rows, ids), do: Enum.reject(rows, &MapSet.member?(ids, &1.entity_id))
+
+  defp dedup_max_weight(rows) do
+    rows
+    |> Enum.reduce(%{}, fn %{entity_id: id, weight: w}, acc ->
+      Map.update(acc, id, w, &max(&1, w))
+    end)
+    |> Enum.map(fn {id, w} -> %{entity_id: id, weight: w} end)
+  end
+
+  defp traverse_edges(ids, :callers),
+    do: edges_query(ids, :calls, :target_entity_id, :source_entity_id)
+
+  defp traverse_edges(ids, :callees),
+    do: edges_query(ids, :calls, :source_entity_id, :target_entity_id)
+
+  defp traverse_edges(ids, :importers),
+    do:
+      edges_query(ids, :imports, :target_entity_id, :source_entity_id) ++
+        importers_by_mention(ids)
+
+  defp traverse_edges(ids, :imports),
+    do:
+      edges_query(ids, :imports, :source_entity_id, :target_entity_id) ++ imports_by_mention(ids)
+
+  # A logical (source, target, kind) edge can back onto MULTIPLE entity_edges
+  # rows — one per contributing chunk (see EntityEdge's moduledoc) — so this
+  # groups by the entity pair before a consumer ever sees a row, summing each
+  # pair's chunk-level weights into one logical weight.
+  defp edges_query(ids, kind, filter_field, select_field) do
+    from(e in EntityEdge,
+      where: e.kind == ^kind and field(e, ^filter_field) in ^ids,
+      group_by: [e.source_entity_id, e.target_entity_id],
+      select: %{entity_id: field(e, ^select_field), weight: type(sum(e.weight), :integer)},
+      order_by: [desc: sum(e.weight), asc: field(e, ^select_field)],
+      limit: @edge_fanout_limit
+    )
+    |> Repo.all()
+  end
+
+  # Mention-based leg of :importers (see related_entities/3): the :definition
+  # mentions on chunks carrying an :import mention of one of `ids`. Weight is
+  # the count of qualifying import mentions. Bounded like edges_query/4.
+  defp importers_by_mention(ids) do
+    from(m in EntityMention,
+      join: d in EntityMention,
+      on: d.chunk_id == m.chunk_id and d.kind == :definition,
+      where: m.kind == :import and m.entity_id in ^ids and d.entity_id not in ^ids,
+      group_by: d.entity_id,
+      select: %{entity_id: d.entity_id, weight: count(m.id)},
+      order_by: [desc: count(m.id), asc: d.entity_id],
+      limit: @edge_fanout_limit
+    )
+    |> Repo.all()
+  end
+
+  # Mirror image of importers_by_mention/1.
+  defp imports_by_mention(ids) do
+    from(m in EntityMention,
+      join: i in EntityMention,
+      on: i.chunk_id == m.chunk_id and i.kind == :import,
+      where: m.kind == :definition and m.entity_id in ^ids and i.entity_id not in ^ids,
+      group_by: i.entity_id,
+      select: %{entity_id: i.entity_id, weight: count(i.id)},
+      order_by: [desc: count(i.id), asc: i.entity_id],
+      limit: @edge_fanout_limit
+    )
+    |> Repo.all()
+  end
+
+  defp load_entities([]), do: %{}
+
+  defp load_entities(ids) do
+    Entity
+    |> where([e], e.id in ^ids)
+    |> Repo.all()
+    |> Map.new(&{&1.id, &1})
+  end
+
+  @doc """
+  Definition-site snippets for `entity_ids` — the chunk(s) where each entity
+  has a `:definition` mention (at most #{@max_seed_ids} distinct ids are
+  used). One query, shaped in memory; capped at `:limit` rows total (default
+  and max #{@definition_snippets_limit}), ordered by entity id then chunk id
+  so the cut is deterministic.
+
+  Each snippet is the defining chunk's `content` truncated to whichever of
+  #{@snippet_max_lines} lines or #{@snippet_max_chars} chars cuts first
+  (line cut applied before the char cut), with a trailing "…" marker when
+  either cut actually truncated the content. The prefix is cut in SQL so a
+  large chunk's full content never reaches the BEAM.
+  """
+  @spec definition_snippets([Ecto.UUID.t()], keyword()) :: [map()]
+  def definition_snippets(entity_ids, opts \\ [])
+
+  def definition_snippets([], _opts), do: []
+
+  def definition_snippets(entity_ids, opts) when is_list(entity_ids) do
+    limit = opts |> Keyword.get(:limit, @definition_snippets_limit) |> clamp_snippet_limit()
+    # One char past the cap, so truncate_snippet/1 can tell "exactly at the
+    # cap" from "longer than it".
+    prefix_chars = @snippet_max_chars + 1
+
+    from(m in EntityMention,
+      join: c in Chunk,
+      on: c.id == m.chunk_id,
+      where: m.kind == :definition and m.entity_id in ^clamp_seed_ids(entity_ids),
+      order_by: [asc: m.entity_id, asc: c.id],
+      select: %{
+        entity_id: m.entity_id,
+        repo: c.repo,
+        lang: c.lang,
+        path: fragment("?->>'path'", c.metadata),
+        breadcrumb: c.context_breadcrumb,
+        content: fragment("left(?, ?)", c.content, ^prefix_chars)
+      },
+      limit: ^limit
+    )
+    |> Repo.all()
+    |> Enum.map(&shape_snippet/1)
+  end
+
+  defp clamp_snippet_limit(n) when is_integer(n) and n > 0, do: min(n, @definition_snippets_limit)
+  defp clamp_snippet_limit(_), do: @definition_snippets_limit
+
+  defp shape_snippet(row) do
+    %{
+      entity_id: row.entity_id,
+      repo: row.repo,
+      lang: row.lang,
+      path: row.path,
+      breadcrumb: row.breadcrumb,
+      snippet: truncate_snippet(row.content || "")
+    }
+  end
+
+  defp truncate_snippet(content) do
+    lines = String.split(content, "\n")
+    line_capped? = length(lines) > @snippet_max_lines
+    by_lines = lines |> Enum.take(@snippet_max_lines) |> Enum.join("\n")
+
+    cond do
+      String.length(by_lines) > @snippet_max_chars ->
+        String.slice(by_lines, 0, @snippet_max_chars) <> "…"
+
+      line_capped? ->
+        by_lines <> "…"
+
+      true ->
+        by_lines
+    end
   end
 
   # --- staged-graph sanitation --------------------------------------------
