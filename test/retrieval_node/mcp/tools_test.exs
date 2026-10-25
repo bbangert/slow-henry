@@ -205,6 +205,36 @@ defmodule RetrievalNode.MCP.ToolsTest do
       %{"results" => [hit | _]} = ok(SemanticSearch, %{query: "authentication"})
       refute Map.has_key?(hit, "fused_score")
     end
+
+    test "graph: true surfaces a chunk reachable only via an entity mention; omitted does not" do
+      source =
+        Repo.insert!(%Source{source_type: :git_repo, name: "acme/graph", identifier: "file:///g"})
+
+      # No embedding and content unrelated to the query: reachable, if at all,
+      # only through the entity leg.
+      chunk =
+        Repo.insert!(%Chunk{
+          source_id: source.id,
+          source_type: :git_repo,
+          repo: "acme/graph",
+          chunk_key: "k-graph",
+          content_hash: "h-graph",
+          content: "totally unrelated filler about zebras",
+          context_breadcrumb: "bc",
+          metadata: %{},
+          embedding: nil
+        })
+
+      index_graph(source, [{chunk, [def_("PaymentProcessor.process_payment")], []}])
+
+      %{"results" => without_graph} = ok(SemanticSearch, %{query: "payment processing"})
+      refute chunk.id in Enum.map(without_graph, & &1["chunk_id"])
+
+      %{"results" => with_graph} =
+        ok(SemanticSearch, %{query: "payment processing", graph: true})
+
+      assert chunk.id in Enum.map(with_graph, & &1["chunk_id"])
+    end
   end
 
   describe "related_code" do

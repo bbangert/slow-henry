@@ -29,6 +29,10 @@ defmodule RetrievalNode.Search do
       inside both ranking CTEs (see `HybridQuery`). `:source_type` is the DB enum
       string (`"git_repo"`/`"jira_project"`/`"drive_folder"`)
     * `:top_k` — result count (default 20)
+    * `:graph` — boolean; adds `HybridQuery`'s third entity-mention leg (default
+      from config `:graph_leg_default`, currently `false`). Opt-in because its
+      query cost is paid on every request whether or not it improves relevance.
+      Exposed on the MCP tool layer as the `graph` field on `semantic_search`.
     * `:embedding` — a precomputed 384-float query vector; when given, skips the
       embedding step (used by tests and callers that already hold an embedding)
     * `:rerank` — boolean; defaults from config `:rerank_default` (currently
@@ -59,7 +63,7 @@ defmodule RetrievalNode.Search do
 
     query_opts =
       opts
-      |> Keyword.take([:source_id, :source_type, :repo, :lang])
+      |> Keyword.take([:source_id, :source_type, :repo, :lang, :graph])
       |> Keyword.merge(embedding: embedding, text_query: query_text, top_k: query_top_k)
 
     rows = HybridQuery.search(query_opts)

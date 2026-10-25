@@ -109,6 +109,15 @@ config :retrieval_node, RetrievalNode.Reranking.Serving,
 # capped at 100 (HybridQuery's row maximum); larger values have no effect.
 config :retrieval_node, rerank_default: false, rerank_candidates: 50
 
+# Graph (entity-mention) leg of the hybrid RRF query — see HybridQuery
+# moduledoc. Off by default: the leg adds query latency on every request
+# whether or not it improves relevance, so callers opt in per request (the MCP
+# `graph` field). `graph_leg_weight` keeps the as-yet-unproven leg from
+# outvoting the tuned vector/FTS pair (weight 1.0 each) when enabled.
+# `graph_leg_timeout_ms` is a safety net: a graph-leg query slower than this
+# is cancelled and the request falls back to plain vector+FTS results.
+config :retrieval_node, graph_leg_default: false, graph_leg_weight: 0.5, graph_leg_timeout_ms: 50
+
 # EXLA as the global Nx default backend — without this, any tensor op NOT
 # routed through the serving's own `defn_options: [compiler: EXLA]` (e.g. the
 # Matryoshka truncation math in NxServingImpl) would silently run on
