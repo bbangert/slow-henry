@@ -607,11 +607,12 @@ defmodule RetrievalNode.Graph do
 
     resolved = resolve_definitions(ref_only)
     definitions = defined ++ resolved
-    aliases = alias_entities(definitions)
 
+    # Only incoming traversal walks into aliases; exclusion keys come from
+    # `infos`, so outgoing hops skip the alias lookup entirely.
     frontier_ids =
       case direction do
-        :incoming -> Enum.map(infos ++ resolved ++ aliases, & &1.id)
+        :incoming -> Enum.map(infos ++ resolved ++ alias_entities(definitions), & &1.id)
         :outgoing -> Enum.map(definitions, & &1.id)
       end
 
