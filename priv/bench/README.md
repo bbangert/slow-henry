@@ -41,9 +41,14 @@ A matcher is a JSON object with any (non-empty) combination of:
   git-relative file path; only set for `:git_repo` chunks).
 * `"breadcrumb_substring"` — case-insensitive substring match against
   `Chunk.context_breadcrumb`.
+* `"content_substring"` — case-**sensitive** literal substring of
+  `Chunk.content` (LIKE metacharacters are not special). Use it for
+  answer-level queries: relevance should mean "this chunk contains the
+  answer", not "this chunk is in the right file". Pick a short, single-line
+  literal so it can't be split across two chunks.
 
 Fields present on a single matcher are **AND'd together**. At least one of
-the three fields must be set — an empty matcher would match every chunk in
+the four fields must be set — an empty matcher would match every chunk in
 the corpus and silently inflate every nDCG score, so `Bench.Runner` raises
 loudly at load time if it sees one.
 
@@ -53,17 +58,31 @@ are stable identifiers a chunker preserves across re-ingest as long as the
 source file/symbol itself hasn't moved. A query set built on ids would need
 re-labeling after every corpus rebuild; one built on these matchers doesn't.
 
-**Why `path_prefix` carries the starter set, not `breadcrumb_substring`**:
-this repo's own source is Elixir, and Elixir isn't yet in
-`TreeSitterImpl.allowed_languages/0` (fast-follow item — see
-`design-build.md`), so it falls through to `HeuristicImpl`, whose chunks all
-carry an **empty** symbol trail (`breadcrumb: ""`, per
-`Chunking.Breadcrumb.build/2`) — `context_breadcrumb` for an Elixir chunk is
-just its file path, same information `path_prefix` already captures more
-precisely. `breadcrumb_substring` becomes useful once a source in a
-tree-sitter-covered language (Python/JS/Go/Rust/Ruby/Java) or a Docs source
-(breadcrumb = doc title) is seeded — its matchers should prefer
-`breadcrumb_substring` for symbol-level precision.
+**Why `path_prefix` carries the starter set**: the starter set is this repo's
+own Elixir source, which is AST-chunked with symbol breadcrumbs, but its queries
+are file-level questions, so the file path is the precise identifier.
+`breadcrumb_substring` is for symbol-level precision (e.g. a specific
+function/class trail, or a Docs source where the breadcrumb is the doc title).
+For top-level (gap) chunks — code between definitions — the breadcrumb is just
+the file path, so use `path_prefix` for those.
+
+## Top-level content queries
+
+`toplevel_queries.jsonl` is a second, separate set of 16 queries whose answers
+live in top-level code outside any function/class: Python constants
+(`const.py`), `__all__`, module-level registries and `PLATFORM_SCHEMA`s,
+TypeScript top-level `const`s, type unions and `customElements.define`
+registrations, Go top-level `var`s. Before top-level (gap) chunks existed these
+were not indexed (files with no definitions produced zero chunks), so it is the
+measure for that feature. It targets the multi-repo seed corpus (`core`,
+`frontend`, `cli`, `supervisor`, `esphome`), with `repo` equal to the source
+name and a `content_substring` on every matcher so only chunks containing the
+answer count as relevant, and is unresolved (excluded from aggregates) on a corpus without them.
+
+    mix rn.bench --queries priv/bench/toplevel_queries.jsonl
+
+`mix rn.bench` is safe to run against a database shared with a running dev
+node: it boots with no Oban queues/plugins/peer and no ingest boot-resume.
 
 ## Example: multi-file matcher
 
