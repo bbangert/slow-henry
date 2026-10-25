@@ -748,6 +748,21 @@ defmodule RetrievalNode.Search.HybridQueryTest do
       assert %{rows: [[^before]]} = Repo.query!("SELECT current_setting('statement_timeout')")
     end
 
+    # Ecto flattens a nested Repo.transaction into the caller's, so without a
+    # real savepoint around the graph query a cancel would abort the caller's
+    # transaction and the plain-query fallback could not run.
+    test "a timeout inside a caller's transaction leaves that transaction usable" do
+      %{rows: [[before]]} = Repo.query!("SELECT current_setting('statement_timeout')")
+
+      assert {:ok, {:timeout, 1, ^before}} =
+               Repo.transaction(fn ->
+                 outcome = HybridQuery.run_graph_query("SELECT pg_sleep(2)", [], 20)
+                 %{rows: [[one]]} = Repo.query!("SELECT 1")
+                 %{rows: [[setting]]} = Repo.query!("SELECT current_setting('statement_timeout')")
+                 {outcome, one, setting}
+               end)
+    end
+
     test "other database errors are re-raised, not swallowed" do
       assert_raise Postgrex.Error, fn ->
         HybridQuery.run_graph_query("SELECT 1/0", [], 500)

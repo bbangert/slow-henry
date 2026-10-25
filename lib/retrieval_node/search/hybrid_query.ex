@@ -388,30 +388,32 @@ defmodule RetrievalNode.Search.HybridQuery do
   @doc false
   # Runs the graph-leg query under a transaction-scoped statement_timeout so a
   # pathological term set degrades to the plain query instead of stalling the
-  # request. The timeout is set and restored inside the transaction (a
-  # savepoint when the caller already holds one), so it can't leak to later
-  # statements. Public only so tests can exercise the timeout path directly.
+  # request. The timeout is set and restored inside the transaction, so it
+  # can't leak to later statements. Ecto flattens a nested Repo.transaction
+  # into the caller's, so the graph query itself runs under its own savepoint
+  # (`mode: :savepoint`): a cancel rolls back only that savepoint and never
+  # aborts a caller's transaction, so the plain-query fallback can still run.
+  # Public only so tests can exercise the timeout path directly.
   # sobelow_skip ["SQL.Query"]
   @spec run_graph_query(String.t(), [term()], pos_integer()) ::
           {:ok, Postgrex.Result.t()} | :timeout
   def run_graph_query(sql, params, timeout_ms) do
-    {:ok, result} =
+    {:ok, outcome} =
       Repo.transaction(fn ->
         %Postgrex.Result{rows: [[previous]]} =
           Repo.query!("SELECT current_setting('statement_timeout')")
 
         Repo.query!("SELECT set_config('statement_timeout', $1, true)", ["#{timeout_ms}ms"])
-        result = Repo.query!(sql, params)
+        outcome = Repo.query(sql, params, mode: :savepoint)
         Repo.query!("SELECT set_config('statement_timeout', $1, true)", [previous])
-        result
+        outcome
       end)
 
-    {:ok, result}
-  rescue
-    e in Postgrex.Error ->
-      if match?(%{postgres: %{code: :query_canceled}}, e),
-        do: :timeout,
-        else: reraise(e, __STACKTRACE__)
+    case outcome do
+      {:ok, result} -> {:ok, result}
+      {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} -> :timeout
+      {:error, error} -> raise error
+    end
   end
 
   defp graph_leg_timeout_ms do
