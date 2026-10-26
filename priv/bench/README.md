@@ -16,6 +16,13 @@ once Jira/Drive sources exist in the seed corpus; correct measurement
 (the harness runs and reports honestly) matters more than the query count for
 this task — the numbers get tuned later.
 
+## Self-exclusion
+
+The query file being run is never a candidate answer to its own queries. The
+dev corpus indexes this repo, so the JSONL would otherwise be retrieved (it
+quotes every query verbatim) and displace real answers; `Runner` drops any hit
+whose `metadata["path"]` is that file's repo-relative path, in any repo.
+
 ## Format
 
 One JSON object per line (JSONL — no comments allowed inline, hence this

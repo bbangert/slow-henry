@@ -17,6 +17,14 @@ defmodule RetrievalNode.Bench.Runner do
   non-`NxServingImpl` configured), so `mix rn.bench` always completes and
   prints a report — the numbers just come back marked SKIPPED with a reason
   instead of PASS/FAIL.
+
+  The query file being run is never a candidate answer to its own queries: the
+  dev corpus indexes this repo, so the JSONL (which quotes every query
+  verbatim) would otherwise rank as a hit and displace real answers. Every
+  `Search.hybrid_search/2` call goes through `search/4`, which over-fetches by
+  exactly the number of the file's indexed chunks and drops those whose
+  `metadata["path"]` is the query file's repo-relative path (any repo name).
+  Those chunks are likewise never resolved as relevant answers.
   """
 
   import Ecto.Query
@@ -27,6 +35,7 @@ defmodule RetrievalNode.Bench.Runner do
   alias RetrievalNode.Repo
   alias RetrievalNode.Retrieval.Chunk
   alias RetrievalNode.Search
+  alias RetrievalNode.Search.HybridQuery
 
   @default_queries_path "priv/bench/queries.jsonl"
   @recognized_matcher_keys ~w(repo path_prefix breadcrumb_substring content_substring)
@@ -62,12 +71,13 @@ defmodule RetrievalNode.Bench.Runner do
     skip_embed_probe? = Keyword.get(opts, :skip_embed_probe, false)
 
     queries = load_queries!(queries_path)
+    self = self_exclusion!(queries_path, top_k)
 
     %{
       queries_loaded: length(queries),
-      quality: quality_section(queries, top_k),
+      quality: quality_section(queries, top_k, self),
       embed_probe: embed_probe_section(skip_embed_probe?),
-      matryoshka: matryoshka_section(queries, top_k)
+      matryoshka: matryoshka_section(queries, top_k, self)
     }
   end
 
@@ -123,24 +133,31 @@ defmodule RetrievalNode.Bench.Runner do
   currently in the corpus that any of them identify. Each individual matcher
   ANDs together whichever of `repo` / `path_prefix` / `breadcrumb_substring` /
   `content_substring` (case-sensitive literal match on `Chunk.content`) it
-  sets. Matching on these fields (not chunk ids) is what lets the same query
+  sets. Chunks whose `metadata["path"]` equals `exclude_path` are never
+  resolved. Matching on these fields (not chunk ids) is what lets the same query
   set survive a re-ingest that assigns fresh ids.
   """
-  @spec resolve_relevant_ids([map()]) :: MapSet.t()
-  def resolve_relevant_ids(matchers) when is_list(matchers) do
+  @spec resolve_relevant_ids([map()], String.t() | nil) :: MapSet.t()
+  def resolve_relevant_ids(matchers, exclude_path \\ nil) when is_list(matchers) do
     matchers
-    |> Enum.flat_map(&Repo.all(matcher_query(&1)))
+    |> Enum.flat_map(&Repo.all(matcher_query(&1, exclude_path)))
     |> MapSet.new()
   end
 
-  defp matcher_query(matcher) do
+  defp matcher_query(matcher, exclude_path) do
     Chunk
     |> select([c], c.id)
+    |> exclude_path(exclude_path)
     |> filter_repo(matcher["repo"])
     |> filter_path_prefix(matcher["path_prefix"])
     |> filter_breadcrumb(matcher["breadcrumb_substring"])
     |> filter_content(matcher["content_substring"])
   end
+
+  defp exclude_path(query, nil), do: query
+
+  defp exclude_path(query, path),
+    do: where(query, [c], fragment("?->>'path' IS DISTINCT FROM ?", c.metadata, ^path))
 
   defp filter_content(query, nil), do: query
 
@@ -188,7 +205,7 @@ defmodule RetrievalNode.Bench.Runner do
 
   # -- Quality: nDCG@k + latency percentiles over Search.hybrid_search/2 -----
 
-  defp quality_section(queries, top_k) do
+  defp quality_section(queries, top_k, self) do
     cond do
       not corpus_seeded?() ->
         {:skipped, "corpus not seeded — ingest at least one source before running mix rn.bench"}
@@ -197,12 +214,12 @@ defmodule RetrievalNode.Bench.Runner do
         {:skipped, "requires warmed embedding serving; run inside dev with serving enabled"}
 
       true ->
-        {:ok, run_quality(queries, top_k)}
+        {:ok, run_quality(queries, top_k, self)}
     end
   end
 
-  defp run_quality(queries, top_k) do
-    per_query = Enum.map(queries, &score_query(&1, top_k))
+  defp run_quality(queries, top_k, self) do
+    per_query = Enum.map(queries, &score_query(&1, top_k, self))
     scored = Enum.filter(per_query, & &1.resolvable)
     latencies = Enum.map(scored, & &1.latency_ms)
 
@@ -217,8 +234,8 @@ defmodule RetrievalNode.Bench.Runner do
     }
   end
 
-  defp score_query(%{"query" => text} = q, top_k) do
-    relevant_ids = resolve_relevant_ids(q["relevant"])
+  defp score_query(%{"query" => text} = q, top_k, self) do
+    relevant_ids = resolve_relevant_ids(q["relevant"], self.path)
 
     if MapSet.size(relevant_ids) == 0 do
       %{
@@ -230,7 +247,7 @@ defmodule RetrievalNode.Bench.Runner do
         latency_ms: nil
       }
     else
-      {elapsed_us, hits} = :timer.tc(fn -> Search.hybrid_search(text, top_k: top_k) end)
+      {elapsed_us, hits} = :timer.tc(fn -> search(text, top_k, self, []) end)
       ranked_ids = Enum.map(hits, & &1.chunk.id)
       ndcg = Metrics.ndcg_at_k(ranked_ids, relevant_ids, top_k)
 
@@ -352,7 +369,7 @@ defmodule RetrievalNode.Bench.Runner do
   # the 384-vs-768 quality delta from the protocol — the status is always
   # `:skipped` (never PASS/FAIL against the <2% target) with that distinction
   # spelled out, so a report reader can't mistake one for the other.
-  defp matryoshka_section(queries, top_k) do
+  defp matryoshka_section(queries, top_k, self) do
     cond do
       not corpus_seeded?() ->
         {:skipped, "corpus not seeded — ingest at least one source before running mix rn.bench"}
@@ -367,14 +384,14 @@ defmodule RetrievalNode.Bench.Runner do
            "truncation step to probe"}
 
       true ->
-        {:ok, run_matryoshka(queries, top_k)}
+        {:ok, run_matryoshka(queries, top_k, self)}
     end
   end
 
-  defp run_matryoshka(queries, top_k) do
+  defp run_matryoshka(queries, top_k, self) do
     per_query =
       queries
-      |> Enum.map(&matryoshka_query(&1, top_k))
+      |> Enum.map(&matryoshka_query(&1, top_k, self))
       |> Enum.reject(&is_nil/1)
 
     %{
@@ -392,8 +409,8 @@ defmodule RetrievalNode.Bench.Runner do
     }
   end
 
-  defp matryoshka_query(%{"query" => text} = q, top_k) do
-    relevant_ids = resolve_relevant_ids(q["relevant"])
+  defp matryoshka_query(%{"query" => text} = q, top_k, self) do
+    relevant_ids = resolve_relevant_ids(q["relevant"], self.path)
 
     if MapSet.size(relevant_ids) == 0 do
       nil
@@ -402,8 +419,8 @@ defmodule RetrievalNode.Bench.Runner do
       q768 = NxServingImpl.embed_full_dims(text)
       q384_reconstructed = q768 |> Nx.tensor() |> NxServingImpl.matryoshka()
 
-      ranking_a = ranked_ids(text, q384, top_k)
-      ranking_b = ranked_ids(text, q384_reconstructed, top_k)
+      ranking_a = ranked_ids(text, q384, top_k, self)
+      ranking_b = ranked_ids(text, q384_reconstructed, top_k, self)
 
       ndcg_a = Metrics.ndcg_at_k(ranking_a, relevant_ids, top_k)
       ndcg_b = Metrics.ndcg_at_k(ranking_b, relevant_ids, top_k)
@@ -418,10 +435,57 @@ defmodule RetrievalNode.Bench.Runner do
     end
   end
 
-  defp ranked_ids(text, embedding, top_k) do
+  defp ranked_ids(text, embedding, top_k, self) do
     text
-    |> Search.hybrid_search(embedding: embedding, top_k: top_k)
+    |> search(top_k, self, embedding: embedding)
     |> Enum.map(& &1.chunk.id)
+  end
+
+  # The single choke point for `Search.hybrid_search/2`: over-fetch by exactly
+  # the number of the query file's own chunks so dropping them still leaves
+  # `top_k` eligible results (`self_exclusion!/2` guarantees the sum fits the cap).
+  defp search(text, top_k, self, extra_opts) do
+    text
+    |> Search.hybrid_search([top_k: top_k + self.count] ++ extra_opts)
+    |> exclude_self(self.path, top_k)
+  end
+
+  @doc false
+  # Resolves the query file's repo-relative path and counts its indexed chunks
+  # once per run. Raises when `top_k` plus that count exceeds the search cap,
+  # since the over-fetch could not then guarantee `top_k` eligible hits.
+  @spec self_exclusion!(Path.t(), pos_integer()) :: %{path: String.t(), count: non_neg_integer()}
+  def self_exclusion!(queries_path, top_k) do
+    path = normalize_query_path(queries_path)
+    count = Repo.aggregate(self_chunks_query(path), :count)
+    cap = HybridQuery.max_top_k()
+
+    if top_k + count > cap do
+      raise ArgumentError,
+            "--top-k #{top_k} plus the query file's #{count} indexed chunks exceeds " <>
+              "the search cap #{cap}; lower --top-k"
+    end
+
+    %{path: path, count: count}
+  end
+
+  defp self_chunks_query(path),
+    do: where(Chunk, [c], fragment("?->>'path'", c.metadata) == ^path)
+
+  @doc false
+  @spec exclude_self([map()], String.t(), pos_integer()) :: [map()]
+  def exclude_self(hits, self_path, top_k) do
+    hits
+    |> Enum.reject(&(&1.chunk.metadata["path"] == self_path))
+    |> Enum.take(top_k)
+  end
+
+  @doc false
+  # Repo-relative form of the query file path; a path outside the working
+  # directory stays absolute and so matches no chunk.
+  @spec normalize_query_path(Path.t()) :: String.t()
+  def normalize_query_path(path) do
+    path |> Path.expand() |> Path.relative_to(File.cwd!())
   end
 
   defp overlap_at_k([], []), do: 1.0
