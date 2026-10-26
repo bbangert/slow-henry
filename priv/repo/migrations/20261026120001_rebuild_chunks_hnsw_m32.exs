@@ -49,15 +49,30 @@ defmodule RetrievalNode.Repo.Migrations.RebuildChunksHnswM32 do
                   "expected #{@build_maintenance_work_mem}"
         end
 
-        # A failed CONCURRENTLY build leaves an INVALID index behind; dropping
-        # it first makes re-running the migration safe.
-        run!("DROP INDEX CONCURRENTLY IF EXISTS #{tmp}")
+        # Resumable from any interruption point, and never drops the only
+        # valid HNSW index on chunks: a valid temp index is reused (the run
+        # stopped after dropping the old index), an INVALID one is left over
+        # from a failed CONCURRENTLY build and is rebuilt.
+        case run!(
+               """
+               SELECT i.indisvalid FROM pg_index i
+               JOIN pg_class c ON c.oid = i.indexrelid
+               WHERE c.relname = $1
+               """,
+               [tmp]
+             ).rows do
+          [[true]] ->
+            :ok
 
-        run!("""
-        CREATE INDEX CONCURRENTLY #{tmp}
-        ON chunks USING hnsw (embedding vector_cosine_ops)
-        WITH (m = #{m}, ef_construction = #{ef})
-        """)
+          state ->
+            if state != [], do: run!("DROP INDEX CONCURRENTLY #{tmp}")
+
+            run!("""
+            CREATE INDEX CONCURRENTLY #{tmp}
+            ON chunks USING hnsw (embedding vector_cosine_ops)
+            WITH (m = #{m}, ef_construction = #{ef})
+            """)
+        end
 
         run!("DROP INDEX CONCURRENTLY IF EXISTS chunks_embedding_hnsw_idx")
         run!("ALTER INDEX #{tmp} RENAME TO chunks_embedding_hnsw_idx")
@@ -66,5 +81,5 @@ defmodule RetrievalNode.Repo.Migrations.RebuildChunksHnswM32 do
     )
   end
 
-  defp run!(sql), do: repo().query!(sql, [], timeout: :infinity, log: :info)
+  defp run!(sql, params \\ []), do: repo().query!(sql, params, timeout: :infinity, log: :info)
 end
