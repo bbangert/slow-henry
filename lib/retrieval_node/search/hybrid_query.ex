@@ -524,6 +524,10 @@ defmodule RetrievalNode.Search.HybridQuery do
   defp to_float(n) when is_float(n), do: n
   defp to_float(n) when is_integer(n), do: n * 1.0
 
+  @doc "The largest `top_k` `search/1` will honor."
+  @spec max_top_k() :: pos_integer()
+  def max_top_k, do: @max_top_k
+
   @doc """
   Clamp a caller-supplied `top_k` to `[1, #{@max_top_k}]`, defaulting to
   #{@default_top_k} for anything that isn't a positive integer — the same

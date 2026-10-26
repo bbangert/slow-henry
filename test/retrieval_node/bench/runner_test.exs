@@ -3,6 +3,7 @@ defmodule RetrievalNode.Bench.RunnerTest do
 
   alias RetrievalNode.Bench.Runner
   alias RetrievalNode.Retrieval.{Chunk, Source}
+  alias RetrievalNode.Search.HybridQuery
 
   @dim 384
 
@@ -405,6 +406,77 @@ defmodule RetrievalNode.Bench.RunnerTest do
                Runner.run(queries_path: path, top_k: 1, skip_embed_probe: true).quality
 
       assert [%{best_rank: 1}] = quality.per_query
+    end
+
+    defp self_query_file! do
+      rel = "_build/bench_self_#{System.unique_integer([:positive])}.jsonl"
+      File.mkdir_p!("_build")
+
+      File.write!(
+        rel,
+        Jason.encode!(%{"query" => "quick brown fox", "relevant" => [%{"repo" => "repo-a"}]})
+      )
+
+      on_exit(fn -> File.rm(rel) end)
+      rel
+    end
+
+    test "self chunks are not relevant answers: repo-only matcher, answer ranked first scores 1.0" do
+      rel = self_query_file!()
+      source = source_fixture("repo-a")
+
+      chunk_fixture(source,
+        repo: "repo-a",
+        content: "unrelated",
+        metadata: %{"path" => rel},
+        embedding: axis(5)
+      )
+
+      chunk_fixture(source,
+        repo: "repo-a",
+        content: "quick brown fox",
+        metadata: %{"path" => "lib/answer.ex"},
+        embedding: axis(0)
+      )
+
+      assert {:ok, quality} =
+               Runner.run(queries_path: rel, top_k: 5, skip_embed_probe: true).quality
+
+      assert [%{ndcg: ndcg, best_rank: 1}] = quality.per_query
+      assert_in_delta ndcg, 1.0, 1.0e-9
+    end
+
+    test "more self chunks than any fixed margin still leaves exactly top_k eligible results" do
+      rel = self_query_file!()
+      source = source_fixture("repo-a")
+
+      for _ <- 1..7 do
+        chunk_fixture(source,
+          repo: "repo-a",
+          content: "quick brown fox",
+          metadata: %{"path" => rel}
+        )
+      end
+
+      assert Runner.self_exclusion!(rel, 10) == %{path: rel, count: 7}
+
+      hit = fn id, path -> %{chunk: %{id: id, metadata: %{"path" => path}}} end
+      hits = for(i <- 1..7, do: hit.(i, rel)) ++ for(i <- 8..17, do: hit.(i, "lib/f#{i}.ex"))
+
+      kept = Runner.exclude_self(hits, rel, 10)
+      assert Enum.map(kept, & &1.chunk.id) == Enum.to_list(8..17)
+    end
+
+    test "top_k plus the query file's chunk count over the search cap raises" do
+      rel = self_query_file!()
+      source = source_fixture("repo-a")
+      chunk_fixture(source, repo: "repo-a", metadata: %{"path" => rel})
+      chunk_fixture(source, repo: "repo-a", metadata: %{"path" => rel})
+      cap = HybridQuery.max_top_k()
+
+      assert_raise ArgumentError,
+                   "--top-k #{cap} plus the query file's 2 indexed chunks exceeds the search cap #{cap}; lower --top-k",
+                   fn -> Runner.run(queries_path: rel, top_k: cap, skip_embed_probe: true) end
     end
   end
 end
