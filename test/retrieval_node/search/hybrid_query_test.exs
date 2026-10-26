@@ -769,4 +769,32 @@ defmodule RetrievalNode.Search.HybridQueryTest do
       end
     end
   end
+
+  describe "with_vector_scan_settings/1" do
+    defp show(name) do
+      %{rows: [[v]]} = Repo.query!("SELECT current_setting($1, true)", [name])
+      v
+    end
+
+    test "sets hnsw.ef_search to the candidate pool and strict_order while fun runs" do
+      pool = Application.fetch_env!(:retrieval_node, :rrf_candidate_pool)
+
+      assert {Integer.to_string(pool), "strict_order"} ==
+               HybridQuery.with_vector_scan_settings(fn ->
+                 {show("hnsw.ef_search"), show("hnsw.iterative_scan")}
+               end)
+    end
+
+    test "the graph path runs under the settings too" do
+      assert {:ok, %Postgrex.Result{rows: [[ef, scan]]}} =
+               HybridQuery.run_graph_query(
+                 "SELECT current_setting('hnsw.ef_search'), current_setting('hnsw.iterative_scan')",
+                 [],
+                 500
+               )
+
+      assert scan == "strict_order"
+      assert ef == Integer.to_string(Application.fetch_env!(:retrieval_node, :rrf_candidate_pool))
+    end
+  end
 end

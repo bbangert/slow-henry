@@ -45,6 +45,20 @@ defmodule RetrievalNode.Search.HybridQuery do
   `:graph_leg_timeout_ms` statement timeout, falling back to the plain
   two-leg query (with a warning) if it is exceeded.
 
+  ## Vector leg depth
+
+  pgvector's HNSW scan returns at most `hnsw.ef_search` rows (default 40),
+  whatever the `LIMIT`, and applies a `WHERE` filter to those candidates
+  afterwards. Left at defaults, the vector leg's "`@candidate_pool`
+  candidates" would be ~40 (fewer when filtered), starving fusion of
+  exact-rank answers. So every execution of a query containing the vector leg
+  runs under `with_vector_scan_settings/1`: `hnsw.ef_search` = the candidate
+  pool (the pool must not exceed pgvector's 1000 cap) and
+  `hnsw.iterative_scan = strict_order`, which keeps scanning until `LIMIT`
+  filtered rows are found while preserving exact distance order
+  (`relaxed_order` was measured to reorder results). The settings are
+  transaction-local.
+
   Returns back-link projection maps (no `content`) ordered by fused score desc;
   full content is fetched separately (`get_file` / targeted `Repo.get`) only when
   a result is actually expanded, keeping the hot search path row/token-lean.
@@ -62,6 +76,18 @@ defmodule RetrievalNode.Search.HybridQuery do
   # to exercise pool-starvation (the filters-inside-CTE property) without seeding
   # 200+ rows. Defaults to 200 in prod.
   @candidate_pool Application.compile_env(:retrieval_node, :rrf_candidate_pool, 200)
+
+  if @candidate_pool < 1 or @candidate_pool > 1000 do
+    raise CompileError,
+      description: ":rrf_candidate_pool must be within 1..1000 (pgvector hnsw.ef_search cap)"
+  end
+
+  @vector_scan_gucs [
+    {"hnsw.ef_search", Integer.to_string(@candidate_pool)},
+    {"hnsw.iterative_scan", "strict_order"}
+  ]
+
+  @vector_scan_settings_sql "SELECT set_config('hnsw.ef_search', $1, true), set_config('hnsw.iterative_scan', $2, true)"
 
   # significant_terms/1 tuning: terms under this length are noise (stopword-ish
   # fragments), and each extra term is one more `unnest` row evaluated per
@@ -358,7 +384,7 @@ defmodule RetrievalNode.Search.HybridQuery do
       opts[:source_type]
     ]
 
-    plain = fn -> Repo.query!(@sql, base_params) end
+    plain = fn -> with_vector_scan_settings(fn -> Repo.query!(@sql, base_params) end) end
 
     result =
       if graph? do
@@ -398,8 +424,8 @@ defmodule RetrievalNode.Search.HybridQuery do
   @spec run_graph_query(String.t(), [term()], pos_integer()) ::
           {:ok, Postgrex.Result.t()} | :timeout
   def run_graph_query(sql, params, timeout_ms) do
-    {:ok, outcome} =
-      Repo.transaction(fn ->
+    outcome =
+      with_vector_scan_settings(fn ->
         %Postgrex.Result{rows: [[previous]]} =
           Repo.query!("SELECT current_setting('statement_timeout')")
 
@@ -414,6 +440,26 @@ defmodule RetrievalNode.Search.HybridQuery do
       {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} -> :timeout
       {:error, error} -> raise error
     end
+  end
+
+  @doc false
+  # The single choke point for executing SQL that contains the vector leg:
+  # applies the pgvector HNSW scan settings (see moduledoc) transaction-locally
+  # around `fun`, returning its result. One statement suffices even on a fresh
+  # connection: the placeholder GUCs are adopted when pgvector loads. Inside a
+  # caller's transaction (a savepoint) the settings outlive the call until that
+  # transaction ends; that is harmless, as they only widen the HNSW scan for
+  # any later vector query in it. Public only so tests can observe the settings
+  # while `fun` runs.
+  @spec with_vector_scan_settings((-> result)) :: result when result: term()
+  def with_vector_scan_settings(fun) do
+    {:ok, result} =
+      Repo.transaction(fn ->
+        Repo.query!(@vector_scan_settings_sql, Enum.map(@vector_scan_gucs, &elem(&1, 1)))
+        fun.()
+      end)
+
+    result
   end
 
   defp graph_leg_timeout_ms do
