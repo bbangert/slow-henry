@@ -313,4 +313,98 @@ defmodule RetrievalNode.Bench.RunnerTest do
       assert is_float(probe.ram.erlang_total_delta_mb)
     end
   end
+
+  describe "query file self-exclusion" do
+    test "normalize_query_path/1 handles ./ and absolute forms; outside paths stay outside" do
+      assert Runner.normalize_query_path("priv/bench/q.jsonl") == "priv/bench/q.jsonl"
+      assert Runner.normalize_query_path("./priv/bench/q.jsonl") == "priv/bench/q.jsonl"
+
+      assert Runner.normalize_query_path(Path.join(File.cwd!(), "priv/bench/q.jsonl")) ==
+               "priv/bench/q.jsonl"
+
+      refute Runner.normalize_query_path("/elsewhere/q.jsonl") == "priv/bench/q.jsonl"
+    end
+
+    test "exclude_self/3 drops only the matching path and keeps top_k" do
+      hit = fn id, path -> %{chunk: %{id: id, metadata: %{"path" => path}}} end
+
+      hits = [hit.(1, "priv/bench/q.jsonl"), hit.(2, "a.ex"), hit.(3, "priv/bench/other.jsonl")]
+
+      assert [2, 3] =
+               hits |> Runner.exclude_self("priv/bench/q.jsonl", 5) |> Enum.map(& &1.chunk.id)
+
+      assert [2] =
+               hits |> Runner.exclude_self("priv/bench/q.jsonl", 1) |> Enum.map(& &1.chunk.id)
+    end
+
+    for form <- [:relative, :dot_slash, :absolute] do
+      test "run/1 excludes the query file's own chunk (#{form} path)" do
+        rel = "_build/bench_self_#{System.unique_integer([:positive])}.jsonl"
+        File.mkdir_p!("_build")
+
+        File.write!(
+          rel,
+          Jason.encode!(%{
+            "query" => "quick brown fox",
+            "relevant" => [%{"path_prefix" => "lib/answer.ex"}]
+          })
+        )
+
+        on_exit(fn -> File.rm(rel) end)
+
+        source = source_fixture("repo-a")
+
+        chunk_fixture(source,
+          repo: "repo-a",
+          content: "quick brown fox",
+          metadata: %{"path" => rel}
+        )
+
+        answer =
+          chunk_fixture(source,
+            repo: "repo-a",
+            content: "quick brown fox answer",
+            metadata: %{"path" => "lib/answer.ex"}
+          )
+
+        qpath =
+          case unquote(form) do
+            :relative -> rel
+            :dot_slash -> "./" <> rel
+            :absolute -> Path.expand(rel)
+          end
+
+        assert {:ok, quality} =
+                 Runner.run(queries_path: qpath, top_k: 1, skip_embed_probe: true).quality
+
+        [per_query] = quality.per_query
+        assert per_query.best_rank == 1
+        assert per_query.ndcg == 1.0
+        assert answer.id
+      end
+    end
+
+    test "a different query file path does not exclude the chunk" do
+      source = source_fixture("repo-a")
+
+      chunk_fixture(source,
+        repo: "repo-a",
+        content: "quick brown fox",
+        metadata: %{"path" => "priv/bench/q.jsonl"}
+      )
+
+      path =
+        write_queries!([
+          %{
+            "query" => "quick brown fox",
+            "relevant" => [%{"path_prefix" => "priv/bench/q.jsonl"}]
+          }
+        ])
+
+      assert {:ok, quality} =
+               Runner.run(queries_path: path, top_k: 1, skip_embed_probe: true).quality
+
+      assert [%{best_rank: 1}] = quality.per_query
+    end
+  end
 end
