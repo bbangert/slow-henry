@@ -39,7 +39,7 @@ defmodule RetrievalNode.Ingest.FileIngest do
 
     * `:force` (default `row.force`) — re-chunk even though the file's content
       hash is unchanged. Embeddings are still reused wherever
-      `(breadcrumb, content_hash)` matches — see "Embedding reuse" below.
+      the embedder input is unchanged — see "Embedding reuse" below.
     * `:on_parse_crash` (default `:error`) — `:heuristic` on a row's FINAL
       attempt (the caller decides "final"; this module has no attempt
       counter of its own).
@@ -48,7 +48,7 @@ defmodule RetrievalNode.Ingest.FileIngest do
   import Ecto.Query
 
   alias RetrievalNode.Chunking
-  alias RetrievalNode.Chunking.{Breadcrumb, HeuristicImpl}
+  alias RetrievalNode.Chunking.{Breadcrumb, EmbedText, HeuristicImpl}
   alias RetrievalNode.Embedding
   alias RetrievalNode.Graph
   alias RetrievalNode.Ingest
@@ -240,19 +240,35 @@ defmodule RetrievalNode.Ingest.FileIngest do
       |> Enum.with_index()
       |> Enum.map(fn {{chunk, graph}, index} ->
         text = chunk.text
+        kind = chunk.kind
+        breadcrumb = Breadcrumb.build(file_prefix(row), chunk.breadcrumb)
+        names = Map.get(chunk, :names, [])
+        import_ranges = Map.get(chunk, :import_ranges, [])
+
+        embed_text =
+          EmbedText.build(%{
+            kind: kind,
+            breadcrumb: breadcrumb,
+            text: text,
+            names: names,
+            import_ranges: import_ranges
+          })
 
         %{
           chunk_key: chunk_key(row, chunk, index),
           # Position in the file — every chunk of a batch shares inserted_at and
           # ids are random, so this is the only record of document order.
           index: index,
-          breadcrumb: Breadcrumb.build(file_prefix(row), chunk.breadcrumb),
+          breadcrumb: breadcrumb,
           text: text,
           # Chunk.content_hash is the hash of the CHUNK (row.content_hash, used
           # as `file_hash` below, is the raw-file hash).
           content_hash: sha256(text),
-          kind: chunk.kind,
-          names: Map.get(chunk, :names, []),
+          kind: kind,
+          names: names,
+          import_ranges: import_ranges,
+          embed_text: embed_text,
+          embed_hash: sha256(embed_text),
           graph: graph
         }
       end)
@@ -398,9 +414,14 @@ defmodule RetrievalNode.Ingest.FileIngest do
   end
 
   # Embedding reuse: load the file's EXISTING chunks (by file identity, not by
-  # this batch's keys) and reuse an embedding wherever a new entry's
-  # (breadcrumb, content_hash) matches an existing row's — together they fully
-  # determine the embedded text (embed_text/1), so the vector is identical.
+  # this batch's keys) and reuse an embedding wherever the sha256 of the new
+  # entry's embedder input (EmbedText.build/1) equals an existing row's. Keying
+  # on the input itself, not on proxies like breadcrumb + content_hash, is what
+  # makes reuse safe: a chunk's names and stripped imports depend on the
+  # surrounding AST, so identical chunk text can be embedded as different input.
+  # Rows written before `metadata["embed_hash"]` existed were embedded as
+  # EmbedText.legacy_text/2 of their stored breadcrumb and content, so their key
+  # is computed from that.
   # chunk_key (which embeds the chunk's index) plays no part: a chunk that only
   # shifted position keeps its vector. Everything else goes through
   # Embedding.embed_batch/1 in ONE call. Reuse applies unconditionally (force
@@ -413,7 +434,7 @@ defmodule RetrievalNode.Ingest.FileIngest do
     {reused_entries, to_embed} =
       Enum.split_with(built, &Map.has_key?(existing, reuse_key(&1)))
 
-    texts = Enum.map(to_embed, &embed_text/1)
+    texts = Enum.map(to_embed, & &1.embed_text)
     vectors = if texts == [], do: [], else: Embedding.embed_batch(texts)
 
     # Fail loud rather than let Enum.zip silently drop the tail if the serving
@@ -436,9 +457,9 @@ defmodule RetrievalNode.Ingest.FileIngest do
     {Map.merge(fresh_by_key, reused_by_key), length(to_embed), length(reused_entries)}
   end
 
-  defp reuse_key(entry), do: {entry.breadcrumb, entry.content_hash}
+  defp reuse_key(entry), do: entry.embed_hash
 
-  # {context_breadcrumb, content_hash} => embedding. Rows with a NULL embedding
+  # embed_hash => embedding. Rows with a NULL embedding
   # (Chunk.embedding is nullable) are excluded so one can never be reused —
   # that would persist an unembedded chunk and skip embedding it. Two
   # identical chunks in one file collide on the key harmlessly: identical
@@ -451,14 +472,13 @@ defmodule RetrievalNode.Ingest.FileIngest do
       query ->
         query
         |> where([c], not is_nil(c.embedding))
-        |> select([c], {{c.context_breadcrumb, c.content_hash}, c.embedding})
+        |> select([c], {c.context_breadcrumb, c.content, c.metadata["embed_hash"], c.embedding})
         |> Repo.all()
-        |> Map.new()
+        |> Map.new(fn {crumb, content, stored_hash, embedding} ->
+          {stored_hash || sha256(EmbedText.legacy_text(crumb, content)), embedding}
+        end)
     end
   end
-
-  defp embed_text(%{breadcrumb: crumb, text: text}) when crumb in [nil, ""], do: text
-  defp embed_text(%{breadcrumb: crumb, text: text}), do: Breadcrumb.prepend(crumb, text)
 
   # One transaction: batched insert into Chunk (ON CONFLICT replace — the same
   # identity, chunk_key, upserts rather than duplicating), reconcile the
@@ -516,7 +536,8 @@ defmodule RetrievalNode.Ingest.FileIngest do
       metadata:
         (row.metadata || %{})
         |> Map.put("chunk_index", entry.index)
-        |> Map.put("kind", entry.kind),
+        |> Map.put("kind", entry.kind)
+        |> Map.put("embed_hash", entry.embed_hash),
       embedding: Map.fetch!(embeddings_by_key, entry.chunk_key),
       parse_status: to_enum(:parse_status, parse_status),
       secrets_status: to_enum(:secrets_status, opts[:secrets_status]),
