@@ -273,6 +273,24 @@ defmodule RetrievalNode.Chunking.TreeSitterNamesTest do
     end
   end
 
+  describe "customElements tag literal is fully decoded" do
+    for lang <- ~w(javascript typescript) do
+      test "#{lang}: escapes, all-escaped, template and undecodable tags" do
+        src = ~S'''
+        customElements.define("my\u002del", A);
+        customElements.define("\x61\x2db", B);
+        customElements.define(`tpl-el`, C);
+        customElements.define(`tpl-${x}`, D);
+        customElements.define("", E);
+        customElements.define("bad\uD800", F);
+        '''
+
+        assert names_at(chunks!(src, unquote(lang)), "") ==
+                 ["customElements:my-el", "customElements:a-b", "customElements:tpl-el"]
+      end
+    end
+  end
+
   describe "piece assignment and limits" do
     test "thousands of bindings interleaved with definitions get exact per-piece names" do
       src =

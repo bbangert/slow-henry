@@ -161,6 +161,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   @behaviour RetrievalNode.Graph.Extractor
 
+  alias RetrievalNode.Chunking.JsString
   alias RetrievalNode.Graph.Extractor.TreeSitter.WalkState
   alias TreeSitterLanguagePack, as: TS
 
@@ -1610,7 +1611,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   # Identifiers may spell characters as `\u` escapes (`this.h\u0065lper()`);
   # canonicalize callees exactly like definition names (decode_js_identifier/1).
-  defp decode_js_callee({name, self?}), do: {decode_js_identifier(name), self?}
+  defp decode_js_callee({name, self?}), do: {JsString.decode_identifier(name), self?}
   defp decode_js_callee(nil), do: nil
 
   # `(helper)()` / `(this.helper)()`: grouping parentheses don't change the callee.
@@ -1812,7 +1813,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
         # The source is a string literal: decoded like any js/ts string value,
         # and omitted when it doesn't decode to a usable import path.
         module_refs =
-          case js_import_path(js_string_value(src_node, source)) do
+          case js_import_path(JsString.value(src_node, source)) do
             nil -> []
             path -> [{path, ln}]
           end
@@ -1978,7 +1979,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   defp js_clause_child_refs(child, source, ln) do
     case TS.node_kind(child) do
       "identifier" ->
-        [{decode_js_identifier(slice(source, child)), ln}]
+        [{JsString.decode_identifier(slice(source, child)), ln}]
 
       "named_imports" ->
         child
@@ -2002,8 +2003,8 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
       name_node ->
         name =
           if TS.node_kind(name_node) == "string",
-            do: name_node |> js_string_value(source) |> literal_identifier(),
-            else: decode_js_identifier(slice(source, name_node))
+            do: name_node |> JsString.value(source) |> literal_identifier(),
+            else: JsString.decode_identifier(slice(source, name_node))
 
         if name, do: [{name, ln}], else: []
     end
@@ -2154,10 +2155,10 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
        when language in ["javascript", "typescript"] do
     case TS.node_kind(name_node) do
       kind when kind in @js_identifier_nodes ->
-        name_node |> then(&slice(source, &1)) |> decode_js_identifier()
+        name_node |> then(&slice(source, &1)) |> JsString.decode_identifier()
 
       "string" ->
-        name_node |> js_string_value(source) |> literal_identifier()
+        name_node |> JsString.value(source) |> literal_identifier()
 
       "computed_property_name" ->
         name_node |> computed_key_string(source) |> literal_identifier()
@@ -2176,112 +2177,15 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   defp computed_key_string(node, source) do
     case node |> named_children() |> Enum.reject(&(TS.node_kind(&1) =~ "comment")) do
-      [str] -> if TS.node_kind(str) == "string", do: js_string_value(str, source)
+      [str] -> if TS.node_kind(str) == "string", do: JsString.value(str, source)
       _ -> nil
-    end
-  end
-
-  # The decoded value of a js/ts string literal, from its `string_fragment` and
-  # `escape_sequence` children (never by trimming quotes off the source text,
-  # which would also strip quotes that are part of the value). nil when the
-  # literal can't be decoded to valid UTF-8 (e.g. a lone surrogate escape).
-  defp js_string_value(str_node, source) do
-    str_node
-    |> named_children()
-    |> Enum.reduce_while([], fn child, acc ->
-      case TS.node_kind(child) do
-        "string_fragment" ->
-          {:cont, [slice(source, child) | acc]}
-
-        "escape_sequence" ->
-          {:cont, Enum.reverse(List.wrap(decode_js_escape(slice(source, child)))) ++ acc}
-
-        _ ->
-          {:halt, :error}
-      end
-    end)
-    |> case do
-      :error -> nil
-      # Line continuations decode to ""; drop them so a surrogate pair split
-      # by one (`\\uD835\\<newline>\\uDC9C`) still pairs.
-      parts -> parts |> Enum.reverse() |> Enum.reject(&(&1 == "")) |> join_js_parts([])
-    end
-  end
-
-  # An identifier's `\uXXXX`/`\u{...}` escapes decoded to their characters (the
-  # only escapes identifiers allow), so `h\u0065lper` and `helper` are one name.
-  # Left as written if an escape doesn't decode to a valid character.
-  defp decode_js_identifier(name) when is_binary(name) do
-    if String.contains?(name, "\\u") do
-      parts =
-        Regex.split(~r/\\u\{[0-9A-Fa-f]+\}|\\u[0-9A-Fa-f]{4}/, name, include_captures: true)
-        |> Enum.map(fn
-          "\\u" <> _ = esc -> decode_js_escape(esc)
-          text -> text
-        end)
-
-      join_js_parts(parts, []) || name
-    else
-      name
-    end
-  end
-
-  # Code units from \u escapes may form UTF-16 surrogate pairs; combine them.
-  defp join_js_parts([{:cu, hi}, {:cu, lo} | rest], acc)
-       when hi in 0xD800..0xDBFF and lo in 0xDC00..0xDFFF,
-       do: join_js_parts(rest, [<<0x10000 + (hi - 0xD800) * 0x400 + (lo - 0xDC00)::utf8>> | acc])
-
-  # An unpaired surrogate or an out-of-range escape: not a valid string value.
-  defp join_js_parts([{:cu, :invalid} | _rest], _acc), do: nil
-  defp join_js_parts([{:cu, cu} | _rest], _acc) when cu in 0xD800..0xDFFF, do: nil
-  defp join_js_parts([{:cu, cu} | rest], acc), do: join_js_parts(rest, [<<cu::utf8>> | acc])
-  defp join_js_parts([part | rest], acc), do: join_js_parts(rest, [part | acc])
-  defp join_js_parts([], acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
-
-  defp decode_js_escape("\\u{" <> rest), do: {:cu, rest |> String.trim_trailing("}") |> hex()}
-  defp decode_js_escape("\\u" <> hex4), do: {:cu, hex(hex4)}
-  defp decode_js_escape("\\x" <> hex2), do: {:cu, hex(hex2)}
-  defp decode_js_escape("\\n"), do: "\n"
-  defp decode_js_escape("\\t"), do: "\t"
-  defp decode_js_escape("\\r"), do: "\r"
-  defp decode_js_escape("\\b"), do: "\b"
-  defp decode_js_escape("\\f"), do: "\f"
-  defp decode_js_escape("\\v"), do: "\v"
-  # Legacy octal escape (non-strict JS): a leading 0-3 takes up to three octal
-  # digits, 4-7 up to two; the parser hands over the whole digit run, so any
-  # surplus digit is literal text (`\477` is `'7`). `\0` alone is NUL; `\8` and
-  # `\9` fall through to the identity escape below.
-  defp decode_js_escape(<<"\\", d, digits::binary>>) when d in ?0..?7 do
-    all = <<d>> <> digits
-
-    if all =~ ~r/\A[0-7]+\z/ do
-      {octal, rest} = String.split_at(all, if(d <= ?3, do: 3, else: 2))
-      [{:cu, String.to_integer(octal, 8)}, rest]
-    else
-      all
-    end
-  end
-
-  # A line continuation (backslash + line terminator) contributes nothing.
-  defp decode_js_escape("\\" <> rest)
-       when rest in ["\n", "\r\n", "\r", <<0x2028::utf8>>, <<0x2029::utf8>>],
-       do: ""
-
-  defp decode_js_escape("\\" <> char), do: char
-
-  # Out-of-range code points (> U+10FFFF) can't be encoded: a distinct :invalid
-  # marker that join_js_parts/2 rejects (never a pairable surrogate).
-  defp hex(digits) do
-    case Integer.parse(digits, 16) do
-      {cp, ""} when cp <= 0x10FFFF -> cp
-      _ -> :invalid
     end
   end
 
   # Module path strings (`pkg-a`, `@scope/pkg`) keep `-`, `@` and `/`, but must
   # still satisfy the output naming rules (see the moduledoc).
   defp module_path_name(name_node, source) do
-    text = if TS.node_kind(name_node) == "string", do: js_string_value(name_node, source)
+    text = if TS.node_kind(name_node) == "string", do: JsString.value(name_node, source)
 
     if is_binary(text) and text != "" and not String.match?(text, ~r/[\s"'`()]/u) and
          not String.contains?(text, ["::", ".."]) and

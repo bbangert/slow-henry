@@ -29,6 +29,7 @@ defmodule RetrievalNode.Chunking.BindingNames do
       / compiler-directive attributes (`@excluded_elixir_attrs`)
   """
 
+  alias RetrievalNode.Chunking.JsString
   alias TreeSitterLanguagePack, as: TS
 
   @excluded_elixir_attrs ~w(moduledoc doc spec type typep opaque callback macrocallback impl
@@ -284,10 +285,9 @@ defmodule RetrievalNode.Chunking.BindingNames do
          true <- identifier_text?(TS.node_child_by_field_name(fun, "property"), source, "define"),
          args when not is_nil(args) <- TS.node_child_by_field_name(node, "arguments"),
          [first | _] <- args |> named_children() |> Enum.reject(&(TS.node_kind(&1) == "comment")),
-         "string" <- TS.node_kind(first),
-         [fragment | _] <-
-           first |> named_children() |> Enum.filter(&(TS.node_kind(&1) == "string_fragment")) do
-      [{TS.node_start_byte(node), "customElements:" <> slice(source, fragment)}]
+         true <- TS.node_kind(first) in ~w(string template_string),
+         tag when is_binary(tag) and tag != "" <- JsString.value(first, source) do
+      [{TS.node_start_byte(node), "customElements:" <> tag}]
     else
       _ -> []
     end
