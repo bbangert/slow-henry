@@ -2,7 +2,9 @@ defmodule RetrievalNode.Chunking.BindingNames do
   @moduledoc """
   The names BOUND by top-level code in one scope (the file root, or a
   container's body), read from the AST — the single rule set behind the
-  `names` field on `kind: "toplevel"` chunks.
+  `names` field on `kind: "toplevel"` chunks — and, from the same walk, the
+  byte ranges of the scope's import statements (`ImportNodes`) behind
+  `import_ranges`.
 
   `collect/3` walks the direct children of a scope node, descending only
   through the per-language wrapper kinds (`export_statement`,
@@ -10,7 +12,8 @@ defmodule RetrievalNode.Chunking.BindingNames do
   or an expression: a `const` inside an arrow function passed to a call is not
   a top-level binding. It returns `{byte, name}` pairs in source order, `byte`
   being the start of the node that carries the name, so the chunker can hand
-  each name to the gap piece containing it.
+  each name to the gap piece containing it (and `{start, end}` import ranges
+  likewise).
 
   Per language:
 
@@ -30,6 +33,7 @@ defmodule RetrievalNode.Chunking.BindingNames do
   """
 
   alias RetrievalNode.Chunking.ElixirBody
+  alias RetrievalNode.Chunking.ImportNodes
   alias RetrievalNode.Chunking.JsString
   alias TreeSitterLanguagePack, as: TS
 
@@ -47,23 +51,51 @@ defmodule RetrievalNode.Chunking.BindingNames do
     "elixir" => ~w(do_block)
   }
 
-  @type entry :: {non_neg_integer(), String.t()}
-  @typedoc "Entries sorted by byte, as a tuple for O(log n) positioning."
+  @typedoc "Entries sorted by their first element (a byte), as a tuple for O(log n) positioning."
   @type index :: tuple()
+  @type scope_index :: %{names: index(), imports: index()}
 
   @doc """
-  Binding names of `scope`'s direct top-level statements, in source order, as
-  an index for `names_in/4`.
+  The same scope walk, two results: the binding names of `scope`'s direct
+  top-level statements (for `names_in/4`) and the byte ranges of its import
+  statements (`ImportNodes`, for `imports_in/3`), both in source order.
   """
-  @spec collect(term(), binary(), String.t()) :: index()
+  @spec collect(term(), binary(), String.t()) :: scope_index()
   def collect(scope, source, language) do
     wrappers = Map.get(@wrappers, language, [])
+    items = walk(scope, source, language, wrappers)
 
-    scope
-    |> walk(source, language, wrappers)
-    |> Enum.reject(fn {_byte, name} -> placeholder?(language, name) end)
-    |> Enum.sort_by(&elem(&1, 0))
-    |> List.to_tuple()
+    names =
+      for {:name, byte, name} <- items, not placeholder?(language, name), do: {byte, name}
+
+    imports = for {:import, from, to} <- items, do: {from, to}
+
+    %{names: to_index(names), imports: to_index(imports)}
+  end
+
+  defp to_index(entries), do: entries |> Enum.sort_by(&elem(&1, 0)) |> List.to_tuple()
+
+  @doc """
+  The `{start, end}` import ranges lying fully inside `[from, to)`, as offsets
+  relative to `from`. An import straddling a piece boundary belongs to no piece.
+  """
+  @spec imports_in(index(), non_neg_integer(), non_neg_integer()) :: [
+          {non_neg_integer(), non_neg_integer()}
+        ]
+  def imports_in(index, from, to) do
+    index |> first_at_or_after(from, 0, tuple_size(index)) |> take_imports(index, from, to, [])
+  end
+
+  defp take_imports(i, index, _from, _to, acc) when i >= tuple_size(index), do: Enum.reverse(acc)
+
+  defp take_imports(i, index, from, to, acc) do
+    {s, e} = elem(index, i)
+
+    cond do
+      s >= to -> Enum.reverse(acc)
+      e <= to -> take_imports(i + 1, index, from, to, [{s - from, e - from} | acc])
+      true -> Enum.reverse(acc)
+    end
   end
 
   @doc """
@@ -149,15 +181,22 @@ defmodule RetrievalNode.Chunking.BindingNames do
   defp walk(node, source, language, wrappers) do
     node
     |> scope_children(language, source)
-    |> Enum.flat_map(fn child ->
-      kind = TS.node_kind(child)
+    |> Enum.flat_map(&statement_items(&1, source, language, wrappers))
+  end
 
-      if kind in wrappers do
+  defp statement_items(child, source, language, wrappers) do
+    kind = TS.node_kind(child)
+
+    cond do
+      kind in wrappers ->
         walk(child, source, language, wrappers)
-      else
-        bindings(language, kind, child, source)
-      end
-    end)
+
+      ImportNodes.import?(child, kind, language, source) ->
+        [{:import, TS.node_start_byte(child), TS.node_end_byte(child)}]
+
+      true ->
+        for {byte, name} <- bindings(language, kind, child, source), do: {:name, byte, name}
+    end
   end
 
   # --- python ---

@@ -162,6 +162,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   @behaviour RetrievalNode.Graph.Extractor
 
   alias RetrievalNode.Chunking.ElixirBody
+  alias RetrievalNode.Chunking.ImportNodes
   alias RetrievalNode.Chunking.JsString
   alias RetrievalNode.Graph.Extractor.TreeSitter.WalkState
   alias TreeSitterLanguagePack, as: TS
@@ -272,16 +273,6 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     "java" => "method_invocation"
   }
 
-  @import_kinds %{
-    "python" => ~w(import_statement import_from_statement),
-    "javascript" => ~w(import_statement),
-    "typescript" => ~w(import_statement),
-    "go" => ~w(import_declaration),
-    "rust" => ~w(use_declaration),
-    "ruby" => [],
-    "java" => ~w(import_declaration)
-  }
-
   # Elixir parses every construct as a `call` node discriminated by its target
   # identifier, which a kind-keyed table can't express, so it has its own
   # process_child/6 clause instead of entries in the tables above.
@@ -290,7 +281,6 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   @elixir_module_forms ~w(defmodule defprotocol defimpl)
   @elixir_function_forms ~w(def defp defmacro defmacrop defguard defguardp defdelegate)
   @elixir_def_forms @elixir_module_forms ++ @elixir_function_forms
-  @elixir_import_forms ~w(alias import use require)
 
   # Typespec attributes are the type language, not runtime code: `@spec f(a) ::
   # b` writes `f` in call syntax but is a signature. They are never descended
@@ -304,7 +294,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
   def extract({root, source}, language, _opts) do
     def_kinds = Map.get(@definition_kinds, language, %{})
     call_kind = Map.get(@call_kinds, language)
-    import_kinds = Map.get(@import_kinds, language, [])
+    import_kinds = ImportNodes.kinds(language)
     lang_ctx = %{def_kinds: def_kinds, call_kind: call_kind, import_kinds: import_kinds}
 
     state = %WalkState{}
@@ -1162,7 +1152,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
       # The form itself is only an import; calls in its arguments or block
       # (`use Foo, opts: build()`) are still dependencies.
-      target in @elixir_import_forms ->
+      target in ImportNodes.elixir_forms() ->
         call_node
         |> handle_elixir_import(source, state, acc)
         |> then(&maybe_walk(&1, call_node, source, language, lang_ctx, state))
@@ -1465,6 +1455,13 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
 
   # --- calls -------------------------------------------------------------
 
+  # Ruby has no import node kind; require/require_relative are plain `call`
+  # nodes (classified by ImportNodes, shared with the chunker).
+  defp ruby_import(call_node, source, "ruby", name),
+    do: ImportNodes.ruby_import(call_node, source, name)
+
+  defp ruby_import(_call_node, _source, _language, _name), do: :not_import
+
   defp handle_call(child, source, language, state, acc) do
     case callee_name(child, source, language) do
       nil ->
@@ -1666,45 +1663,6 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     |> slice(node)
     |> String.split(~r/\.|::/)
     |> List.last()
-  end
-
-  # Ruby has no import node kind; require/require_relative are plain `call`
-  # nodes. Classify one as an import of its first string argument.
-  defp ruby_import(call_node, source, "ruby", name)
-       when name in ["require", "require_relative"] do
-    with true <- ruby_kernel_receiver?(call_node, source),
-         str when not is_nil(str) <- first_string_arg(call_node, source) do
-      {:import, str}
-    else
-      _ -> :not_import
-    end
-  end
-
-  defp ruby_import(_call_node, _source, _language, _name), do: :not_import
-
-  defp ruby_kernel_receiver?(call_node, source) do
-    case TS.node_child_by_field_name(call_node, "receiver") do
-      nil -> true
-      recv -> TS.node_kind(recv) == "self" or slice(source, recv) in ["Kernel", "::Kernel"]
-    end
-  end
-
-  defp first_string_arg(call_node, source) do
-    with args_node when not is_nil(args_node) <-
-           TS.node_child_by_field_name(call_node, "arguments"),
-         [str_node | _] <- Enum.filter(named_children(args_node), &(TS.node_kind(&1) == "string")),
-         false <- Enum.any?(named_children(str_node), &(TS.node_kind(&1) == "interpolation")) do
-      string_content(str_node, source)
-    else
-      _ -> nil
-    end
-  end
-
-  defp string_content(str_node, source) do
-    case Enum.find(named_children(str_node), &(TS.node_kind(&1) == "string_content")) do
-      nil -> strip_quotes(slice(source, str_node))
-      content_node -> slice(source, content_node)
-    end
   end
 
   # --- imports -------------------------------------------------------------
@@ -1999,8 +1957,7 @@ defmodule RetrievalNode.Graph.Extractor.TreeSitter do
     end)
   end
 
-  defp strip_quotes(text),
-    do: text |> String.trim() |> String.trim("\"") |> String.trim("'") |> String.trim("`")
+  defp strip_quotes(text), do: ImportNodes.strip_quotes(text)
 
   # --- shared node/accumulator helpers ---------------------------------
 

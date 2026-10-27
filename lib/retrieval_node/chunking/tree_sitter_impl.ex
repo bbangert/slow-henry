@@ -423,20 +423,21 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   # `scope` is the `{node, language}` being gapped: the names bound by its
   # top-level statements are collected once and handed to the piece they fall in.
   defp add_gaps(chunks, source, from, to, breadcrumb, {scope_node, language}) do
-    names = BindingNames.collect(scope_node, source, language)
+    scope_index = BindingNames.collect(scope_node, source, language)
 
     {gaps, cursor} =
       Enum.reduce(chunks, {[], from}, fn chunk, {acc, cursor} ->
-        {gap_chunks(source, cursor, chunk.start_byte, breadcrumb, names) ++ acc, chunk.end_byte}
+        {gap_chunks(source, cursor, chunk.start_byte, breadcrumb, scope_index) ++ acc,
+         chunk.end_byte}
       end)
 
-    tail = gap_chunks(source, cursor, to, breadcrumb, names)
+    tail = gap_chunks(source, cursor, to, breadcrumb, scope_index)
     Enum.sort_by(chunks ++ gaps ++ tail, & &1.start_byte)
   end
 
   # Gap chunks for one uncovered byte range: trimmed to its non-whitespace
   # extent, then split into size-bounded line-aligned pieces.
-  defp gap_chunks(source, from, to, breadcrumb, names) do
+  defp gap_chunks(source, from, to, breadcrumb, scope_index) do
     case trim_range(source, from, to) do
       nil ->
         []
@@ -444,17 +445,19 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
       {s, e} ->
         source
         |> split_range(s, e, s, [])
-        |> Enum.flat_map(fn {ps, pe} -> piece_chunk(source, ps, pe, breadcrumb, names) end)
+        |> Enum.flat_map(fn {ps, pe} -> piece_chunk(source, ps, pe, breadcrumb, scope_index) end)
     end
   end
 
-  defp piece_chunk(source, from, to, breadcrumb, names) do
+  defp piece_chunk(source, from, to, breadcrumb, scope_index) do
     case trim_range(source, from, to) do
       nil ->
         []
 
       {s, e} ->
-        [gap_chunk(source, s, e, breadcrumb, BindingNames.names_in(names, s, e, @max_names))]
+        names = BindingNames.names_in(scope_index.names, s, e, @max_names)
+        imports = BindingNames.imports_in(scope_index.imports, s, e)
+        [gap_chunk(source, s, e, breadcrumb, names, imports)]
     end
   end
 
@@ -508,12 +511,13 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
     end
   end
 
-  defp gap_chunk(source, start_byte, end_byte, breadcrumb, names) do
+  defp gap_chunk(source, start_byte, end_byte, breadcrumb, names, imports) do
     %{
       text: binary_part(source, start_byte, end_byte - start_byte),
       breadcrumb: breadcrumb,
       kind: @toplevel_kind,
       names: names,
+      import_ranges: imports,
       parse_status: :ok,
       start_byte: start_byte,
       end_byte: end_byte
