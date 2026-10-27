@@ -41,7 +41,8 @@ defmodule RetrievalNode.Chunking do
           required(:kind) => String.t(),
           required(:parse_status) => :ok | :heuristic_fallback | :crashed_fallback,
           optional(:start_byte) => non_neg_integer(),
-          optional(:end_byte) => non_neg_integer()
+          optional(:end_byte) => non_neg_integer(),
+          optional(:names) => [String.t()]
         }
 
   @doc "Split `source` (in `language`) into chunks, or return a tagged error."

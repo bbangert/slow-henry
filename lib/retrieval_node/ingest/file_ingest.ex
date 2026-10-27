@@ -251,6 +251,8 @@ defmodule RetrievalNode.Ingest.FileIngest do
           # Chunk.content_hash is the hash of the CHUNK (row.content_hash, used
           # as `file_hash` below, is the raw-file hash).
           content_hash: sha256(text),
+          kind: chunk.kind,
+          names: Map.get(chunk, :names, []),
           graph: graph
         }
       end)
@@ -511,7 +513,10 @@ defmodule RetrievalNode.Ingest.FileIngest do
       content_hash: entry.content_hash,
       content: entry.text,
       context_breadcrumb: entry.breadcrumb,
-      metadata: Map.put(row.metadata || %{}, "chunk_index", entry.index),
+      metadata:
+        (row.metadata || %{})
+        |> Map.put("chunk_index", entry.index)
+        |> Map.put("kind", entry.kind),
       embedding: Map.fetch!(embeddings_by_key, entry.chunk_key),
       parse_status: to_enum(:parse_status, parse_status),
       secrets_status: to_enum(:secrets_status, opts[:secrets_status]),

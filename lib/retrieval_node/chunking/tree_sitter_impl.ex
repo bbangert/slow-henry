@@ -43,6 +43,7 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
 
   @behaviour RetrievalNode.Chunking
 
+  alias RetrievalNode.Chunking.BindingNames
   alias RetrievalNode.Chunking.HeuristicImpl
   alias RetrievalNode.Graph.Extractor
   alias TreeSitterLanguagePack, as: TS
@@ -66,6 +67,9 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   @elixir_def_forms @elixir_module_forms ++ @elixir_function_forms
 
   @toplevel_kind "toplevel"
+
+  # Cap on `names` per gap chunk.
+  @max_names 20
 
   # Node kinds that mark a chunk boundary, per language. A node is emitted as a
   # chunk only if it has no chunkable descendants (leaf-most def); a container
@@ -188,7 +192,7 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   defp document_chunks(root, source, language) do
     root
     |> extract(source, language, [])
-    |> add_gaps(source, 0, byte_size(source), "")
+    |> add_gaps(source, 0, byte_size(source), "", {root, language})
     |> fill_gap_lines(source)
   end
 
@@ -256,23 +260,24 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
     case extract(child, source, language, child_scope) do
       [] ->
         if container_form?(child, source, language) do
-          emit_container(child, source, [], child_scope)
+          emit_container(child, source, [], child_scope, language)
         else
           [to_chunk(child, source, kind, child_scope)]
         end
 
       nested ->
-        emit_container(child, source, nested, child_scope)
+        emit_container(child, source, nested, child_scope, language)
     end
   end
 
-  defp emit_container(node, source, nested, child_scope) do
+  defp emit_container(node, source, nested, child_scope, language) do
     add_gaps(
       nested,
       source,
       TS.node_start_byte(node),
       TS.node_end_byte(node),
-      Enum.join(child_scope, " > ")
+      Enum.join(child_scope, " > "),
+      {node, language}
     )
   end
 
@@ -296,29 +301,7 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
 
   defp enclosing_scope(_node, _source, _language, scope), do: scope
 
-  # Collect direct named children in one O(n) cursor pass. The indexed
-  # `node_named_child/2` accessor rescans from the first child each call (O(n²)
-  # over siblings); the TreeCursor walks siblings in O(1) amortized.
-  defp named_children(node) do
-    cursor = TS.node_walk(node)
-
-    if TS.treecursor_goto_first_child(cursor) do
-      collect_siblings(cursor, [])
-    else
-      []
-    end
-  end
-
-  defp collect_siblings(cursor, acc) do
-    node = TS.treecursor_node(cursor)
-    acc = if TS.node_is_named(node), do: [node | acc], else: acc
-
-    if TS.treecursor_goto_next_sibling(cursor) do
-      collect_siblings(cursor, acc)
-    else
-      Enum.reverse(acc)
-    end
-  end
+  defp named_children(node), do: BindingNames.named_children(node)
 
   # Elixir boundary nodes are always kind "call"; every other language's
   # boundary kinds carry a "name" field directly.
@@ -437,19 +420,23 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
 
   # Merge `chunks` (sorted, non-overlapping, all within [from, to)) with the
   # gaps of [from, to) they leave uncovered, returned in document order.
-  defp add_gaps(chunks, source, from, to, breadcrumb) do
+  # `scope` is the `{node, language}` being gapped: the names bound by its
+  # top-level statements are collected once and handed to the piece they fall in.
+  defp add_gaps(chunks, source, from, to, breadcrumb, {scope_node, language}) do
+    names = BindingNames.collect(scope_node, source, language)
+
     {gaps, cursor} =
       Enum.reduce(chunks, {[], from}, fn chunk, {acc, cursor} ->
-        {gap_chunks(source, cursor, chunk.start_byte, breadcrumb) ++ acc, chunk.end_byte}
+        {gap_chunks(source, cursor, chunk.start_byte, breadcrumb, names) ++ acc, chunk.end_byte}
       end)
 
-    tail = gap_chunks(source, cursor, to, breadcrumb)
+    tail = gap_chunks(source, cursor, to, breadcrumb, names)
     Enum.sort_by(chunks ++ gaps ++ tail, & &1.start_byte)
   end
 
   # Gap chunks for one uncovered byte range: trimmed to its non-whitespace
   # extent, then split into size-bounded line-aligned pieces.
-  defp gap_chunks(source, from, to, breadcrumb) do
+  defp gap_chunks(source, from, to, breadcrumb, names) do
     case trim_range(source, from, to) do
       nil ->
         []
@@ -457,14 +444,17 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
       {s, e} ->
         source
         |> split_range(s, e, s, [])
-        |> Enum.flat_map(fn {ps, pe} -> piece_chunk(source, ps, pe, breadcrumb) end)
+        |> Enum.flat_map(fn {ps, pe} -> piece_chunk(source, ps, pe, breadcrumb, names) end)
     end
   end
 
-  defp piece_chunk(source, from, to, breadcrumb) do
+  defp piece_chunk(source, from, to, breadcrumb, names) do
     case trim_range(source, from, to) do
-      nil -> []
-      {s, e} -> [gap_chunk(source, s, e, breadcrumb)]
+      nil ->
+        []
+
+      {s, e} ->
+        [gap_chunk(source, s, e, breadcrumb, BindingNames.names_in(names, s, e, @max_names))]
     end
   end
 
@@ -518,11 +508,12 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
     end
   end
 
-  defp gap_chunk(source, start_byte, end_byte, breadcrumb) do
+  defp gap_chunk(source, start_byte, end_byte, breadcrumb, names) do
     %{
       text: binary_part(source, start_byte, end_byte - start_byte),
       breadcrumb: breadcrumb,
       kind: @toplevel_kind,
+      names: names,
       parse_status: :ok,
       start_byte: start_byte,
       end_byte: end_byte
