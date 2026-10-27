@@ -313,6 +313,28 @@ defmodule RetrievalNode.Chunking.TreeSitterNamesTest do
     end
   end
 
+  describe "container bodies and chains" do
+    test "elixir: keyword-form module bodies are traversed, other keywords are not" do
+      src = ~S'''
+      defmodule A, do: (@foo 1; @bar 2)
+      defmodule B, do: @baz 3
+      defmodule C, other: @nope, do: @yes
+      defprotocol P, do: (@pa 1)
+      '''
+
+      chunks = chunks!(src, "elixir")
+      assert names_at(chunks, "A") == ~w(foo bar)
+      assert names_at(chunks, "B") == ~w(baz)
+      assert names_at(chunks, "C") == ~w(yes)
+      assert names_at(chunks, "P") == ~w(pa)
+    end
+
+    test "ruby: constants are found through = and ||= chains alike" do
+      src = "cached ||= SCHEMA = {}\nCOPY = OTHER ||= {}\nA ||= B ||= 1\n"
+      assert names_at(chunks!(src, "ruby"), "") == ~w(SCHEMA COPY OTHER A B)
+    end
+  end
+
   describe "placeholders and parameterized aliases" do
     test "go: blank identifiers bind nothing and do not use up cap slots" do
       real = Enum.map_join(1..20, "\n", &"\tN#{&1} = #{&1}")

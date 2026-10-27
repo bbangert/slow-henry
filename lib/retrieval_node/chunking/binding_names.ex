@@ -29,6 +29,7 @@ defmodule RetrievalNode.Chunking.BindingNames do
       / compiler-directive attributes (`@excluded_elixir_attrs`)
   """
 
+  alias RetrievalNode.Chunking.ElixirBody
   alias RetrievalNode.Chunking.JsString
   alias TreeSitterLanguagePack, as: TS
 
@@ -118,6 +119,28 @@ defmodule RetrievalNode.Chunking.BindingNames do
       else: Enum.reverse(acc)
   end
 
+  # Elixir containers keep their statements in a `do_block` child or in the
+  # `do:` keyword value (one block of statements, or a single one); mirror the
+  # graph extractor via ElixirBody. Other pairs/arguments are not body.
+  defp scope_children(node, "elixir", source) do
+    if TS.node_kind(node) == "call" do
+      node |> ElixirBody.body_nodes(["do"], source) |> Enum.flat_map(&keyword_body(&1))
+    else
+      named_children(node)
+    end
+  end
+
+  defp scope_children(node, _language, _source), do: named_children(node)
+
+  # A `do:` value is a parenthesised `block` of statements or one statement.
+  defp keyword_body(body) do
+    case TS.node_kind(body) do
+      "do_block" -> named_children(body)
+      "block" -> named_children(body)
+      _ -> [body]
+    end
+  end
+
   # Go's blank identifier and Rust's `const _` bind nothing. Python's and
   # JS/TS's `_` is a real variable (gettext, lodash), so it is kept.
   defp placeholder?(language, name) when language in ~w(go rust), do: name == "_"
@@ -125,7 +148,7 @@ defmodule RetrievalNode.Chunking.BindingNames do
 
   defp walk(node, source, language, wrappers) do
     node
-    |> named_children()
+    |> scope_children(language, source)
     |> Enum.flat_map(fn child ->
       kind = TS.node_kind(child)
 
@@ -192,14 +215,8 @@ defmodule RetrievalNode.Chunking.BindingNames do
 
   # --- ruby ---
 
-  defp bindings("ruby", "assignment", node, source), do: ruby_assignment(node, source)
-
-  defp bindings("ruby", "operator_assignment", node, source) do
-    case TS.node_child_by_field_name(node, "left") do
-      nil -> []
-      left -> ruby_constants(left, source)
-    end
-  end
+  defp bindings("ruby", kind, node, source) when kind in ~w(assignment operator_assignment),
+    do: ruby_assignment(node, source)
 
   # --- java ---
 
@@ -323,8 +340,10 @@ defmodule RetrievalNode.Chunking.BindingNames do
     |> Enum.map(&named(&1, source))
   end
 
-  # `FOO = BAR = 1` nests the second assignment under `right`; in
-  # `A, B = C = 1, 2` it sits inside the right_assignment_list.
+  # One walker for `=` and `||=`/`+=`: the statement and every assignment
+  # followed down a chain's right side. `FOO = BAR = 1` nests the second under
+  # `right`; in `A, B = C = 1, 2` it sits inside the right_assignment_list.
+  # Only constants bind, so `cached ||= SCHEMA = {}` records just SCHEMA.
   defp ruby_assignment(node, source) do
     left =
       case TS.node_child_by_field_name(node, "left") do
@@ -343,13 +362,13 @@ defmodule RetrievalNode.Chunking.BindingNames do
 
   defp ruby_chained(right, source) do
     case TS.node_kind(right) do
-      "assignment" ->
+      k when k in ~w(assignment operator_assignment) ->
         ruby_assignment(right, source)
 
       "right_assignment_list" ->
         right
         |> named_children()
-        |> Enum.filter(&(TS.node_kind(&1) == "assignment"))
+        |> Enum.filter(&(TS.node_kind(&1) in ~w(assignment operator_assignment)))
         |> Enum.flat_map(&ruby_assignment(&1, source))
 
       _ ->
