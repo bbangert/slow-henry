@@ -253,7 +253,7 @@ defmodule RetrievalNode.Chunking.BindingNames do
   defp js_pattern_names(node, source) do
     case TS.node_kind(node) do
       k when k in ~w(identifier shorthand_property_identifier_pattern) ->
-        [named(node, source)]
+        [{TS.node_start_byte(node), js_ident(node, source)}]
 
       "pair_pattern" ->
         value_names(node, "value", source)
@@ -296,7 +296,8 @@ defmodule RetrievalNode.Chunking.BindingNames do
   defp identifier_text?(nil, _source, _text), do: false
 
   defp identifier_text?(node, source, text),
-    do: TS.node_kind(node) in ~w(identifier property_identifier) and slice(source, node) == text
+    do:
+      TS.node_kind(node) in ~w(identifier property_identifier) and js_ident(node, source) == text
 
   # Spec names are the identifier children (`var c, d = 1, 2`); the type and
   # the value expressions are other kinds.
@@ -394,6 +395,13 @@ defmodule RetrievalNode.Chunking.BindingNames do
       name -> [named(name, source)]
     end
   end
+
+  # Every JS/TS identifier goes through here: `\u` escapes are decoded (an
+  # undecodable escape stays as written), so `h\u0065lper` and `helper` are one
+  # name, as in the graph extractor.
+  defp js_ident(node, source), do: node |> slice_of(source) |> JsString.decode_identifier()
+
+  defp slice_of(node, source), do: slice(source, node)
 
   defp named(node, source), do: {TS.node_start_byte(node), slice(source, node)}
 

@@ -291,6 +291,28 @@ defmodule RetrievalNode.Chunking.TreeSitterNamesTest do
     end
   end
 
+  describe "JS/TS identifiers are decoded before use" do
+    for lang <- ~w(javascript typescript) do
+      test "#{lang}: escaped duplicates, destructured names and customElements parts" do
+        src = ~S'''
+        var helper = 1;
+        var h\u0065lper = 2;
+        const {\u0061, b: \u{63}, ...r\u0065st} = o;
+        const [d\u0065f = 1] = p;
+        customElements.d\u0065fine("x-el", A);
+        \u0063ustomElements.define("y-el", B);
+        '''
+
+        assert names_at(chunks!(src, unquote(lang)), "") ==
+                 ~w(helper a c rest def customElements:x-el customElements:y-el)
+      end
+
+      test "#{lang}: an undecodable identifier escape stays as written" do
+        assert names_at(chunks!("var a\\uD800b = 1;\n", unquote(lang)), "") == ["a\\uD800b"]
+      end
+    end
+  end
+
   describe "piece assignment and limits" do
     test "thousands of bindings interleaved with definitions get exact per-piece names" do
       src =
