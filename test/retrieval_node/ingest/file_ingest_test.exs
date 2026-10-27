@@ -490,6 +490,47 @@ defmodule RetrievalNode.Ingest.FileIngestTest do
     refute vector_b_after == vector_b_before
   end
 
+  test "persists the chunk kind in metadata and a re-apply of the same file reuses every vector",
+       %{source: source} do
+    natural_key = "repo:acme/app:kinds.py"
+
+    chunk = fn text, crumb, kind, extra ->
+      Map.merge(
+        %{
+          text: text,
+          breadcrumb: crumb,
+          start_line: 1,
+          end_line: 1,
+          kind: kind,
+          parse_status: :ok
+        },
+        extra
+      )
+    end
+
+    force_chunk(
+      {:ok,
+       [
+         chunk.("LIMIT = 3", "", "toplevel", %{names: ["LIMIT"]}),
+         chunk.("def a():\n    pass", "a", "function_definition", %{}),
+         chunk.("plain text", "doc", "heuristic_block", %{})
+       ]}
+    )
+
+    assert {:ok, %{embedded: 3, reused: 0}} =
+             FileIngest.apply(seed_raw(source, "v1", natural_key, "kinds.py"), [])
+
+    kinds =
+      source
+      |> chunks_for("kinds.py")
+      |> Map.new(&{&1.metadata["chunk_index"], &1.metadata["kind"]})
+
+    assert kinds == %{0 => "toplevel", 1 => "function_definition", 2 => "heuristic_block"}
+
+    assert {:ok, %{embedded: 0, reused: 3}} =
+             FileIngest.apply(seed_raw(source, "v1b", natural_key, "kinds.py"), [])
+  end
+
   test "embedding reuse skips a stored chunk whose embedding is nil (re-embeds it)", %{
     source: source
   } do
