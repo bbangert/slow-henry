@@ -46,29 +46,54 @@ defmodule RetrievalNode.Chunking.BindingNames do
   }
 
   @type entry :: {non_neg_integer(), String.t()}
+  @typedoc "Entries sorted by byte, as a tuple for O(log n) positioning."
+  @type index :: tuple()
 
   @doc """
-  Binding names of `scope`'s direct top-level statements, in source order.
+  Binding names of `scope`'s direct top-level statements, in source order, as
+  an index for `names_in/4`.
   """
-  @spec collect(term(), binary(), String.t()) :: [entry()]
+  @spec collect(term(), binary(), String.t()) :: index()
   def collect(scope, source, language) do
     wrappers = Map.get(@wrappers, language, [])
 
     scope
     |> walk(source, language, wrappers)
     |> Enum.sort_by(&elem(&1, 0))
+    |> List.to_tuple()
   end
 
   @doc """
-  The deduped, capped names of `entries` whose byte lies in `[from, to)`.
+  The deduped, capped names of the index entries whose byte lies in
+  `[from, to)`. Binary-searches the first candidate, then reads forward only
+  until `to` or `cap` distinct names — O(log n + names taken) per piece.
   """
-  @spec names_in([entry()], non_neg_integer(), non_neg_integer(), pos_integer()) :: [String.t()]
-  def names_in(entries, from, to, cap) do
-    entries
-    |> Enum.filter(fn {byte, _} -> byte >= from and byte < to end)
-    |> Enum.map(&elem(&1, 1))
-    |> Enum.uniq()
-    |> Enum.take(cap)
+  @spec names_in(index(), non_neg_integer(), non_neg_integer(), pos_integer()) :: [String.t()]
+  def names_in(index, from, to, cap) do
+    index |> first_at_or_after(from, 0, tuple_size(index)) |> take_names(index, to, cap, [])
+  end
+
+  defp first_at_or_after(_index, _from, lo, hi) when lo >= hi, do: lo
+
+  defp first_at_or_after(index, from, lo, hi) do
+    mid = div(lo + hi, 2)
+
+    if index |> elem(mid) |> elem(0) < from,
+      do: first_at_or_after(index, from, mid + 1, hi),
+      else: first_at_or_after(index, from, lo, mid)
+  end
+
+  defp take_names(i, index, _to, _cap, acc) when i >= tuple_size(index), do: Enum.reverse(acc)
+
+  defp take_names(i, index, to, cap, acc) do
+    {byte, name} = elem(index, i)
+
+    cond do
+      byte >= to -> Enum.reverse(acc)
+      length(acc) >= cap -> Enum.reverse(acc)
+      name in acc -> take_names(i + 1, index, to, cap, acc)
+      true -> take_names(i + 1, index, to, cap, [name | acc])
+    end
   end
 
   @doc """
@@ -197,7 +222,7 @@ defmodule RetrievalNode.Chunking.BindingNames do
       "identifier" ->
         [named(node, source)]
 
-      k when k in ~w(pattern_list tuple_pattern list_pattern) ->
+      k when k in ~w(pattern_list tuple_pattern list_pattern list_splat_pattern) ->
         node |> named_children() |> Enum.flat_map(&python_targets(&1, source))
 
       _ ->

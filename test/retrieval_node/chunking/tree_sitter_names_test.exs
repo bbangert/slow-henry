@@ -178,7 +178,63 @@ defmodule RetrievalNode.Chunking.TreeSitterNamesTest do
     end
   end
 
+  describe "every identifier bound by a target pattern" do
+    test "python: starred, nested and parenthesized targets; not starred attributes" do
+      src = ~S'''
+      head, *tail = v
+      (a, (b, *c)), [d, e] = x
+      *obj.attr, f = y
+      (g) = 1
+      [h, *i] = z
+      '''
+
+      assert names_at(chunks!(src, "python"), "") == ~w(head tail a b c d e f g h i)
+    end
+
+    for lang <- ~w(javascript typescript) do
+      test "#{lang}: rest, defaults, nested and renamed patterns" do
+        src = ~S'''
+        const {a, ...rest} = o;
+        const [x, ...ys] = arr;
+        const {p: {q = 1}, r: [s, t]} = u;
+        const {k: l = 5} = m;
+        let [m1 = 2, [n1, ...o1]] = w;
+        '''
+
+        assert names_at(chunks!(src, unquote(lang)), "") ==
+                 ~w(a rest x ys q s t l m1 n1 o1)
+      end
+    end
+
+    test "go: several names per spec" do
+      src = ~S'''
+      package main
+
+      var a, b = 1, 2
+
+      var (
+      	c, d int
+      )
+
+      const X, Y = 1, 2
+      '''
+
+      assert names_at(chunks!(src, "go"), "") == ~w(a b c d X Y)
+    end
+  end
+
   describe "piece assignment and limits" do
+    test "thousands of bindings interleaved with definitions get exact per-piece names" do
+      src =
+        for i <- 1..2000, into: "" do
+          "V#{i} = #{i}\n\ndef f#{i}():\n    return #{i}\n\n"
+        end
+
+      pieces = src |> chunks!("python") |> toplevel()
+      assert length(pieces) == 2000
+      assert Enum.map(pieces, & &1.names) == for(i <- 1..2000, do: ["V#{i}"])
+    end
+
     test "a gap split into several pieces gives each name to the piece containing it" do
       body = String.duplicate("x", 150)
 
