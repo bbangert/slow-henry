@@ -39,8 +39,7 @@ defmodule RetrievalNode.Ingest.FileIngest do
 
     * `:force` (default `row.force`) — re-chunk even though the file's content
       hash is unchanged. Embeddings are still reused wherever
-      `(breadcrumb, content_hash, embed_format)` matches — see "Embedding
-      reuse" below.
+      the embedder input is unchanged — see "Embedding reuse" below.
     * `:on_parse_crash` (default `:error`) — `:heuristic` on a row's FINAL
       attempt (the caller decides "final"; this module has no attempt
       counter of its own).
@@ -246,7 +245,7 @@ defmodule RetrievalNode.Ingest.FileIngest do
         names = Map.get(chunk, :names, [])
         import_ranges = Map.get(chunk, :import_ranges, [])
 
-        {embed_text, embed_format} =
+        embed_text =
           EmbedText.build(%{
             kind: kind,
             breadcrumb: breadcrumb,
@@ -269,7 +268,7 @@ defmodule RetrievalNode.Ingest.FileIngest do
           names: names,
           import_ranges: import_ranges,
           embed_text: embed_text,
-          embed_format: embed_format,
+          embed_hash: sha256(embed_text),
           graph: graph
         }
       end)
@@ -415,13 +414,14 @@ defmodule RetrievalNode.Ingest.FileIngest do
   end
 
   # Embedding reuse: load the file's EXISTING chunks (by file identity, not by
-  # this batch's keys) and reuse an embedding wherever a new entry's
-  # (breadcrumb, content_hash, embed_format) matches an existing row's. The
-  # embedded input is breadcrumb + text rendered by EmbedText, and the format
-  # names that rendering, so the three together determine it and the vector is
-  # identical. The format is in the key because a rendering change (e.g. the
-  # top-level header) alters the vector without altering breadcrumb or
-  # content_hash; rows written before formats existed count as format 0.
+  # this batch's keys) and reuse an embedding wherever the sha256 of the new
+  # entry's embedder input (EmbedText.build/1) equals an existing row's. Keying
+  # on the input itself, not on proxies like breadcrumb + content_hash, is what
+  # makes reuse safe: a chunk's names and stripped imports depend on the
+  # surrounding AST, so identical chunk text can be embedded as different input.
+  # Rows written before `metadata["embed_hash"]` existed were embedded as
+  # EmbedText.legacy_text/2 of their stored breadcrumb and content, so their key
+  # is computed from that.
   # chunk_key (which embeds the chunk's index) plays no part: a chunk that only
   # shifted position keeps its vector. Everything else goes through
   # Embedding.embed_batch/1 in ONE call. Reuse applies unconditionally (force
@@ -457,9 +457,9 @@ defmodule RetrievalNode.Ingest.FileIngest do
     {Map.merge(fresh_by_key, reused_by_key), length(to_embed), length(reused_entries)}
   end
 
-  defp reuse_key(entry), do: {entry.breadcrumb, entry.content_hash, entry.embed_format}
+  defp reuse_key(entry), do: entry.embed_hash
 
-  # {context_breadcrumb, content_hash, embed_format} => embedding. Rows with a NULL embedding
+  # embed_hash => embedding. Rows with a NULL embedding
   # (Chunk.embedding is nullable) are excluded so one can never be reused —
   # that would persist an unembedded chunk and skip embedding it. Two
   # identical chunks in one file collide on the key harmlessly: identical
@@ -472,17 +472,11 @@ defmodule RetrievalNode.Ingest.FileIngest do
       query ->
         query
         |> where([c], not is_nil(c.embedding))
-        |> select(
-          [c],
-          {{c.context_breadcrumb, c.content_hash,
-            fragment(
-              "COALESCE((?->>'embed_format')::int, ?)",
-              c.metadata,
-              ^EmbedText.legacy_format()
-            )}, c.embedding}
-        )
+        |> select([c], {c.context_breadcrumb, c.content, c.metadata["embed_hash"], c.embedding})
         |> Repo.all()
-        |> Map.new()
+        |> Map.new(fn {crumb, content, stored_hash, embedding} ->
+          {stored_hash || sha256(EmbedText.legacy_text(crumb, content)), embedding}
+        end)
     end
   end
 
@@ -543,7 +537,7 @@ defmodule RetrievalNode.Ingest.FileIngest do
         (row.metadata || %{})
         |> Map.put("chunk_index", entry.index)
         |> Map.put("kind", entry.kind)
-        |> Map.put("embed_format", entry.embed_format),
+        |> Map.put("embed_hash", entry.embed_hash),
       embedding: Map.fetch!(embeddings_by_key, entry.chunk_key),
       parse_status: to_enum(:parse_status, parse_status),
       secrets_status: to_enum(:secrets_status, opts[:secrets_status]),

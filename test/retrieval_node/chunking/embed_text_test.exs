@@ -17,58 +17,63 @@ defmodule RetrievalNode.Chunking.EmbedTextTest do
 
   describe "pure rules" do
     test "toplevel with names: header line, blank line, text" do
-      assert {"lib/a.py — defines: X, Y\n\nX = 1\nY = 2", 1} =
+      assert "lib/a.py — defines: X, Y\n\nX = 1\nY = 2" ==
                build(%{names: ["X", "Y"], text: "X = 1\nY = 2"})
     end
 
-    test "toplevel with no names and no imports is format 0, byte-identical to legacy" do
-      assert {embed, 0} = build(%{})
+    test "toplevel with no names and no imports is byte-identical to legacy" do
+      assert embed = build(%{})
       assert embed == Breadcrumb.prepend("lib/a.py", "X = 1")
 
-      assert {"X = 1", 0} = build(%{breadcrumb: nil})
+      assert "X = 1" ==
+               build(%{breadcrumb: nil})
     end
 
     test "import ranges are cut out and the blank-line runs collapsed" do
       text = "import os\nimport sys\n\n\nX = 1"
 
-      assert {"lib/a.py — defines: X\n\nX = 1", 1} =
+      assert "lib/a.py — defines: X\n\nX = 1" ==
                build(%{names: ["X"], text: text, import_ranges: [{0, 9}, {10, 20}]})
     end
 
-    test "a chunk of only imports falls back to its text: format 0 without names, 1 with" do
-      assert {"lib/a.py\n\nimport os", 0} =
+    test "a chunk of only imports falls back to its text" do
+      assert "lib/a.py\n\nimport os" ==
                build(%{text: "import os", import_ranges: [{0, 9}]})
 
-      assert {"lib/a.py — defines: os\n\nimport os", 1} =
+      assert "lib/a.py — defines: os\n\nimport os" ==
                build(%{text: "import os", names: ["os"], import_ranges: [{0, 9}]})
     end
 
-    test "stripping imports alone (no names) is format 1" do
-      assert {"lib/a.py\n\nX = 1", 1} =
+    test "stripping imports alone (no names) still drops them" do
+      assert "lib/a.py\n\nX = 1" ==
                build(%{text: "import os\nX = 1", import_ranges: [{0, 9}]})
     end
 
     test "text with no imports is embedded as written" do
-      assert {"lib/a.py\n\na = 1\n\n\n\nb = 2", 0} = build(%{text: "a = 1\n\n\n\nb = 2"})
+      assert "lib/a.py\n\na = 1\n\n\n\nb = 2" ==
+               build(%{text: "a = 1\n\n\n\nb = 2"})
     end
 
     test "nil / empty breadcrumb: no header line" do
-      assert {"X = 1", 0} = build(%{breadcrumb: nil, names: ["X"]})
-      assert {"X = 1", 0} = build(%{breadcrumb: "", names: ["X"]})
+      assert "X = 1" ==
+               build(%{breadcrumb: nil, names: ["X"]})
+
+      assert "X = 1" ==
+               build(%{breadcrumb: "", names: ["X"]})
     end
 
     test "definition chunks are byte-identical to the pre-format embed input" do
       for kind <- ["function_definition", "heuristic_block", nil] do
         chunk = %{kind: kind, breadcrumb: "lib/a.py > f", text: "def f():\n    pass"}
-        assert {embed, 0} = EmbedText.build(chunk)
+        embed = EmbedText.build(chunk)
         assert embed == "lib/a.py > f" <> "\n\n" <> "def f():\n    pass"
         assert embed == Breadcrumb.prepend(chunk.breadcrumb, chunk.text)
       end
 
-      assert {"bare", 0} =
+      assert "bare" ==
                EmbedText.build(%{kind: "function_definition", breadcrumb: nil, text: "bare"})
 
-      assert {"bare", 0} =
+      assert "bare" ==
                EmbedText.build(%{kind: "function_definition", breadcrumb: "", text: "bare"})
     end
 
@@ -81,8 +86,15 @@ defmodule RetrievalNode.Chunking.EmbedTextTest do
         import_ranges: [{0, 8}]
       }
 
-      assert {"p\n\nimport x", 0} = EmbedText.build(chunk)
+      assert "p\n\nimport x" ==
+               EmbedText.build(chunk)
     end
+  end
+
+  test "legacy_text/2 is Breadcrumb.prepend/2, or bare text without a breadcrumb" do
+    assert EmbedText.legacy_text("p > f", "t") == Breadcrumb.prepend("p > f", "t")
+    assert EmbedText.legacy_text("", "t") == "t"
+    assert EmbedText.legacy_text(nil, "t") == "t"
   end
 
   describe "on real chunker output" do
@@ -92,7 +104,7 @@ defmodule RetrievalNode.Chunking.EmbedTextTest do
       assert {:ok, chunks} = TSI.chunk(source, lang)
 
       for %{kind: "toplevel"} = c <- chunks do
-        {embed, _format} =
+        embed =
           EmbedText.build(%{
             kind: c.kind,
             breadcrumb: Breadcrumb.build(path, c.breadcrumb),

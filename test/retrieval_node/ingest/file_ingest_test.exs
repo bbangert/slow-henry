@@ -4,6 +4,7 @@ defmodule RetrievalNode.Ingest.FileIngestTest do
   # application tree starts.
   use RetrievalNode.DataCase, async: false
 
+  alias RetrievalNode.Chunking.EmbedText
   alias RetrievalNode.Ingest.FileIngest
   alias RetrievalNode.Ingest.PendingChunks
   alias RetrievalNode.Repo
@@ -531,34 +532,10 @@ defmodule RetrievalNode.Ingest.FileIngestTest do
              FileIngest.apply(seed_raw(source, "v1b", natural_key, "kinds.py"), [])
   end
 
-  describe "embed format" do
+  describe "embedder input and reuse" do
     alias RetrievalNode.Embedding.StubImpl
 
     @toplevel_text "import os\n\nLIMIT = 3"
-
-    defp format_chunks do
-      {:ok,
-       [
-         %{
-           text: @toplevel_text,
-           breadcrumb: "",
-           start_line: 1,
-           end_line: 3,
-           kind: "toplevel",
-           names: ["LIMIT"],
-           import_ranges: [{0, 9}],
-           parse_status: :ok
-         },
-         %{
-           text: "def a():\n    pass",
-           breadcrumb: "a",
-           start_line: 5,
-           end_line: 6,
-           kind: "function_definition",
-           parse_status: :ok
-         }
-       ]}
-    end
 
     # The stored vector is float32; round-trip the stub's float64 the same way.
     defp stub_vector(text), do: text |> StubImpl.embed() |> Pgvector.new() |> Pgvector.to_list()
@@ -566,9 +543,47 @@ defmodule RetrievalNode.Ingest.FileIngestTest do
     defp chunk_with_kind(source, path, kind),
       do: source |> chunks_for(path) |> Enum.find(&(&1.metadata["kind"] == kind))
 
-    test "first apply: toplevel is format 1 embedded with the header, definitions format 0",
+    defp toplevel_chunk(text, names, import_ranges, line) do
+      %{
+        text: text,
+        breadcrumb: "",
+        start_line: line,
+        end_line: line,
+        kind: "toplevel",
+        names: names,
+        import_ranges: import_ranges,
+        parse_status: :ok
+      }
+    end
+
+    defp definition_chunk do
+      %{
+        text: "def a():\n    pass",
+        breadcrumb: "a",
+        start_line: 5,
+        end_line: 6,
+        kind: "function_definition",
+        parse_status: :ok
+      }
+    end
+
+    # Rewind every row of `path` to what a pre-embed_hash ingest wrote: no
+    # `embed_hash` key and the legacy (headerless) vector.
+    defp rewind_to_legacy(source, path) do
+      for c <- chunks_for(source, path) do
+        vec = Pgvector.new(StubImpl.embed(EmbedText.legacy_text(c.context_breadcrumb, c.content)))
+
+        Repo.update_all(from(x in Chunk, where: x.id == ^c.id),
+          set: [metadata: Map.delete(c.metadata, "embed_hash"), embedding: vec]
+        )
+      end
+    end
+
+    test "first apply: toplevel embedded with the header, definition as before; hashes persisted",
          %{source: source} do
-      force_chunk(format_chunks())
+      force_chunk(
+        {:ok, [toplevel_chunk(@toplevel_text, ["LIMIT"], [{0, 9}], 1), definition_chunk()]}
+      )
 
       assert {:ok, %{embedded: 2, reused: 0}} =
                FileIngest.apply(seed_raw(source, "v1", "repo:acme/app:fmt.py", "fmt.py"), [])
@@ -576,24 +591,25 @@ defmodule RetrievalNode.Ingest.FileIngestTest do
       top = chunk_with_kind(source, "fmt.py", "toplevel")
       defn = chunk_with_kind(source, "fmt.py", "function_definition")
 
-      assert top.metadata["embed_format"] == 1
-      assert defn.metadata["embed_format"] == 0
-
       # Stored text and breadcrumb are untouched by the header / import strip.
       assert top.content == @toplevel_text
       assert top.context_breadcrumb == "fmt.py"
 
-      assert Pgvector.to_list(top.embedding) ==
-               stub_vector("fmt.py — defines: LIMIT\n\nLIMIT = 3")
-
+      top_input = "fmt.py — defines: LIMIT\n\nLIMIT = 3"
+      defn_input = "fmt.py > a\n\ndef a():\n    pass"
+      assert Pgvector.to_list(top.embedding) == stub_vector(top_input)
       refute Pgvector.to_list(top.embedding) == stub_vector("fmt.py\n\n" <> @toplevel_text)
+      assert Pgvector.to_list(defn.embedding) == stub_vector(defn_input)
 
-      assert Pgvector.to_list(defn.embedding) ==
-               stub_vector("fmt.py > a\n\ndef a():\n    pass")
+      assert top.metadata["embed_hash"] == sha256_hex(top_input)
+      assert defn.metadata["embed_hash"] == sha256_hex(defn_input)
     end
 
     test "re-apply of an unchanged file reuses every vector", %{source: source} do
-      force_chunk(format_chunks())
+      force_chunk(
+        {:ok, [toplevel_chunk(@toplevel_text, ["LIMIT"], [{0, 9}], 1), definition_chunk()]}
+      )
+
       natural_key = "repo:acme/app:fmt2.py"
 
       assert {:ok, %{embedded: 2}} =
@@ -603,84 +619,68 @@ defmodule RetrievalNode.Ingest.FileIngestTest do
                FileIngest.apply(seed_raw(source, "v1b", natural_key, "fmt2.py"), [])
     end
 
-    test "a pre-format toplevel row re-embeds once; definition rows are reused", %{source: source} do
-      force_chunk(format_chunks())
-      natural_key = "repo:acme/app:fmt3.py"
+    test "same text and breadcrumb but a different rendering re-embeds; the definition is reused",
+         %{source: source} do
+      natural_key = "repo:acme/app:ctx.py"
+
+      # Surrounding code decides which statement is an import / binds a name.
+      force_chunk(
+        {:ok, [toplevel_chunk("import os\nX = 1", [], [{0, 9}], 1), definition_chunk()]}
+      )
 
       assert {:ok, %{embedded: 2}} =
-               FileIngest.apply(seed_raw(source, "v1", natural_key, "fmt3.py"), [])
+               FileIngest.apply(seed_raw(source, "v1", natural_key, "ctx.py"), [])
 
-      # Rewind to what a pre-PR ingest wrote: no embed_format key, and the old
-      # headerless vector for the toplevel chunk.
-      old_vector = Pgvector.new(StubImpl.embed("fmt3.py\n\n" <> @toplevel_text))
+      before = chunk_with_kind(source, "ctx.py", "toplevel")
 
-      for c <- chunks_for(source, "fmt3.py") do
-        set =
-          if c.metadata["kind"] == "toplevel",
-            do: [metadata: Map.delete(c.metadata, "embed_format"), embedding: old_vector],
-            else: [metadata: Map.delete(c.metadata, "embed_format")]
-
-        Repo.update_all(from(x in Chunk, where: x.id == ^c.id), set: set)
-      end
+      force_chunk({:ok, [toplevel_chunk("import os\nX = 1", ["X"], [], 1), definition_chunk()]})
 
       assert {:ok, %{embedded: 1, reused: 1}} =
+               FileIngest.apply(seed_raw(source, "v2", natural_key, "ctx.py"), [])
+
+      after_ = chunk_with_kind(source, "ctx.py", "toplevel")
+      assert after_.content_hash == before.content_hash
+      refute after_.embedding == before.embedding
+      assert after_.metadata["embed_hash"] != before.metadata["embed_hash"]
+    end
+
+    test "legacy rows: unchanged rendering is reused; a changed one re-embeds once",
+         %{source: source} do
+      natural_key = "repo:acme/app:fmt3.py"
+
+      force_chunk(
+        {:ok,
+         [
+           toplevel_chunk("print('plain')", [], [], 1),
+           toplevel_chunk(@toplevel_text, ["LIMIT"], [{0, 9}], 3),
+           definition_chunk()
+         ]}
+      )
+
+      assert {:ok, %{embedded: 3}} =
+               FileIngest.apply(seed_raw(source, "v1", natural_key, "fmt3.py"), [])
+
+      rewind_to_legacy(source, "fmt3.py")
+
+      assert Enum.all?(
+               chunks_for(source, "fmt3.py"),
+               &(not Map.has_key?(&1.metadata, "embed_hash"))
+             )
+
+      assert {:ok, %{embedded: 1, reused: 2}} =
                FileIngest.apply(seed_raw(source, "v2", natural_key, "fmt3.py"), [])
 
-      top = chunk_with_kind(source, "fmt3.py", "toplevel")
-      assert top.metadata["embed_format"] == 1
+      named = Enum.find(chunks_for(source, "fmt3.py"), &(&1.content == @toplevel_text))
 
-      assert Pgvector.to_list(top.embedding) ==
+      assert Pgvector.to_list(named.embedding) ==
                stub_vector("fmt3.py — defines: LIMIT\n\nLIMIT = 3")
 
-      # And now it is settled: nothing re-embeds.
-      assert {:ok, %{embedded: 0, reused: 2}} =
+      assert {:ok, %{embedded: 0, reused: 3}} =
                FileIngest.apply(seed_raw(source, "v3", natural_key, "fmt3.py"), [])
     end
   end
 
-  describe "embed format: toplevel chunks whose input did not change" do
-    alias RetrievalNode.Embedding.StubImpl
-
-    defp toplevel_chunk(text, names, line) do
-      %{
-        text: text,
-        breadcrumb: "",
-        start_line: line,
-        end_line: line,
-        kind: "toplevel",
-        names: names,
-        import_ranges: [],
-        parse_status: :ok
-      }
-    end
-
-    test "a pre-PR toplevel row with no names/imports is reused; one with names re-embeds once",
-         %{source: source} do
-      natural_key = "repo:acme/app:fmt4.py"
-      plain = toplevel_chunk("print('plain')", [], 1)
-      named = toplevel_chunk("LIMIT = 3", ["LIMIT"], 2)
-      force_chunk({:ok, [plain, named]})
-
-      assert {:ok, %{embedded: 2}} =
-               FileIngest.apply(seed_raw(source, "v1", natural_key, "fmt4.py"), [])
-
-      by_text = Map.new(chunks_for(source, "fmt4.py"), &{&1.content, &1})
-      assert by_text["print('plain')"].metadata["embed_format"] == 0
-      assert by_text["LIMIT = 3"].metadata["embed_format"] == 1
-
-      # Rewind to pre-PR rows: no embed_format key, headerless vectors.
-      for c <- Map.values(by_text) do
-        vec = Pgvector.new(StubImpl.embed("fmt4.py\n\n" <> c.content))
-
-        Repo.update_all(from(x in Chunk, where: x.id == ^c.id),
-          set: [metadata: Map.delete(c.metadata, "embed_format"), embedding: vec]
-        )
-      end
-
-      assert {:ok, %{embedded: 1, reused: 1}} =
-               FileIngest.apply(seed_raw(source, "v2", natural_key, "fmt4.py"), [])
-    end
-  end
+  defp sha256_hex(text), do: :crypto.hash(:sha256, text) |> Base.encode16(case: :lower)
 
   test "embedding reuse skips a stored chunk whose embedding is nil (re-embeds it)", %{
     source: source

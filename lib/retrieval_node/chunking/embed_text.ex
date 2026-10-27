@@ -4,36 +4,27 @@ defmodule RetrievalNode.Chunking.EmbedText do
   and the FTS `tsv` never contain any of this; it exists only as embedding
   input.
 
-  `build/1` returns `{embed_text, embed_format}`:
+  `build/1` returns the string:
 
-    * format `0` — `Breadcrumb.prepend/2` of the chunk text (bare text when
-      there is no breadcrumb). Every definition chunk, and every chunk written
-      before formats existed.
-    * format `1` — `kind: "toplevel"` chunks whose rendering differs from format 0: a header line
-      `"<breadcrumb> — defines: N1, N2, ..."` (just the breadcrumb when the
-      chunk binds no names), a blank line, then the text with its import
-      statements removed (`import_ranges`, from the AST). A chunk that is
-      nothing but imports keeps its text so it still embeds something.
+    * everything but `kind: "toplevel"` — `legacy_text/2`: `Breadcrumb.prepend/2`
+      of the chunk text (bare text when there is no breadcrumb). This is also
+      what every chunk was embedded as before this module existed.
+    * `kind: "toplevel"` — a header line `"<breadcrumb> — defines: N1, N2, ..."`
+      (just the breadcrumb when the chunk binds no names), a blank line, then
+      the text with its import statements removed (`import_ranges`, from the
+      AST). A chunk that is nothing but imports keeps its text so it still
+      embeds something. A chunk with no names and no imports renders to exactly
+      `legacy_text/2`.
 
-  The format records which transformation ACTUALLY applied, not which kind
-  the chunk is: a toplevel chunk that binds no names and has no imports to
-  strip renders to exactly the format 0 text, so `build/1` returns
-  `{legacy_text, 0}` for it. Identical input means an identical vector, so
-  reusing the vector written under format 0 is correct and the chunk is not
-  re-embedded when format 1 rolls out. The comparison lives here, in `build/1`,
-  and nowhere else.
-
-  `embed_format` is part of FileIngest's embedding-reuse key and is persisted
-  in `chunks.metadata["embed_format"]`. Changing what a format produces, or
-  moving chunks to a new number, forces exactly those chunks to re-embed on
-  their next ingest (a forced re-ingest included); bump a number whenever the
-  produced text changes for a chunk whose `{breadcrumb, content_hash}` does not.
+  Names and import ranges depend on the enclosing AST, not only on the chunk's
+  own text, so identical `{breadcrumb, content}` can render differently.
+  Embedding reuse (FileIngest) therefore keys on the sha256 of this string, the
+  actual embedder input: an identical input is an identical vector, and nothing
+  else is assumed to be. Rows written before the hash was stored are keyed by
+  `legacy_text/2` of their stored breadcrumb and content.
   """
 
   alias RetrievalNode.Chunking.Breadcrumb
-
-  @embed_format_plain 0
-  @embed_format_toplevel 1
 
   @type input :: %{
           required(:kind) => String.t() | nil,
@@ -43,26 +34,18 @@ defmodule RetrievalNode.Chunking.EmbedText do
           optional(:import_ranges) => [{non_neg_integer(), non_neg_integer()}]
         }
 
-  @doc "The format number written for chunks that have no format recorded."
-  @spec legacy_format() :: non_neg_integer()
-  def legacy_format, do: @embed_format_plain
-
-  @spec build(input()) :: {String.t(), non_neg_integer()}
+  @spec build(input()) :: String.t()
   def build(%{kind: "toplevel", text: text} = chunk) do
-    legacy = legacy_text(chunk)
     body = chunk |> Map.get(:import_ranges, []) |> strip_ranges(text) |> body_or(text)
-    candidate = join(header(chunk[:breadcrumb], Map.get(chunk, :names, [])), body)
-
-    if candidate == legacy,
-      do: {legacy, @embed_format_plain},
-      else: {candidate, @embed_format_toplevel}
+    join(header(chunk[:breadcrumb], Map.get(chunk, :names, [])), body)
   end
 
-  def build(chunk), do: {legacy_text(chunk), @embed_format_plain}
+  def build(%{breadcrumb: crumb, text: text}), do: legacy_text(crumb, text)
 
-  # Exactly what every chunk was embedded as before formats existed.
-  defp legacy_text(%{breadcrumb: crumb, text: text}) when crumb in [nil, ""], do: text
-  defp legacy_text(%{breadcrumb: crumb, text: text}), do: Breadcrumb.prepend(crumb, text)
+  @doc "The embedder input as it was before `build/1` existed."
+  @spec legacy_text(String.t() | nil, String.t()) :: String.t()
+  def legacy_text(crumb, text) when crumb in [nil, ""], do: text
+  def legacy_text(crumb, text), do: Breadcrumb.prepend(crumb, text)
 
   defp header(crumb, _names) when crumb in [nil, ""], do: nil
   defp header(crumb, []), do: crumb
