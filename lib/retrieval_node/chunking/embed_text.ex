@@ -54,8 +54,11 @@ defmodule RetrievalNode.Chunking.EmbedText do
   defp join(nil, body), do: body
   defp join(header, body), do: header <> "\n\n" <> body
 
-  defp body_or("", text), do: text
-  defp body_or(body, _text), do: body
+  # A remainder with no letter or digit (whitespace, `;`, `,`, stray brackets
+  # left by separators outside the import nodes) carries no content: keep the
+  # original text so an all-import chunk still embeds its imports.
+  defp body_or(body, text),
+    do: if(String.match?(body, ~r/[\p{L}\p{N}]/u), do: body, else: text)
 
   # Removes the ranges (sorted, non-overlapping, byte offsets into `text`),
   # then collapses the runs of blank (or indentation-only)

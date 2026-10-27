@@ -91,6 +91,19 @@ defmodule RetrievalNode.Chunking.EmbedTextTest do
     end
   end
 
+  test "a remainder with no letter or digit falls back to the text; any identifier keeps it" do
+    # "import os; import sys" with the two import nodes stripped leaves "; ".
+    text = "import os; import sys"
+    ranges = [{0, 9}, {11, 21}]
+    assert "lib/a.py\n\n" <> text == build(%{text: text, import_ranges: ranges})
+
+    # Only separators left -> falls back; any identifier left -> kept.
+    only_sep = "a;  ,\nb"
+    assert "lib/a.py\n\n" <> only_sep == build(%{text: only_sep, import_ranges: [{0, 1}, {6, 7}]})
+    assert "lib/a.py\n\n;  ,\nx" == build(%{text: "a;  ,\nx", import_ranges: [{0, 1}]})
+    assert "lib/a.py\n\nü" == build(%{text: "aü", import_ranges: [{0, 1}]})
+  end
+
   test "legacy_text/2 is Breadcrumb.prepend/2, or bare text without a breadcrumb" do
     assert EmbedText.legacy_text("p > f", "t") == Breadcrumb.prepend("p > f", "t")
     assert EmbedText.legacy_text("", "t") == "t"
@@ -198,6 +211,22 @@ defmodule RetrievalNode.Chunking.EmbedTextTest do
       '''
 
       assert embed_toplevel(src, "ruby", "lib/a.rb") == ["lib/a.rb — defines: LIMIT\n\nLIMIT = 3"]
+    end
+
+    test "same-line imports separated by ; keep their text (python, rust)" do
+      for {lang, src} <- [
+            {"python", "import os; import sys\n"},
+            {"rust", "use a::b; use c::d;\n"}
+          ] do
+        embeds = embed_toplevel(src, lang, "f")
+        assert Enum.any?(embeds, &(&1 =~ ~r/(os|a::b)/)), "#{lang}: #{inspect(embeds)}"
+        refute Enum.any?(embeds, &(&1 =~ ~r/\n\n[;\s]*\z/)), "#{lang}: #{inspect(embeds)}"
+      end
+    end
+
+    test "elixir: same-line aliases leave only the module head, which is content" do
+      embeds = embed_toplevel("defmodule A do\n  alias A.B; alias A.C\nend\n", "elixir", "f")
+      assert Enum.any?(embeds, &(&1 =~ "defmodule A do"))
     end
 
     test "a file of only imports keeps them as the embedded text" do
