@@ -60,6 +60,7 @@ defmodule RetrievalNode.Chunking.BindingNames do
 
     scope
     |> walk(source, language, wrappers)
+    |> Enum.reject(fn {_byte, name} -> placeholder?(language, name) end)
     |> Enum.sort_by(&elem(&1, 0))
     |> List.to_tuple()
   end
@@ -117,6 +118,11 @@ defmodule RetrievalNode.Chunking.BindingNames do
       else: Enum.reverse(acc)
   end
 
+  # Go's blank identifier and Rust's `const _` bind nothing. Python's and
+  # JS/TS's `_` is a real variable (gettext, lodash), so it is kept.
+  defp placeholder?(language, name) when language in ~w(go rust), do: name == "_"
+  defp placeholder?(_language, _name), do: false
+
   defp walk(node, source, language, wrappers) do
     node
     |> named_children()
@@ -138,7 +144,7 @@ defmodule RetrievalNode.Chunking.BindingNames do
 
   defp bindings("python", "type_alias_statement", node, source) do
     case named_children(node) do
-      [alias_name | _] -> python_targets_of_type(alias_name, source)
+      [alias_name | _] -> python_alias_name(alias_name, source)
       _ -> []
     end
   end
@@ -233,8 +239,17 @@ defmodule RetrievalNode.Chunking.BindingNames do
     left ++ chained
   end
 
-  defp python_targets_of_type(type_node, source) do
-    type_node |> named_children() |> Enum.flat_map(&python_targets(&1, source))
+  # `type Cache[T] = ...` parses the left side as a generic_type whose first
+  # named child is the bare identifier.
+  defp python_alias_name(type_node, source) do
+    type_node
+    |> named_children()
+    |> Enum.flat_map(fn child ->
+      if TS.node_kind(child) == "generic_type",
+        do:
+          child |> named_children() |> Enum.take(1) |> Enum.flat_map(&python_targets(&1, source)),
+        else: python_targets(child, source)
+    end)
   end
 
   defp python_targets(node, source) do

@@ -313,6 +313,44 @@ defmodule RetrievalNode.Chunking.TreeSitterNamesTest do
     end
   end
 
+  describe "placeholders and parameterized aliases" do
+    test "go: blank identifiers bind nothing and do not use up cap slots" do
+      real = Enum.map_join(1..20, "\n", &"\tN#{&1} = #{&1}")
+
+      src = """
+      package main
+
+      var _ I = (*T)(nil)
+      var a, _ = f()
+
+      const (
+      \t_ = iota
+      \tK
+      )
+
+      var (
+      #{String.duplicate("\t_ = 1\n", 25)}#{real}
+      )
+      """
+
+      assert names_at(chunks!(src, "go"), "") == ["a", "K" | for(i <- 1..18, do: "N#{i}")]
+    end
+
+    test "rust: const _ is excluded, _NAME and parameterized aliases keep their bare name" do
+      src = "const _: () = ();\nstatic _X: u8 = 1;\ntype Foo<T> = Vec<T>;\n"
+      assert names_at(chunks!(src, "rust"), "") == ~w(_X Foo)
+    end
+
+    test "python: generic alias binds its bare name; _ is a real binding" do
+      src = "type Cache[T] = dict[str, T]\n_ = gettext\n"
+      assert names_at(chunks!(src, "python"), "") == ~w(Cache _)
+    end
+
+    test "javascript: _ is a real binding" do
+      assert names_at(chunks!("const _ = require('lodash');\n", "javascript"), "") == ["_"]
+    end
+  end
+
   describe "piece assignment and limits" do
     test "thousands of bindings interleaved with definitions get exact per-piece names" do
       src =
