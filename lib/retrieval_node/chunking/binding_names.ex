@@ -41,7 +41,7 @@ defmodule RetrievalNode.Chunking.BindingNames do
     "go" => ~w(),
     "rust" => ~w(declaration_list),
     "ruby" => ~w(body_statement),
-    "java" => ~w(class_body interface_body enum_body enum_body_declarations),
+    "java" => ~w(class_body interface_body annotation_type_body enum_body enum_body_declarations),
     "elixir" => ~w(do_block)
   }
 
@@ -135,7 +135,17 @@ defmodule RetrievalNode.Chunking.BindingNames do
   defp bindings("python", kind, node, source) when kind in ~w(assignment augmented_assignment),
     do: python_assignment(node, source)
 
+  defp bindings("python", "type_alias_statement", node, source) do
+    case named_children(node) do
+      [alias_name | _] -> python_targets_of_type(alias_name, source)
+      _ -> []
+    end
+  end
+
   # --- javascript / typescript ---
+  #
+  # `const a = b = 1` binds only `a`: `b` is an assignment to an existing
+  # variable, not a declaration, so the chain is deliberately not followed.
 
   defp bindings(lang, kind, node, source)
        when lang in ~w(javascript typescript) and
@@ -170,12 +180,14 @@ defmodule RetrievalNode.Chunking.BindingNames do
 
   # --- rust ---
 
-  defp bindings("rust", kind, node, source) when kind in ~w(const_item static_item),
+  defp bindings("rust", kind, node, source) when kind in ~w(const_item static_item type_item),
     do: field_name(node, "name", source)
 
   # --- ruby ---
 
-  defp bindings("ruby", "assignment", node, source) do
+  defp bindings("ruby", "assignment", node, source), do: ruby_assignment(node, source)
+
+  defp bindings("ruby", "operator_assignment", node, source) do
     case TS.node_child_by_field_name(node, "left") do
       nil -> []
       left -> ruby_constants(left, source)
@@ -184,7 +196,10 @@ defmodule RetrievalNode.Chunking.BindingNames do
 
   # --- java ---
 
-  defp bindings("java", "field_declaration", node, source) do
+  defp bindings("java", "enum_constant", node, source), do: field_name(node, "name", source)
+
+  defp bindings("java", kind, node, source)
+       when kind in ~w(field_declaration constant_declaration) do
     node
     |> named_children()
     |> Enum.filter(&(TS.node_kind(&1) == "variable_declarator"))
@@ -215,6 +230,10 @@ defmodule RetrievalNode.Chunking.BindingNames do
       end
 
     left ++ chained
+  end
+
+  defp python_targets_of_type(type_node, source) do
+    type_node |> named_children() |> Enum.flat_map(&python_targets(&1, source))
   end
 
   defp python_targets(node, source) do
@@ -259,9 +278,12 @@ defmodule RetrievalNode.Chunking.BindingNames do
   # `customElements.define("my-el", Cls)` as a statement-level call.
   defp custom_element(node, source) do
     with fun when not is_nil(fun) <- TS.node_child_by_field_name(node, "function"),
-         "customElements.define" <- slice(source, fun),
+         "member_expression" <- TS.node_kind(fun),
+         true <-
+           identifier_text?(TS.node_child_by_field_name(fun, "object"), source, "customElements"),
+         true <- identifier_text?(TS.node_child_by_field_name(fun, "property"), source, "define"),
          args when not is_nil(args) <- TS.node_child_by_field_name(node, "arguments"),
-         [first | _] <- named_children(args),
+         [first | _] <- args |> named_children() |> Enum.reject(&(TS.node_kind(&1) == "comment")),
          "string" <- TS.node_kind(first),
          [fragment | _] <-
            first |> named_children() |> Enum.filter(&(TS.node_kind(&1) == "string_fragment")) do
@@ -271,6 +293,11 @@ defmodule RetrievalNode.Chunking.BindingNames do
     end
   end
 
+  defp identifier_text?(nil, _source, _text), do: false
+
+  defp identifier_text?(node, source, text),
+    do: TS.node_kind(node) in ~w(identifier property_identifier) and slice(source, node) == text
+
   # Spec names are the identifier children (`var c, d = 1, 2`); the type and
   # the value expressions are other kinds.
   defp go_spec_names(spec, source) do
@@ -278,6 +305,40 @@ defmodule RetrievalNode.Chunking.BindingNames do
     |> named_children()
     |> Enum.filter(&(TS.node_kind(&1) == "identifier"))
     |> Enum.map(&named(&1, source))
+  end
+
+  # `FOO = BAR = 1` nests the second assignment under `right`; in
+  # `A, B = C = 1, 2` it sits inside the right_assignment_list.
+  defp ruby_assignment(node, source) do
+    left =
+      case TS.node_child_by_field_name(node, "left") do
+        nil -> []
+        left -> ruby_constants(left, source)
+      end
+
+    chained =
+      case TS.node_child_by_field_name(node, "right") do
+        nil -> []
+        right -> ruby_chained(right, source)
+      end
+
+    left ++ chained
+  end
+
+  defp ruby_chained(right, source) do
+    case TS.node_kind(right) do
+      "assignment" ->
+        ruby_assignment(right, source)
+
+      "right_assignment_list" ->
+        right
+        |> named_children()
+        |> Enum.filter(&(TS.node_kind(&1) == "assignment"))
+        |> Enum.flat_map(&ruby_assignment(&1, source))
+
+      _ ->
+        []
+    end
   end
 
   defp ruby_constants(node, source) do

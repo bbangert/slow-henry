@@ -223,6 +223,56 @@ defmodule RetrievalNode.Chunking.TreeSitterNamesTest do
     end
   end
 
+  describe "declaration forms and structural matching" do
+    test "ruby: chained and operator assignments bind every constant" do
+      src = "FOO = BAR = 1\nA, B = C = 1, 2\nBAZ ||= 3\nlocal = OTHER = 4\n"
+      assert names_at(chunks!(src, "ruby"), "") == ~w(FOO BAR A B C BAZ OTHER)
+    end
+
+    test "java: interface constants and enum constants (enum with methods is a container)" do
+      src = ~S'''
+      interface I {
+        int X = 1;
+        void f();
+      }
+
+      enum E {
+        A, B(1);
+        int c = 1;
+        void g() {}
+      }
+      '''
+
+      chunks = chunks!(src, "java")
+      assert names_at(chunks, "I") == ~w(X)
+      assert names_at(chunks, "E") == ~w(A B c)
+    end
+
+    test "rust and python type aliases" do
+      assert names_at(chunks!("type T = u32;\nconst A: u8 = 1;\n", "rust"), "") == ~w(T A)
+      assert names_at(chunks!("type X = int\nY = 1\n", "python"), "") == ~w(X Y)
+    end
+
+    for lang <- ~w(javascript typescript) do
+      test "#{lang}: customElements.define is matched structurally, not by spelling" do
+        src = ~S'''
+        customElements . define('a-el', A);
+        customElements
+          // comment
+          .define(
+            // another
+            "b-el", B);
+        window.customElements.define('no-el', C);
+        customElements.define(tag, D);
+        const a = b = 1;
+        '''
+
+        assert names_at(chunks!(src, unquote(lang)), "") ==
+                 ["customElements:a-el", "customElements:b-el", "a"]
+      end
+    end
+  end
+
   describe "piece assignment and limits" do
     test "thousands of bindings interleaved with definitions get exact per-piece names" do
       src =
