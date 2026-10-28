@@ -217,38 +217,62 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   end
 
   # `inherited` is the lead of an enclosing wrapper (`export`, decorators): a
-  # definition that is its direct child starts there. See `Attachments`.
+  # definition that is its direct child starts there. Siblings absorbed into a
+  # definition's attachment run are owned by its chunk and never searched for
+  # boundaries of their own. See `Attachments`.
   defp extract(node, source, language, scope, inherited \\ nil) do
     kinds = Map.get(@chunk_kinds, language, [])
 
-    {chunks, _preceding} =
-      node
-      |> named_children()
-      |> Enum.flat_map_reduce([], fn child, preceding ->
-        lead_ctx = {preceding, inherited}
-        {extract_child(child, lead_ctx, source, language, scope, kinds), [child | preceding]}
+    node
+    |> named_children()
+    |> plan_children(source, language, kinds, inherited)
+    |> Enum.flat_map(fn
+      {_child, :absorbed, _lead} -> []
+      {child, kind, lead} -> extract_child(child, kind, lead, source, language, scope)
+    end)
+  end
+
+  # `{child, role, lead}` per child in document order, where role is the node
+  # kind for a boundary or wrapper, `:other` for anything descended generically,
+  # and `:absorbed` for attachments of a later definition.
+  defp plan_children(children, source, language, kinds, inherited) do
+    {entries, _nodes} =
+      Enum.reduce(children, {[], []}, fn child, {entries, nodes} ->
+        kind = TS.node_kind(child)
+
+        role =
+          cond do
+            chunk_boundary?(child, kind, source, language, kinds) -> {:boundary, kind}
+            Attachments.wrapper?(kind, language) -> {:wrapper, kind}
+            true -> :other
+          end
+
+        {entries, lead} =
+          case role do
+            :other ->
+              {entries, nil}
+
+            _ ->
+              {lead, absorbed} = Attachments.lead(child, nodes, inherited, source, language)
+              {head, rest} = Enum.split(entries, absorbed)
+              {Enum.map(head, fn {c, _role, _lead} -> {c, :absorbed, nil} end) ++ rest, lead}
+          end
+
+        {[{child, role, lead} | entries], [child | nodes]}
       end)
 
-    chunks
+    Enum.reverse(entries)
   end
 
-  defp extract_child(child, {preceding, inherited}, source, language, scope, kinds) do
-    kind = TS.node_kind(child)
+  defp extract_child(child, {:boundary, kind}, lead, source, language, scope),
+    do: emit_or_recurse(child, lead, source, language, scope, kind)
 
-    cond do
-      chunk_boundary?(child, kind, source, language, kinds) ->
-        lead = Attachments.lead(child, preceding, inherited, source, language)
-        emit_or_recurse(child, lead, source, language, scope, kind)
+  defp extract_child(child, {:wrapper, _kind}, lead, source, language, scope),
+    do: extract(child, source, language, scope, lead)
 
-      Attachments.wrapper?(kind, language) ->
-        lead = Attachments.lead(child, preceding, inherited, source, language)
-        extract(child, source, language, scope, lead)
-
-      true ->
-        # Non-chunkable wrapper (block/body): descend, keep scope.
-        extract(child, source, language, scope)
-    end
-  end
+  # Non-chunkable wrapper (block/body): descend, keep scope.
+  defp extract_child(child, :other, _lead, source, language, scope),
+    do: extract(child, source, language, scope)
 
   # Elixir has no fixed boundary-kind set (see moduledoc): every construct is
   # a `call` node discriminated by its target identifier's text.

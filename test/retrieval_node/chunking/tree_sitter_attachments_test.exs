@@ -255,4 +255,54 @@ defmodule RetrievalNode.Chunking.TreeSitterAttachmentsTest do
       assert definition(chunks, "b").text == "function b() {}"
     end
   end
+
+  describe "ownership" do
+    test "boundaries nested inside a decorator argument are not separate chunks" do
+      src = "class C {\n  @dec({ helper() {} })\n  m() {}\n}\n"
+      chunks = chunks!(src, "typescript")
+      assert definition(chunks, "C > m").text == "@dec({ helper() {} })\n  m() {}"
+      refute Enum.any?(chunks, &(&1.breadcrumb =~ "helper"))
+    end
+
+    test "boundaries nested inside a wrapper's decorator are not separate chunks" do
+      src = "@deco({ hook() {} })\nexport class C {}\n"
+      chunks = chunks!(src, "typescript")
+      assert definition(chunks, "C").text == src |> String.trim_trailing()
+      refute Enum.any?(chunks, &(&1.breadcrumb =~ "hook"))
+    end
+
+    test "python decorators with lambdas attach without extra chunks" do
+      src = "@dec(lambda x: x)\n@other\ndef f():\n    pass\n"
+      chunks = chunks!(src, "python")
+      assert Enum.map(chunks, & &1.kind) == ["function_definition"]
+      assert hd(chunks).text == String.trim_trailing(src)
+    end
+
+    test "elixir attribute values holding anonymous functions attach without extra chunks" do
+      src = "defmodule A do\n  @doc fn -> 1 end\n  def f, do: 1\nend\n"
+      chunks = chunks!(src, "elixir")
+      assert definition(chunks, "A > f").text =~ ~r/\A@doc fn -> 1 end\n\s+def f/
+    end
+  end
+
+  describe "standalone comments" do
+    test "a comment after code on the container's header line stays with the header" do
+      for {lang, src} <- [
+            {"java", "class A { // class note\n  void f() {}\n}\n"},
+            {"javascript", "class A { // class note\n  f() {}\n}\n"},
+            {"typescript", "class A { // class note\n  f() {}\n}\n"},
+            {"javascript", "class A { /* note */\n  f() {}\n}\n"}
+          ] do
+        chunks = chunks!(src, lang)
+        f = definition(chunks, "A > f")
+        refute f.text =~ "note", lang
+        assert Enum.find(chunks, &(&1.kind == "toplevel" and &1.breadcrumb == "A")).text =~ "note"
+      end
+    end
+
+    test "a comment on its own line still attaches" do
+      chunks = chunks!("class A {\n  // own line\n  f() {}\n}\n", "javascript")
+      assert definition(chunks, "A > f").text == "// own line\n  f() {}"
+    end
+  end
 end

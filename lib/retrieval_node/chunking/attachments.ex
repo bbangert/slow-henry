@@ -13,7 +13,7 @@ defmodule RetrievalNode.Chunking.Attachments do
     * a sibling attribute/decorator node (TS method `decorator`, Rust
       `attribute_item`, Elixir `@doc`/`@spec`/`@impl`/`@deprecated`/`@typedoc`);
     * a doc comment: a comment that ends on the line above the run (or the
-      line of its first node) and does not trail other code. Rust only counts
+      line of its first node) and starts its own line. Rust only counts
       outer doc comments (`///`, `/** */`).
 
   Data attributes such as Elixir `@limit 3` are not attachments: they are bound
@@ -35,6 +35,7 @@ defmodule RetrievalNode.Chunking.Attachments do
 
   # Sibling kinds that always attach to the run that follows them.
   @attachment_kinds %{
+    "python" => ~w(decorator),
     "javascript" => ~w(decorator),
     "typescript" => ~w(decorator),
     "rust" => ~w(attribute_item)
@@ -61,30 +62,33 @@ defmodule RetrievalNode.Chunking.Attachments do
   def wrapper?(kind, language), do: kind in Map.get(@wrappers, language, [])
 
   @doc """
-  Where the chunk for `node` starts. `preceding` is the earlier siblings,
-  nearest first; `inherited` the lead of an enclosing wrapper (or `nil`).
+  Where the chunk for `node` starts, and how many of the nearest `preceding`
+  siblings (nearest first) its attachment run absorbs. `inherited` is the lead
+  of an enclosing wrapper (or `nil`). Absorbed siblings belong to the chunk:
+  the caller must not look for boundaries inside them.
   """
-  @spec lead(term(), [term()], position() | nil, binary(), String.t()) :: position()
+  @spec lead(term(), [term()], position() | nil, binary(), String.t()) ::
+          {position(), non_neg_integer()}
   def lead(node, preceding, inherited, source, language) do
-    own = run_start(preceding, position(node), source, language)
+    {own, absorbed} = run_start(preceding, position(node), 0, source, language)
 
     case inherited do
-      {byte, _row} = outer when byte < elem(own, 0) -> outer
-      _ -> own
+      {byte, _row} = outer when byte < elem(own, 0) -> {outer, absorbed}
+      _ -> {own, absorbed}
     end
   end
 
-  defp run_start([], current, _source, _language), do: current
+  defp run_start([], current, count, _source, _language), do: {current, count}
 
-  defp run_start([sibling | rest], {_byte, row} = current, source, language) do
-    if attachment?(sibling, rest, row, source, language) do
-      run_start(rest, position(sibling), source, language)
+  defp run_start([sibling | rest], {_byte, row} = current, count, source, language) do
+    if attachment?(sibling, row, source, language) do
+      run_start(rest, position(sibling), count + 1, source, language)
     else
-      current
+      {current, count}
     end
   end
 
-  defp attachment?(sibling, earlier, next_row, source, language) do
+  defp attachment?(sibling, next_row, source, language) do
     kind = TS.node_kind(sibling)
 
     cond do
@@ -92,7 +96,7 @@ defmodule RetrievalNode.Chunking.Attachments do
         true
 
       kind in Map.get(@comment_kinds, language, []) ->
-        doc_comment?(sibling, earlier, next_row, language)
+        doc_comment?(sibling, next_row, source, language)
 
       language == "elixir" ->
         elixir_doc_attribute?(sibling, source)
@@ -102,17 +106,26 @@ defmodule RetrievalNode.Chunking.Attachments do
     end
   end
 
-  defp doc_comment?(comment, earlier, next_row, language) do
-    ends_above?(comment, next_row) and not trailing?(comment, earlier) and
+  defp doc_comment?(comment, next_row, source, language) do
+    ends_above?(comment, next_row) and standalone?(comment, source) and
       (language != "rust" or rust_outer_doc?(comment))
   end
 
   defp ends_above?(comment, next_row), do: last_row(comment) >= next_row - 1
 
-  defp trailing?(comment, [previous | _]),
-    do: last_row(previous) == TS.node_start_position(comment).row
+  # Nothing but whitespace precedes the comment on its start line (a comment
+  # after code, even `{ // note`, belongs to that code).
+  defp standalone?(comment, source), do: blank_before?(source, TS.node_start_byte(comment))
 
-  defp trailing?(_comment, []), do: false
+  defp blank_before?(_source, 0), do: true
+
+  defp blank_before?(source, byte) do
+    case :binary.at(source, byte - 1) do
+      c when c in [?\s, ?\t] -> blank_before?(source, byte - 1)
+      c when c in [?\n, ?\r] -> true
+      _ -> false
+    end
+  end
 
   # A line comment's node includes its newline, ending at column 0 of the next
   # row; that row is not one the comment occupies.
