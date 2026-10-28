@@ -62,29 +62,28 @@ defmodule RetrievalNode.Chunking.Attachments do
   def wrapper?(kind, language), do: kind in Map.get(@wrappers, language, [])
 
   @doc """
-  Where the chunk for `node` starts, and how many of the nearest `preceding`
-  siblings (nearest first) its attachment run absorbs. `inherited` is the lead
-  of an enclosing wrapper (or `nil`). Absorbed siblings belong to the chunk:
-  the caller must not look for boundaries inside them.
+  Where the chunk for `node` starts. `preceding` is the earlier siblings,
+  nearest first; `inherited` the lead of an enclosing wrapper (or `nil`). The
+  caller owns everything from the returned position on: it must not look for
+  boundaries in any sibling that starts at or after it.
   """
-  @spec lead(term(), [term()], position() | nil, binary(), String.t()) ::
-          {position(), non_neg_integer()}
+  @spec lead(term(), [term()], position() | nil, binary(), String.t()) :: position()
   def lead(node, preceding, inherited, source, language) do
-    {own, absorbed} = run_start(preceding, position(node), 0, source, language)
+    own = run_start(preceding, position(node), source, language)
 
     case inherited do
-      {byte, _row} = outer when byte < elem(own, 0) -> {outer, absorbed}
-      _ -> {own, absorbed}
+      {byte, _row} = outer when byte < elem(own, 0) -> outer
+      _ -> own
     end
   end
 
-  defp run_start([], current, count, _source, _language), do: {current, count}
+  defp run_start([], current, _source, _language), do: current
 
-  defp run_start([sibling | rest], {_byte, row} = current, count, source, language) do
+  defp run_start([sibling | rest], {_byte, row} = current, source, language) do
     if attachment?(sibling, row, source, language) do
-      run_start(rest, position(sibling), count + 1, source, language)
+      run_start(rest, position(sibling), source, language)
     else
-      {current, count}
+      current
     end
   end
 

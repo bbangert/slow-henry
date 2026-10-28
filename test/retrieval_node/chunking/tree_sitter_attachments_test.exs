@@ -285,6 +285,39 @@ defmodule RetrievalNode.Chunking.TreeSitterAttachmentsTest do
     end
   end
 
+  describe "ownership when the scan stops short of the lead" do
+    test "comment between export and class" do
+      src = "@deco({ hook() {} })\nexport /* note */ class C {}\n"
+      chunks = chunks!(src, "typescript")
+      assert [c] = chunks
+      assert c.text == String.trim_trailing(src)
+    end
+
+    test "block comment after the decorator" do
+      src = "@deco({ hook() {} }) /* note */\nexport class C {}\n"
+      chunks = chunks!(src, "typescript")
+      assert [c] = chunks
+      assert c.text == String.trim_trailing(src)
+    end
+
+    test "typescript method with a comment after its decorator" do
+      src = "class C {\n  @dec({ h() {} }) /* c */ m() {}\n}\n"
+      chunks = chunks!(src, "typescript")
+
+      assert Enum.sort(for c <- chunks, c.kind != "toplevel", do: c.breadcrumb) == [
+               "C > h",
+               "C > m"
+             ]
+    end
+
+    test "python decorator followed by a trailing comment" do
+      src = "@deco(lambda: 1)  # c\ndef f():\n    pass\n"
+      chunks = chunks!(src, "python")
+      assert [c] = chunks
+      assert c.text == String.trim_trailing(src)
+    end
+  end
+
   describe "standalone comments" do
     test "a comment after code on the container's header line stays with the header" do
       for {lang, src} <- [

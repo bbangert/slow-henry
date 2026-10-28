@@ -218,7 +218,7 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
 
   # `inherited` is the lead of an enclosing wrapper (`export`, decorators): a
   # definition that is its direct child starts there. Siblings absorbed into a
-  # definition's attachment run are owned by its chunk and never searched for
+  # definition's chunk (from its lead onward) are owned by its chunk and never searched for
   # boundaries of their own. See `Attachments`.
   defp extract(node, source, language, scope, inherited \\ nil) do
     kinds = Map.get(@chunk_kinds, language, [])
@@ -253,15 +253,27 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
               {entries, nil}
 
             _ ->
-              {lead, absorbed} = Attachments.lead(child, nodes, inherited, source, language)
-              {head, rest} = Enum.split(entries, absorbed)
-              {Enum.map(head, fn {c, _role, _lead} -> {c, :absorbed, nil} end) ++ rest, lead}
+              {lead_byte, _row} =
+                lead = Attachments.lead(child, nodes, inherited, source, language)
+
+              {absorb_from(entries, lead_byte), lead}
           end
 
         {[{child, role, lead} | entries], [child | nodes]}
       end)
 
     Enum.reverse(entries)
+  end
+
+  # Whatever the chunk now covers is owned by it, however the lead was chosen:
+  # every earlier sibling starting at or after `lead_byte` is absorbed.
+  defp absorb_from(entries, lead_byte) do
+    {covered, rest} =
+      Enum.split_while(entries, fn {child, _role, _lead} ->
+        TS.node_start_byte(child) >= lead_byte
+      end)
+
+    Enum.map(covered, fn {child, _role, _lead} -> {child, :absorbed, nil} end) ++ rest
   end
 
   defp extract_child(child, {:boundary, kind}, lead, source, language, scope),
