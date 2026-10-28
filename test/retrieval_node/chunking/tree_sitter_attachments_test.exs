@@ -318,6 +318,35 @@ defmodule RetrievalNode.Chunking.TreeSitterAttachmentsTest do
     end
   end
 
+  describe "unnamed separators end an attachment run" do
+    test "java stray semicolon between a doc comment and a method" do
+      chunks = chunks!("class A {\n  /** note */\n  ; void f() {}\n}\n", "java")
+      assert definition(chunks, "A > f").text == "void f() {}"
+    end
+
+    test "javascript and typescript" do
+      for lang <- ~w(javascript typescript) do
+        chunks = chunks!("/** d */\n;\nfunction f() {}\n", lang)
+        assert definition(chunks, "f").text == "function f() {}", lang
+      end
+    end
+
+    test "go" do
+      chunks = chunks!("package p\n\n// c\n;\nfunc F() {}\n", "go")
+      assert definition(chunks, "F").text == "func F() {}"
+    end
+
+    test "ruby" do
+      chunks = chunks!("# c\n;\ndef f\nend\n", "ruby")
+      assert definition(chunks, "f").text == "def f\nend"
+    end
+
+    test "python" do
+      chunks = chunks!("# c\n;\ndef f():\n    pass\n", "python")
+      assert definition(chunks, "f").text == "def f():\n    pass"
+    end
+  end
+
   describe "standalone comments" do
     test "a comment after code on the container's header line stays with the header" do
       for {lang, src} <- [

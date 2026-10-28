@@ -80,11 +80,22 @@ defmodule RetrievalNode.Chunking.Attachments do
   defp run_start([], current, _source, _language), do: current
 
   defp run_start([sibling | rest], {_byte, row} = current, source, language) do
-    if attachment?(sibling, row, source, language) do
+    if whitespace_between?(source, TS.node_end_byte(sibling), elem(current, 0)) and
+         attachment?(sibling, row, source, language) do
       run_start(rest, position(sibling), source, language)
     else
       current
     end
+  end
+
+  # A sibling run is contiguous only through whitespace: unnamed syntax (a
+  # stray `;`) is not in the sibling list but ends the run. This applies to
+  # sibling runs only; a wrapper's own prefix (`export`, decorators inside
+  # `decorated_definition`) is covered by the wrapper's lead, not this scan.
+  defp whitespace_between?(_source, from, to) when from >= to, do: true
+
+  defp whitespace_between?(source, from, to) do
+    :binary.at(source, from) in ~c" \t\n\r\f\v" and whitespace_between?(source, from + 1, to)
   end
 
   defp attachment?(sibling, next_row, source, language) do
