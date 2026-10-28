@@ -18,8 +18,10 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   the heuristic chunker until their native-AST path lands (fast-follow).
 
   Coverage invariant: every non-whitespace byte of a chunked file belongs to
-  exactly one chunk. Definition chunks (leaf-most boundary nodes) are emitted
-  as-is; the stretches between them — imports, constants, decorators, a class's
+  exactly one chunk. Definition chunks (leaf-most boundary nodes) start at their
+  leading attachments (`Attachments`: decorators, `export`, doc comments, Elixir
+  `@doc`/`@spec`); a container's own attachments fall into its first gap chunk.
+  The stretches between them — imports, constants, a class's
   header and fields, module-level statements, an Elixir module's `@moduledoc`/
   `use`/ExUnit `test` blocks — become `kind: "toplevel"` chunks. A container
   (a boundary node with nested boundaries) emits its nested chunks plus the
@@ -35,7 +37,7 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
 
   Elixir is the one language here whose grammar has no fixed boundary-kind
   set: `defmodule`/`def`/`defp`/... all parse as a bare `call` node (target:
-  identifier), so `chunk_boundary?/4` special-cases it with a predicate
+  identifier), so `chunk_boundary?/5` special-cases it with a predicate
   (target text in `@elixir_def_forms`) instead of a kind-set lookup. The form
   set and name canonicalisation (`defdelegate`, `Elixir.Foo` -> `Foo`) match
   `Graph.Extractor.TreeSitter`, so chunk breadcrumbs agree with entity names.
@@ -43,6 +45,7 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
 
   @behaviour RetrievalNode.Chunking
 
+  alias RetrievalNode.Chunking.Attachments
   alias RetrievalNode.Chunking.BindingNames
   alias RetrievalNode.Chunking.HeuristicImpl
   alias RetrievalNode.Graph.Extractor
@@ -75,7 +78,7 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   # chunk only if it has no chunkable descendants (leaf-most def); a container
   # (e.g. a class) yields its members instead, with the container name in the
   # breadcrumb — so methods are chunks scoped as "Class > method". Elixir has
-  # no entry here — see `chunk_boundary?/4`.
+  # no entry here — see `chunk_boundary?/5`.
   @chunk_kinds %{
     "python" => ~w(function_definition class_definition),
     "javascript" =>
@@ -213,30 +216,47 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
     end
   end
 
-  defp extract(node, source, language, scope) do
+  # `inherited` is the lead of an enclosing wrapper (`export`, decorators): a
+  # definition that is its direct child starts there. See `Attachments`.
+  defp extract(node, source, language, scope, inherited \\ nil) do
     kinds = Map.get(@chunk_kinds, language, [])
 
-    node
-    |> named_children()
-    |> Enum.flat_map(&extract_child(&1, source, language, scope, kinds))
+    {chunks, _preceding} =
+      node
+      |> named_children()
+      |> Enum.flat_map_reduce([], fn child, preceding ->
+        lead_ctx = {preceding, inherited}
+        {extract_child(child, lead_ctx, source, language, scope, kinds), [child | preceding]}
+      end)
+
+    chunks
   end
 
-  defp extract_child(child, source, language, scope, kinds) do
-    if chunk_boundary?(child, source, language, kinds) do
-      emit_or_recurse(child, source, language, scope, TS.node_kind(child))
-    else
-      # Non-chunkable wrapper (block/body/decorator): descend, keep scope.
-      extract(child, source, language, scope)
+  defp extract_child(child, {preceding, inherited}, source, language, scope, kinds) do
+    kind = TS.node_kind(child)
+
+    cond do
+      chunk_boundary?(child, kind, source, language, kinds) ->
+        lead = Attachments.lead(child, preceding, inherited, source, language)
+        emit_or_recurse(child, lead, source, language, scope, kind)
+
+      Attachments.wrapper?(kind, language) ->
+        lead = Attachments.lead(child, preceding, inherited, source, language)
+        extract(child, source, language, scope, lead)
+
+      true ->
+        # Non-chunkable wrapper (block/body): descend, keep scope.
+        extract(child, source, language, scope)
     end
   end
 
   # Elixir has no fixed boundary-kind set (see moduledoc): every construct is
   # a `call` node discriminated by its target identifier's text.
-  defp chunk_boundary?(child, source, "elixir", _kinds) do
-    TS.node_kind(child) == "call" and elixir_def_form?(child, source)
+  defp chunk_boundary?(child, kind, source, "elixir", _kinds) do
+    kind == "call" and elixir_def_form?(child, source)
   end
 
-  defp chunk_boundary?(child, _source, _language, kinds), do: TS.node_kind(child) in kinds
+  defp chunk_boundary?(_child, kind, _source, _language, kinds), do: kind in kinds
 
   defp elixir_def_form?(call_node, source) do
     case TS.node_child_by_field_name(call_node, "target") do
@@ -254,27 +274,29 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
   # docstring, fields), scoped to the container; a leaf-most one is emitted as a
   # chunk itself. An Elixir module form is a container even with no nested
   # boundaries, so its macro-DSL body is gap-split under the size limits.
-  defp emit_or_recurse(child, source, language, scope, kind) do
+  defp emit_or_recurse(child, lead, source, language, scope, kind) do
     child_scope = enclosing_scope(child, source, language, scope) ++ [node_name(child, source)]
 
     case extract(child, source, language, child_scope) do
       [] ->
         if container_form?(child, source, language) do
-          emit_container(child, source, [], child_scope, language)
+          emit_container(child, lead, source, [], child_scope, language)
         else
-          [to_chunk(child, source, kind, child_scope)]
+          [to_chunk(child, lead, source, kind, child_scope)]
         end
 
       nested ->
-        emit_container(child, source, nested, child_scope, language)
+        emit_container(child, lead, source, nested, child_scope, language)
     end
   end
 
-  defp emit_container(node, source, nested, child_scope, language) do
+  # The container's own attachments land in its first gap chunk (the container
+  # is not one chunk), under the container breadcrumb.
+  defp emit_container(node, {lead_byte, _row}, source, nested, child_scope, language) do
     add_gaps(
       nested,
       source,
-      TS.node_start_byte(node),
+      lead_byte,
       TS.node_end_byte(node),
       Enum.join(child_scope, " > "),
       {node, language}
@@ -400,19 +422,19 @@ defmodule RetrievalNode.Chunking.TreeSitterImpl do
     end
   end
 
-  defp to_chunk(node, source, kind, scope) do
-    start_pos = TS.node_start_position(node)
+  defp to_chunk(node, {lead_byte, lead_row}, source, kind, scope) do
     end_pos = TS.node_end_position(node)
+    end_byte = TS.node_end_byte(node)
 
     %{
-      text: slice(source, node),
+      text: binary_part(source, lead_byte, end_byte - lead_byte),
       breadcrumb: Enum.join(scope, " > "),
-      start_line: start_pos.row + 1,
+      start_line: lead_row + 1,
       end_line: end_pos.row + 1,
       kind: kind,
       parse_status: :ok,
-      start_byte: TS.node_start_byte(node),
-      end_byte: TS.node_end_byte(node)
+      start_byte: lead_byte,
+      end_byte: end_byte
     }
   end
 
