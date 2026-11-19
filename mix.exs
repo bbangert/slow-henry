@@ -107,6 +107,12 @@ defmodule RetrievalNode.MixProject do
       {:bumblebee, "~> 0.8"},
       {:nx, "~> 1.0"},
       {:exla, "~> 1.0"},
+      # Hold fine (EXLA's C++ NIF header library) on 0.1.x. exla 1.0.0 accepts
+      # `~> 0.1`, but its exla.cc does not compile against fine 0.2.0
+      # (`try_decode` is not a member of `fine::Decoder<xla::Shape>`). Drop this
+      # once an exla release builds against fine 0.2. This also holds
+      # lazy_html (test-only) on 0.1.13, since 0.1.14 needs fine ~> 0.2.0.
+      {:fine, "~> 0.1.6", runtime: false},
       {:tree_sitter_language_pack, "~> 1.12"},
       {:req, "~> 0.5"},
       # Explicit dep: we start Finch ourselves in the supervision tree (shared
